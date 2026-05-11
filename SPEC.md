@@ -18,6 +18,8 @@ A COGP file is:
 3. organized so that each level of detail ends at a Parquet row group boundary;
 4. annotated with minimal metadata describing those level-of-detail boundaries.
 
+COGP is feature-level: it reorders features across row groups; it does not simplify, aggregate, or duplicate them.
+
 ## 2. Motivation
 
 GeoParquet is well suited for geospatial analytics and cloud storage, but ordinary GeoParquet files are not necessarily optimized for progressive visual access.
@@ -72,6 +74,13 @@ For example, a LoD with `gsd` equal to `1000` represents independently meaningfu
 
 Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse LoD retains its full geometry, including fine internal detail.
 
+This may apply to deferring features such as:
+
+* a pair of point features too close together to be visually distinguished;
+* a short linear feature whose overall length is too small to form a visually meaningful shape;
+* a small polygon feature that does not form a meaningful rendered shape;
+* a polygon feature too small to form at least a minimal visible area at the target display scale.
+
 This value is rendering-oriented. It does not guarantee positional accuracy, topological validity, or analytical precision.
 
 ## 5. Requirements
@@ -106,7 +115,7 @@ Every source feature MUST appear in exactly one row group. Feature geometry and 
 
 LoD ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
 
-This profile does not constrain the order of features within a single LoD.
+Within each LoD, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective. This profile does not prescribe a specific clustering algorithm.
 
 ### 5.3 LoD boundaries
 
