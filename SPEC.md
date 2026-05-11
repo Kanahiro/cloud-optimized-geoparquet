@@ -1,8 +1,11 @@
-# Cloud Optimized GeoParquet Profile (COGP) v0.1 Draft
+---
+title: Cloud Optimized GeoParquet Profile (COGP)
+version: "0.1"
+status: Draft
+scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
+---
 
-Status: Draft
-Version: 0.1
-Scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
+# Cloud Optimized GeoParquet Profile (COGP)
 
 ## 1. Summary
 
@@ -35,7 +38,9 @@ The core idea is:
 
 > Earlier row groups contain geometry that is meaningful at coarse display resolutions. Later row groups add geometry that is only meaningful at finer display resolutions.
 
-A reader can choose a row group prefix based on its target rendering resolution.
+Each feature appears in exactly one row group. Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels of detail.
+
+A reader can choose how many leading row groups to load based on its target rendering resolution.
 
 For example:
 
@@ -51,9 +56,13 @@ A logical rendering detail level.
 
 LoDs are represented by metadata and row group boundaries. This profile does not require a `lod`, `zoom`, or `zoomlevel` column in the data.
 
-### 4.2 Render resolution
+### 4.2 Ground sample distance (GSD)
 
-`nominal_render_resolution_m` is the approximate ground distance below which geometric distinctions are not expected to be independently renderable at this LoD.
+`gsd` is the approximate ground distance below which geometric distinctions are not expected to be independently renderable at this LoD.
+
+The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features at this LoD are not expected to be individually meaningful.
+
+The value is always expressed in meters of ground distance at the geographic location of the features, independent of the CRS or units used by the underlying data. For example, a file in EPSG:4326 (degrees) still expresses this value in meters.
 
 This includes, for example:
 
@@ -64,12 +73,6 @@ This includes, for example:
 
 This value is rendering-oriented. It does not guarantee positional accuracy, topological validity, or analytical precision.
 
-### 4.3 Row group prefix
-
-A row group prefix is the contiguous set of row groups from row group `0` through a selected `row_group_end`.
-
-A reader can load a prefix to obtain a progressively refined representation.
-
 ## 5. Requirements
 
 A COGP v0.1 file MUST satisfy the following requirements.
@@ -78,7 +81,7 @@ A COGP v0.1 file MUST satisfy the following requirements.
 
 The file MUST be a valid GeoParquet 1.1 file.
 
-The file MUST include GeoParquet `covering` metadata for a bounding box column associated with the primary geometry column.
+The file MUST include GeoParquet `covering` metadata for a bounding box column associated with the geometry column identified by the GeoParquet `primary_column` metadata.
 
 The referenced bounding box covering column MUST be present in the file.
 
@@ -105,15 +108,17 @@ The file-level metadata MUST contain a non-empty ordered list of LoD entries.
 Each LoD entry MUST contain:
 
 * `row_group_end`
-* `nominal_render_resolution_m`
+* `gsd`
 
-`row_group_end` values MUST be monotonically increasing.
+`row_group_end` values MUST be strictly monotonically increasing.
+
+The first LoD entry covers row groups from row group `0` through its `row_group_end`, inclusive.
 
 The final `row_group_end` value MUST equal the last row group index in the file.
 
-`nominal_render_resolution_m` values MUST be positive numbers.
+`gsd` values MUST be positive numbers.
 
-`nominal_render_resolution_m` values SHOULD be monotonically decreasing from coarse to fine LoDs.
+`gsd` values MUST be strictly monotonically decreasing from coarse to fine LoDs.
 
 ## 6. Metadata
 
@@ -130,19 +135,18 @@ The value MUST be a UTF-8 JSON object.
 ```json
 {
   "version": "0.1",
-  "profile": "progressive-rendering",
   "lods": [
     {
       "row_group_end": 0,
-      "nominal_render_resolution_m": 1000
+      "gsd": 1000
     },
     {
       "row_group_end": 3,
-      "nominal_render_resolution_m": 500
+      "gsd": 500
     },
     {
       "row_group_end": 12,
-      "nominal_render_resolution_m": 100
+      "gsd": 100
     }
   ]
 }
@@ -153,25 +157,20 @@ The value MUST be a UTF-8 JSON object.
 ```json
 {
   "version": "0.1",
-  "profile": "progressive-rendering",
   "lods": [
     {
       "row_group_end": 0,
-      "nominal_render_resolution_m": 1000,
-      "feature_count": 12000
+      "gsd": 1000
     },
     {
       "row_group_end": 3,
-      "nominal_render_resolution_m": 500,
-      "feature_count": 48000
+      "gsd": 500
     },
     {
       "row_group_end": 12,
-      "nominal_render_resolution_m": 100,
-      "feature_count": 210000
+      "gsd": 100
     }
   ],
-  "ordering": "coarse-to-fine",
   "spatial_clustering": {
     "method": "str-pack"
   },
@@ -184,79 +183,61 @@ The value MUST be a UTF-8 JSON object.
 
 ### 6.3 Field definitions
 
-| Field                                | Required | Description                                                                                      |
-| ------------------------------------ | -------: | ------------------------------------------------------------------------------------------------ |
-| `version`                            |      Yes | Profile metadata version.                                                                        |
-| `profile`                            |      Yes | Profile identifier. For v0.1, `progressive-rendering`.                                           |
-| `lods`                               |      Yes | Ordered LoD entries from coarse to fine.                                                         |
-| `lods[].row_group_end`               |      Yes | Inclusive row group index ending this LoD prefix.                                                |
-| `lods[].nominal_render_resolution_m` |      Yes | Approximate ground distance below which geometry is not expected to be independently renderable. |
-| `lods[].feature_count`               |       No | Cumulative feature count through this LoD prefix.                                                |
-| `ordering`                           |       No | Informational ordering description.                                                              |
-| `spatial_clustering`                 |       No | Informational clustering method metadata.                                                        |
-| `generator`                          |       No | Producer tool metadata.                                                                          |
+| Field                  | Required | Description                                                                                                       |
+| ---------------------- | -------: | ----------------------------------------------------------------------------------------------------------------- |
+| `version`              |      Yes | Profile metadata version.                                                                                         |
+| `lods`                 |      Yes | Ordered LoD entries from coarse to fine.                                                                          |
+| `lods[].row_group_end` |      Yes | Inclusive row group index ending this LoD.                                                                        |
+| `lods[].gsd`           |      Yes | Approximate ground sample distance, in meters, below which geometry is not expected to be independently renderable. |
+| `spatial_clustering`   |       No | Informational clustering method metadata.                                                                         |
+| `generator`            |       No | Producer tool metadata.                                                                                           |
 
-## 7. Reader Behavior
+## 7. Reader Guidance (non-normative)
 
-A reader that does not understand this profile MAY ignore the metadata and read the file as ordinary GeoParquet.
+This section is informational. It does not impose conformance requirements on readers.
 
-An optimized reader SHOULD:
+A reader that does not understand this profile MAY ignore the `cogp` metadata and read the file as ordinary GeoParquet. The file remains fully readable as GeoParquet 1.1 regardless of whether the reader interprets COGP semantics.
 
-1. read the Parquet footer;
-2. parse GeoParquet metadata;
-3. parse `cogp` metadata;
-4. choose an LoD based on target render resolution;
-5. read row groups from `0` through the selected `row_group_end`;
-6. apply bbox filtering and row group pruning where possible;
-7. decode only required columns.
+A COGP-aware reader typically:
+
+1. parses `cogp` metadata from the Parquet file-level key-value metadata;
+2. chooses an LoD based on a target ground sample distance;
+3. reads row groups from `0` through the selected `row_group_end`;
+4. combines this with bbox covering and row group statistics to further prune row groups within the chosen LoD.
 
 ### 7.1 LoD selection
 
 A renderer can compute or estimate a target ground pixel size:
 
 ```text
-target_render_resolution_m = scale_denominator * display_pixel_size_m
+target_gsd = scale_denominator * display_pixel_size_m
 ```
 
-Then it can choose the finest LoD whose render resolution is still appropriate for that target.
-
-A simple rule is:
+It can then choose the finest LoD whose `gsd` is still appropriate for that target. A simple rule is:
 
 ```text
-nominal_render_resolution_m >= target_render_resolution_m
+gsd >= target_gsd
 ```
 
-If no LoD satisfies the target, the reader SHOULD choose the coarsest LoD.
+If no LoD satisfies the target, the reader can fall back to the coarsest LoD.
 
-Different readers MAY use different selection strategies, including zoom level, scale denominator, screen-space error, feature budget, byte budget, or latency budget.
+Different readers may use different selection strategies, including zoom level, scale denominator, screen-space error, feature budget, byte budget, or latency budget. COGP does not mandate a specific strategy.
 
 ## 8. Producer Behavior
 
 A producer SHOULD:
 
 1. derive coarse-to-fine LoDs;
-2. remove, simplify, aggregate, or defer geometry that is not independently renderable at each LoD;
+2. for each feature, choose the coarsest LoD at which the feature is independently renderable and place it in that LoD;
 3. spatially cluster features within each LoD;
 4. write LoDs in coarse-to-fine order;
 5. align LoD boundaries with Parquet row group boundaries;
 6. write GeoParquet 1.1 metadata;
 7. write `cogp` metadata.
 
-The producer MAY use any thinning, simplification, aggregation, or clustering method.
+Feature geometry and attributes MUST NOT be simplified or aggregated. Each source feature MUST appear at most once in the output.
 
-The method SHOULD be documented in optional metadata when useful.
-
-## 9. Byte Ranges
-
-LoD boundaries are defined by row group indices, not byte offsets.
-
-A future version MAY define byte offset hints or a stricter byte-range access model.
-
-In v0.1, readers SHOULD use the Parquet footer to determine which row groups and column chunks to read.
-
-A byte prefix such as `bytes=0-N` MUST NOT be assumed to be a valid standalone Parquet file.
-
-## 10. Validation
+## 9. Validation
 
 A validator SHOULD check:
 
@@ -265,16 +246,14 @@ A validator SHOULD check:
 * `cogp` metadata exists;
 * metadata is valid JSON;
 * `version` is supported;
-* `profile` is `progressive-rendering`;
 * `lods` is non-empty;
-* `row_group_end` values are valid and increasing;
+* `row_group_end` values are valid and strictly increasing;
 * the final `row_group_end` equals the final row group index;
-* `nominal_render_resolution_m` values are positive;
-* `nominal_render_resolution_m` values decrease from coarse to fine;
+* `gsd` values are positive;
+* `gsd` values strictly decrease from coarse to fine;
 * GeoParquet covering metadata exists;
 * the referenced bounding box covering column exists;
-* row group statistics are available for the covering column;
-* optional `feature_count` values match the row counts, if present.
+* row group statistics are available for the covering column.
 
 A validator MAY also compute quality metrics such as:
 
@@ -285,7 +264,7 @@ A validator MAY also compute quality metrics such as:
 
 These quality metrics are not conformance requirements.
 
-## 11. Non-goals
+## 10. Non-goals
 
 This profile does not define:
 
@@ -300,18 +279,6 @@ This profile does not define:
 * standalone prefix-Parquet semantics;
 * SQL query semantics.
 
-## 12. Open Questions
+## 11. One-line Definition
 
-For v0.2 or later:
-
-1. Should `nominal_render_resolution_m` be renamed?
-2. Should `feature_count` be required?
-3. Should byte offset hints be standardized?
-4. Should there be separate conformance classes for core metadata, spatial pruning, and progressive rendering quality?
-5. Should the profile recommend row group size ranges?
-6. Should the profile define standard quality metrics for progressive rendering?
-7. Should this remain an external profile or become a GeoParquet extension proposal?
-
-## 13. One-line Definition
-
-COGP is valid GeoParquet 1.1 with bbox covering, ordered from coarse to fine rendering detail, with row-group-aligned LoD metadata describing the render resolution at which each prefix is useful.
+COGP is valid GeoParquet 1.1 with bbox covering, ordered from coarse to fine rendering detail, where row-group-aligned LoD metadata tells a reader how many leading row groups to load for a target ground sample distance.
