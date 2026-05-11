@@ -1,6 +1,6 @@
 ---
 title: Cloud Optimized GeoParquet Profile (COGP)
-version: "0.1"
+version: "0.1.0"
 status: Draft
 scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
 ---
@@ -18,8 +18,6 @@ A COGP file is:
 3. organized so that each level of detail ends at a Parquet row group boundary;
 4. annotated with minimal metadata describing those level-of-detail boundaries.
 
-The profile does not define a new geometry encoding, a new CRS model, or a new tile scheme.
-
 ## 2. Motivation
 
 GeoParquet is well suited for geospatial analytics and cloud storage, but ordinary GeoParquet files are not necessarily optimized for progressive visual access.
@@ -36,9 +34,15 @@ COGP defines a conservative layout convention for this use case while keeping th
 
 The core idea is:
 
-> Earlier row groups contain geometry that is meaningful at coarse display resolutions. Later row groups add geometry that is only meaningful at finer display resolutions.
+> Earlier row groups contain features that are independently meaningful at coarse display resolutions. Later row groups add features that are only independently meaningful at finer display resolutions.
 
-Each feature appears in exactly one row group. Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels of detail.
+COGP is a **feature-level progressive subset**, not a geometry-detail level of detail scheme:
+
+* each source feature is placed, in full, in exactly one row group;
+* a feature's geometry is preserved verbatim — vertices, bends, and detail within a feature are never removed or simplified by this profile;
+* features are assigned to the coarsest LoD at which they become independently renderable as whole features.
+
+Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels of detail, and does not produce simplified geometries.
 
 A reader can choose how many leading row groups to load based on its target rendering resolution.
 
@@ -58,18 +62,15 @@ LoDs are represented by metadata and row group boundaries. This profile does not
 
 ### 4.2 Ground sample distance (GSD)
 
-`gsd` is the approximate ground distance below which geometric distinctions are not expected to be independently renderable at this LoD.
+`gsd` is the approximate smallest ground distance represented as an independently meaningful unit at this LoD.
 
-The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features at this LoD are not expected to be individually meaningful.
+The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features are not represented as independently meaningful at this LoD.
 
 The value is always expressed in meters of ground distance at the geographic location of the features, independent of the CRS or units used by the underlying data. For example, a file in EPSG:4326 (degrees) still expresses this value in meters.
 
-This includes, for example:
+For example, a LoD with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later LoDs.
 
-* two points being too close to appear as separate pixels;
-* a line segment or bend being too small to visually matter;
-* a polygon being too small to form a meaningful rendered shape;
-* a polygon being too small to form at least a minimal visible area at the target display scale.
+Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse LoD retains its full geometry, including fine internal detail.
 
 This value is rendering-oriented. It does not guarantee positional accuracy, topological validity, or analytical precision.
 
@@ -81,23 +82,31 @@ A COGP v0.1 file MUST satisfy the following requirements.
 
 The file MUST be a valid GeoParquet 1.1 file.
 
-The file MUST include GeoParquet `covering` metadata for a bounding box column associated with the geometry column identified by the GeoParquet `primary_column` metadata.
+The file MUST declare bounding box covering metadata under the primary geometry column, at the GeoParquet metadata path:
 
-The referenced bounding box covering column MUST be present in the file.
+```text
+geo.columns[<primary_column>].covering.bbox
+```
 
-The bounding box covering column MUST be written so that optimized readers can use Parquet row group statistics for spatial pruning.
+where `<primary_column>` is the value of the GeoParquet `primary_column` field.
+
+Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
+
+For COGP v0.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
 
 ### 5.2 Physical ordering
 
 The file MUST be ordered from coarse to fine rendering detail.
 
-Earlier row groups MUST contain features or geometry meaningful at coarser render resolutions.
+Earlier row groups MUST contain features that are independently meaningful at coarser render resolutions.
 
-Later row groups MUST add features or geometry meaningful only at finer render resolutions.
+Later row groups MUST add features that are independently meaningful only at finer render resolutions.
 
-Within each LoD, features SHOULD be spatially clustered.
+Every source feature MUST appear in exactly one row group. Feature geometry and attributes MUST NOT be simplified or aggregated.
 
-This profile does not require a specific clustering algorithm.
+LoD ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
+
+This profile does not constrain the order of features within a single LoD.
 
 ### 5.3 LoD boundaries
 
@@ -110,15 +119,27 @@ Each LoD entry MUST contain:
 * `row_group_end`
 * `gsd`
 
-`row_group_end` values MUST be strictly monotonically increasing.
+`row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
+
+`row_group_end` values MUST be strictly monotonically increasing across the `lods` array.
 
 The first LoD entry covers row groups from row group `0` through its `row_group_end`, inclusive.
 
-The final `row_group_end` value MUST equal the last row group index in the file.
+The row groups belonging to the second and later LoDs are the row groups after the previous LoD entry's `row_group_end` through the current LoD entry's `row_group_end`, inclusive.
 
-`gsd` values MUST be positive numbers.
+The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the LoDs collectively cover every row group in the file.
+
+`gsd` MUST be a positive JSON number.
 
 `gsd` values MUST be strictly monotonically decreasing from coarse to fine LoDs.
+
+### 5.4 Progressive access layout
+
+Producers SHOULD choose row group sizes so that each LoD prefix can be fetched and rendered with bounded latency over HTTP range requests or object storage.
+
+Producers SHOULD avoid placing so many bytes or features in an early row group that the first LoD is no longer useful as a coarse overview.
+
+This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
 
 ## 6. Metadata
 
@@ -130,11 +151,22 @@ cogp
 
 The value MUST be a UTF-8 JSON object.
 
-### 6.1 Minimal example
+### 6.1 Versioning and forward compatibility
+
+The `version` field is a string of the form `MAJOR.MINOR.PATCH` and identifies the COGP profile version. It follows semantic versioning:
+
+* a minor version increment (for example `0.1.0` to `0.2.0`, or `1.0.0` to `1.1.0`) MAY add new optional fields, but MUST NOT change the meaning or requirements of existing fields;
+* a major version increment (for example `0.x.y` to `1.0.0`, or `1.x.y` to `2.0.0`) MAY introduce breaking changes.
+
+Readers MUST ignore unrecognized fields in `cogp` metadata so that files written against a newer minor version of the profile remain readable.
+
+Readers MUST NOT interpret `cogp` metadata with an unsupported major version as conforming to this version of the profile.
+
+### 6.2 Minimal example
 
 ```json
 {
-  "version": "0.1",
+  "version": "0.1.0",
   "lods": [
     {
       "row_group_end": 0,
@@ -152,11 +184,11 @@ The value MUST be a UTF-8 JSON object.
 }
 ```
 
-### 6.2 Recommended example
+### 6.3 Recommended example
 
 ```json
 {
-  "version": "0.1",
+  "version": "0.1.0",
   "lods": [
     {
       "row_group_end": 0,
@@ -171,9 +203,6 @@ The value MUST be a UTF-8 JSON object.
       "gsd": 100
     }
   ],
-  "spatial_clustering": {
-    "method": "str-pack"
-  },
   "generator": {
     "name": "yosegi",
     "version": "0.8.0"
@@ -181,90 +210,47 @@ The value MUST be a UTF-8 JSON object.
 }
 ```
 
-### 6.3 Field definitions
+### 6.4 Field definitions
 
 | Field                  | Required | Description                                                                                                       |
 | ---------------------- | -------: | ----------------------------------------------------------------------------------------------------------------- |
 | `version`              |      Yes | Profile metadata version.                                                                                         |
 | `lods`                 |      Yes | Ordered LoD entries from coarse to fine.                                                                          |
 | `lods[].row_group_end` |      Yes | Inclusive row group index ending this LoD.                                                                        |
-| `lods[].gsd`           |      Yes | Approximate ground sample distance, in meters, below which geometry is not expected to be independently renderable. |
-| `spatial_clustering`   |       No | Informational clustering method metadata.                                                                         |
+| `lods[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this LoD, in meters.                  |
 | `generator`            |       No | Producer tool metadata.                                                                                           |
 
-## 7. Reader Guidance (non-normative)
+## 7. LoD selection (non-normative)
 
-This section is informational. It does not impose conformance requirements on readers.
-
-A reader that does not understand this profile MAY ignore the `cogp` metadata and read the file as ordinary GeoParquet. The file remains fully readable as GeoParquet 1.1 regardless of whether the reader interprets COGP semantics.
-
-A COGP-aware reader typically:
-
-1. parses `cogp` metadata from the Parquet file-level key-value metadata;
-2. chooses an LoD based on a target ground sample distance;
-3. reads row groups from `0` through the selected `row_group_end`;
-4. combines this with bbox covering and row group statistics to further prune row groups within the chosen LoD.
-
-### 7.1 LoD selection
-
-A renderer can compute or estimate a target ground pixel size:
+A renderer can compute or estimate a target ground pixel size in many ways. As one example, given an OGC-style scale denominator and a physical pixel size in meters (for instance, the OGC default of 0.28 mm, i.e. `0.00028` m), a target ground sample distance can be derived as:
 
 ```text
 target_gsd = scale_denominator * display_pixel_size_m
 ```
 
-It can then choose the finest LoD whose `gsd` is still appropriate for that target. A simple rule is:
+Readers MAY use any other definition of `display_pixel_size_m` — device pixel, CSS pixel, or library-specific virtual pixel — provided it is consistent with how they interpret `scale_denominator`. COGP does not mandate a specific definition.
+
+A reader can then choose the finest LoD whose `gsd` is not finer than the target ground pixel size. A simple rule is:
 
 ```text
 gsd >= target_gsd
 ```
 
+After selecting a target LoD, the reader reads row groups from `0` through that LoD's `row_group_end`, inclusive. Because each feature appears in exactly one LoD, rendering a finer LoD normally requires reading the preceding coarser LoDs as a prefix.
+
 If no LoD satisfies the target, the reader can fall back to the coarsest LoD.
 
 Different readers may use different selection strategies, including zoom level, scale denominator, screen-space error, feature budget, byte budget, or latency budget. COGP does not mandate a specific strategy.
 
-## 8. Producer Behavior
+## 8. Validation
 
-A producer SHOULD:
+A validator verifies that the file meets all requirements stated in Section 5.
 
-1. derive coarse-to-fine LoDs;
-2. for each feature, choose the coarsest LoD at which the feature is independently renderable and place it in that LoD;
-3. spatially cluster features within each LoD;
-4. write LoDs in coarse-to-fine order;
-5. align LoD boundaries with Parquet row group boundaries;
-6. write GeoParquet 1.1 metadata;
-7. write `cogp` metadata.
+The semantic correctness of coarse-to-fine ordering — whether the features placed in earlier row groups are genuinely meaningful at coarser display resolutions — is not fully machine-verifiable. Validators can only check structural and metadata conformance. Achieving meaningful LoD semantics is a producer responsibility.
 
-Feature geometry and attributes MUST NOT be simplified or aggregated. Each source feature MUST appear at most once in the output.
+A validator MAY also compute non-conformance quality metrics such as row group touch count for sample bbox queries, prefix rendering latency, spatial spread of coarse LoDs, or spatial clustering quality within each LoD.
 
-## 9. Validation
-
-A validator SHOULD check:
-
-* the file is valid Parquet;
-* the file is valid GeoParquet 1.1;
-* `cogp` metadata exists;
-* metadata is valid JSON;
-* `version` is supported;
-* `lods` is non-empty;
-* `row_group_end` values are valid and strictly increasing;
-* the final `row_group_end` equals the final row group index;
-* `gsd` values are positive;
-* `gsd` values strictly decrease from coarse to fine;
-* GeoParquet covering metadata exists;
-* the referenced bounding box covering column exists;
-* row group statistics are available for the covering column.
-
-A validator MAY also compute quality metrics such as:
-
-* row group touch count for sample bbox queries;
-* prefix rendering latency;
-* spatial spread of coarse LoDs;
-* spatial clustering quality within each LoD.
-
-These quality metrics are not conformance requirements.
-
-## 10. Non-goals
+## 9. Non-goals
 
 This profile does not define:
 
@@ -278,7 +264,3 @@ This profile does not define:
 * topology preservation guarantees;
 * standalone prefix-Parquet semantics;
 * SQL query semantics.
-
-## 11. One-line Definition
-
-COGP is valid GeoParquet 1.1 with bbox covering, ordered from coarse to fine rendering detail, where row-group-aligned LoD metadata tells a reader how many leading row groups to load for a target ground sample distance.
