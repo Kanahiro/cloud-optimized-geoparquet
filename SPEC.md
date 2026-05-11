@@ -231,7 +231,9 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 
 ## 7. LoD selection (non-normative)
 
-A renderer can compute or estimate a target ground pixel size in many ways. As one example, given an OGC-style scale denominator and a physical pixel size in meters (for instance, the OGC default of 0.28 mm, i.e. `0.00028` m), a target ground sample distance can be derived as:
+COGP metadata describes available LoDs, but it does not prescribe how a reader chooses one. A renderer can base the choice on zoom level, scale denominator, screen-space error, feature budget, byte budget, latency budget, or any other application-specific policy.
+
+One common strategy is to estimate the ground distance represented by one display pixel and select the finest LoD that is still appropriate for that display resolution. Given a scale denominator and an assumed display pixel size in meters, such a target ground sample distance can be derived as:
 
 ```text
 target_gsd = scale_denominator * display_pixel_size_m
@@ -239,17 +241,15 @@ target_gsd = scale_denominator * display_pixel_size_m
 
 Readers MAY use any other definition of `display_pixel_size_m` — device pixel, CSS pixel, or library-specific virtual pixel — provided it is consistent with how they interpret `scale_denominator`. COGP does not mandate a specific definition.
 
-A reader can then choose the finest LoD whose `gsd` is not finer than the target ground pixel size. A simple rule is:
+Because `lods` are ordered from coarse to fine and `gsd` values strictly decrease, a reader can select the last LoD in the `lods` array whose `gsd` is greater than or equal to `target_gsd`:
 
 ```text
 gsd >= target_gsd
 ```
 
+If no LoD satisfies this condition, the target display resolution is coarser than the coarsest LoD described by the file, and the reader can select the first LoD.
+
 After selecting a target LoD, the reader reads row groups from `0` through that LoD's `row_group_end`, inclusive. Because each feature appears in exactly one LoD, rendering a finer LoD normally requires reading the preceding coarser LoDs as a prefix.
-
-If no LoD satisfies the target, the reader can fall back to the coarsest LoD.
-
-Different readers may use different selection strategies, including zoom level, scale denominator, screen-space error, feature budget, byte budget, or latency budget. COGP does not mandate a specific strategy.
 
 ## 8. Validation
 
