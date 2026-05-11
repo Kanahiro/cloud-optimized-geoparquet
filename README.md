@@ -10,6 +10,16 @@ COGP is **feature-level**: it reorders features across row groups; it does not s
 
 A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
 
+## Design influences
+
+COGP is informed by several existing cloud-optimized and progressive rendering patterns:
+
+- Cloud Optimized GeoTIFF: remaining a valid GeoTIFF while adding cloud-friendly layout and overview structure;
+- Cloud Optimized Point Cloud: remaining a valid LAZ file while adding thinning and level-of-detail concepts;
+- tippecanoe: design choice to avoid rendering every feature literally at low zoom levels.
+
+COGP applies these ideas at the GeoParquet row group level. Unlike raster overviews or vector tile simplification pipelines, COGP keeps each feature geometry unchanged and places each source feature in exactly one level of detail.
+
 ## Why
 
 GeoParquet is well suited for analytics and cloud storage, but ordinary GeoParquet files are not laid out for progressive visual access. For map rendering, tile serving, and viewport-driven applications, readers often want to fetch a coarse overview first and only descend into finer detail when the display scale requires it.
