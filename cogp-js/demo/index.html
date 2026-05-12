@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>COGP Demo</title>
+    <link rel="stylesheet" href="./src/style.css" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/maplibre-gl@4.7.0/dist/maplibre-gl.css"
+    />
+  </head>
+  <body>
+    <div id="panel">
+      <h1>COGP Demo</h1>
+      <p class="hint">
+        Load a COGP file via HTTP range requests. Features are fetched per
+        visible Web Mercator tile and the LoD is auto-selected from the current
+        zoom.
+      </p>
+      <label>
+        URL
+        <input
+          id="url"
+          type="text"
+          placeholder="https://example.com/data.cogp.parquet"
+        />
+      </label>
+      <div class="row">
+        <button id="load">Load</button>
+        <button id="fly">Fit to data</button>
+      </div>
+      <div id="status">Idle.</div>
+      <details>
+        <summary>Metadata</summary>
+        <pre id="meta"></pre>
+      </details>
+    </div>
+    <div id="map"></div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

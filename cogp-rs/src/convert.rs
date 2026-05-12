@@ -52,6 +52,15 @@ pub struct ConvertArgs {
     /// Override auto-detected primary geometry column
     #[arg(long)]
     pub geometry_column: Option<String>,
+    /// Base resolution per tile side (units) used to derive the LoD thinning
+    /// grid when auto-deriving GSDs from zoom. The LoD-i GSD is the ground
+    /// distance covered by one base unit at zoom i (≈ `40_075_016 / (base ·
+    /// 2^i)` meters at the equator). Independent of the renderer's MVT
+    /// coordinate extent — this controls *thinning* granularity, not output
+    /// coordinate precision. The default of 512 matches MapLibre's 512-pixel
+    /// tile rendering. Ignored when `--gsd` is given.
+    #[arg(long, default_value_t = 512)]
+    pub base_resolution: u32,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -93,13 +102,21 @@ fn detect_input_units(input_geo: Option<&GeoMeta>, geom_col: &str) -> InputUnits
     classify(crs).unwrap_or(InputUnits::Degrees)
 }
 
-/// Web Mercator per-pixel ground resolution at the equator at zoom 0:
-/// `2π · 6_378_137 m / 256 px`. Halves at each successive zoom level.
-const WEB_MERCATOR_GSD_Z0: f64 = 156_543.033_928_040_97;
+/// Web Mercator equatorial circumference, used as `2π · 6_378_137 m`.
+const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_488;
 
-fn web_mercator_gsds(minzoom: u32, maxzoom: u32) -> Vec<f64> {
+/// Ground distance per base unit at the equator at zoom 0, for a tile sliced
+/// into `base_resolution` units per side. The default of 512 yields ~78272 m
+/// per unit at zoom 0 — the smallest distance the thinning grid distinguishes
+/// at the coarsest LoD.
+fn base_unit_gsd_z0(base_resolution: u32) -> f64 {
+    WEB_MERCATOR_CIRCUMFERENCE_M / (base_resolution as f64)
+}
+
+fn web_mercator_gsds(minzoom: u32, maxzoom: u32, base_resolution: u32) -> Vec<f64> {
+    let z0 = base_unit_gsd_z0(base_resolution);
     (minzoom..=maxzoom)
-        .map(|z| WEB_MERCATOR_GSD_Z0 / (1u64 << z) as f64)
+        .map(|z| z0 / (1u64 << z) as f64)
         .collect()
 }
 
@@ -117,12 +134,19 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         if args.maxzoom > 30 {
             bail!("--maxzoom must be <= 30 (got {})", args.maxzoom);
         }
-        let derived = web_mercator_gsds(args.minzoom, args.maxzoom);
+        if args.base_resolution == 0 {
+            bail!(
+                "--base-resolution must be > 0 (got {})",
+                args.base_resolution
+            );
+        }
+        let derived = web_mercator_gsds(args.minzoom, args.maxzoom, args.base_resolution);
         eprintln!(
-            "      auto-derived {} LoD(s) from Web Mercator z{}..=z{}",
+            "      auto-derived {} LoD(s) from Web Mercator z{}..=z{} (base resolution {})",
             derived.len(),
             args.minzoom,
-            args.maxzoom
+            args.maxzoom,
+            args.base_resolution,
         );
         derived
     };

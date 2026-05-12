@@ -1,0 +1,207 @@
+import maplibregl, { type LngLatBoundsLike } from 'maplibre-gl';
+import { CogpReader } from 'cogp';
+import type { FeatureCollection } from 'geojson';
+
+const EMPTY_FC: FeatureCollection = { type: 'FeatureCollection', features: [] };
+
+const map = new maplibregl.Map({
+  container: 'map',
+  hash: true,
+  style: {
+    version: 8,
+    sources: {
+      osm: {
+        type: 'raster',
+        tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        attribution: '&copy; OpenStreetMap contributors',
+        maxzoom: 19,
+      },
+    },
+    layers: [
+      { id: 'osm', type: 'raster', source: 'osm' },
+    ],
+  },
+  center: [0, 20],
+  zoom: 2,
+});
+
+map.addControl(new maplibregl.NavigationControl({}), 'top-right');
+
+map.on('load', () => {
+  map.addSource('cogp', { type: 'geojson', data: EMPTY_FC });
+  map.addLayer({
+    id: 'cogp-fill',
+    type: 'fill',
+    source: 'cogp',
+    filter: ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
+    paint: {
+      'fill-color': '#4a6cf7',
+      'fill-opacity': 0.35,
+      'fill-outline-color': '#1f3aa8',
+    },
+  });
+  map.addLayer({
+    id: 'cogp-line',
+    type: 'line',
+    source: 'cogp',
+    filter: ['any', ['==', ['geometry-type'], 'LineString'], ['==', ['geometry-type'], 'MultiLineString']],
+    paint: {
+      'line-color': '#1f3aa8',
+      'line-width': 1.5,
+    },
+  });
+  map.addLayer({
+    id: 'cogp-point',
+    type: 'circle',
+    source: 'cogp',
+    filter: ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
+    paint: {
+      'circle-radius': 3,
+      'circle-color': '#4a6cf7',
+      'circle-stroke-color': '#1f3aa8',
+      'circle-stroke-width': 1,
+    },
+  });
+});
+
+const urlInput = document.getElementById('url') as HTMLInputElement;
+const loadBtn = document.getElementById('load') as HTMLButtonElement;
+const flyBtn = document.getElementById('fly') as HTMLButtonElement;
+const statusEl = document.getElementById('status') as HTMLDivElement;
+const metaEl = document.getElementById('meta') as HTMLPreElement;
+
+function setStatus(msg: string): void {
+  statusEl.textContent = msg;
+}
+
+interface ActiveDataset {
+  reader: CogpReader;
+  // Monotonic ID — increments on each viewport request so stale reads that
+  // resolve after the user has moved on are dropped.
+  loadId: number;
+  // bbox of all row group envelopes, computed lazily.
+  dataBbox: LngLatBoundsLike | null;
+}
+
+let active: ActiveDataset | null = null;
+
+loadBtn.addEventListener('click', () => {
+  void loadDataset(urlInput.value.trim());
+});
+
+flyBtn.addEventListener('click', () => {
+  if (!active?.dataBbox) {
+    setStatus('No data bbox available yet.');
+    return;
+  }
+  map.fitBounds(active.dataBbox, { padding: 40, maxZoom: 14 });
+});
+
+async function loadDataset(url: string): Promise<void> {
+  if (!url) {
+    setStatus('Enter a URL first.');
+    return;
+  }
+  loadBtn.disabled = true;
+  setStatus(`Opening ${url} …`);
+  try {
+    const reader = await CogpReader.open(url);
+    const dataBbox = computeDataBbox(reader);
+    active = {
+      reader,
+      loadId: 0,
+      dataBbox,
+    };
+    renderMetadata(reader);
+    if (dataBbox) {
+      map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
+    }
+    setStatus(
+      `Opened. ${reader.numRowGroups} row groups across ${reader.lods.length} LoDs.`,
+    );
+    await refreshViewport();
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${(err as Error).message}`);
+    active = null;
+  } finally {
+    loadBtn.disabled = false;
+  }
+}
+
+function renderMetadata(reader: CogpReader): void {
+  const summary = {
+    primary_column: reader.primaryGeometryColumn,
+    num_row_groups: reader.numRowGroups,
+    lods: reader.lods.map((l, i) => ({
+      i,
+      gsd: l.gsd,
+      row_group_end: l.row_group_end,
+    })),
+    crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
+  };
+  metaEl.textContent = JSON.stringify(summary, null, 2);
+}
+
+function computeDataBbox(reader: CogpReader): LngLatBoundsLike | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < reader.numRowGroups; i++) {
+    const env = reader.rowGroupEnvelope(i);
+    if (!env) continue;
+    if (env.minX < minX) minX = env.minX;
+    if (env.minY < minY) minY = env.minY;
+    if (env.maxX > maxX) maxX = env.maxX;
+    if (env.maxY > maxY) maxY = env.maxY;
+  }
+  if (!isFinite(minX)) return null;
+  return [
+    [minX, minY],
+    [maxX, maxY],
+  ];
+}
+
+map.on('moveend', () => {
+  void refreshViewport();
+});
+
+async function refreshViewport(): Promise<void> {
+  if (!active) return;
+  const ds = active;
+  const z = Math.max(0, Math.min(22, Math.floor(map.getZoom())));
+  const bounds = map.getBounds();
+  const bbox = {
+    minX: bounds.getWest(),
+    minY: bounds.getSouth(),
+    maxX: bounds.getEast(),
+    maxY: bounds.getNorth(),
+  };
+  const maxLod = ds.reader.selectLod(gsdForZoom(z));
+
+  const myLoadId = ++ds.loadId;
+  setStatus(`Reading at z=${z} (lod ≤ ${maxLod}) …`);
+  try {
+    const fc = await ds.reader.readAsGeoJSON({ bbox, maxLod });
+    if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
+    const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;
+    src?.setData(fc as FeatureCollection);
+    setStatus(`Rendered ${fc.features.length} features at z=${z} (lod ≤ ${maxLod}).`);
+  } catch (err) {
+    console.warn('read failed', err);
+    setStatus(`Read error: ${(err as Error).message}`);
+  }
+}
+
+// Target ground-sample distance for a tile zoom level. Must match the
+// `--base-resolution` the cogp file was authored with (default 512): the
+// LoD-i GSD is `(2π · 6_378_137) / (base · 2^i)` m at the equator, so using
+// the same base here keeps `zoom ↔ LoD index` 1:1.
+const BASE_RESOLUTION = 512;
+const EARTH_CIRCUMFERENCE_M = 40075016.685578488;
+const BASE_GSD_Z0 = EARTH_CIRCUMFERENCE_M / BASE_RESOLUTION;
+function gsdForZoom(zoom: number): number {
+  return BASE_GSD_Z0 / Math.pow(2, zoom);
+}
