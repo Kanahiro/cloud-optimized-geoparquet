@@ -61,6 +61,13 @@ pub struct ConvertArgs {
     /// tile rendering. Ignored when `--gsd` is given.
     #[arg(long, default_value_t = 512)]
     pub base_resolution: u32,
+    /// Point-like features (zero-area bbox) use a thinning grid this many
+    /// times coarser than `prec` per axis, yielding ~factor² fewer points
+    /// per LoD than polygons. Compensates for the fact that polygons span
+    /// multiple cells visually while points occupy one, so equal grid
+    /// density looks too dense for points. `1` disables (legacy behavior).
+    #[arg(long, default_value_t = 4)]
+    pub point_thinning_factor: u32,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -233,8 +240,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             }
         };
 
+    if args.point_thinning_factor == 0 {
+        bail!(
+            "--point-thinning-factor must be >= 1 (got {})",
+            args.point_thinning_factor
+        );
+    }
     eprintln!("[3/4] Assigning features to {} LoD(s)", gsds.len());
-    let assignment = assign_lods(&bboxes, &gsds, input_units)?;
+    let assignment = assign_lods(&bboxes, &gsds, input_units, args.point_thinning_factor)?;
     let mut per_lod_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, lod_i) in assignment.iter().enumerate() {
         per_lod_full[*lod_i as usize].push(idx as u32);
@@ -599,7 +612,12 @@ fn compute_bboxes(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<Bbox>>
 /// Features whose bbox is smaller than `prec` are deferred to a finer LoD where they
 /// become independently meaningful — except point-like features (size <= 0) which
 /// are always eligible from the coarsest LoD.
-fn assign_lods(bboxes: &[Bbox], gsds: &[f64], units: InputUnits) -> Result<Vec<u16>> {
+fn assign_lods(
+    bboxes: &[Bbox],
+    gsds: &[f64],
+    units: InputUnits,
+    point_thinning_factor: u32,
+) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
     const METERS_PER_DEGREE: f64 = 111_320.0;
@@ -617,6 +635,17 @@ fn assign_lods(bboxes: &[Bbox], gsds: &[f64], units: InputUnits) -> Result<Vec<u
             InputUnits::Auto => unreachable!("Auto must be resolved before assign_lods"),
         })
         .collect();
+
+    // Zero-area bbox → point-like (true Point or coincident multi-point). These need
+    // a coarser grid than extent features: polygons of size==prec span ~1 cell so 1
+    // pick/cell already overlaps visually, but points are point-sized so a full cell
+    // grid renders saturated. Multiplying prec by `point_thinning_factor` per axis
+    // gives ~factor² fewer points per LoD.
+    let is_point: Vec<bool> = bboxes
+        .par_iter()
+        .map(|b| b.width() <= 0.0 && b.height() <= 0.0)
+        .collect();
+    let point_mul = point_thinning_factor as f64;
 
     // For each feature, the coarsest LoD index at which it becomes independently meaningful.
     let min_visible: Vec<u16> = bboxes
@@ -640,14 +669,24 @@ fn assign_lods(bboxes: &[Bbox], gsds: &[f64], units: InputUnits) -> Result<Vec<u
         // local HashMap, then the reduce step merges them, picking the higher priority
         // entry on collisions. This keeps the priority semantics identical to the
         // sequential version (priority is a total order on (area_bits, row_hash)).
-        let best: HashMap<(i64, i64), u32> = remaining
+        // Key namespaced by feature kind because point cells use a different grid
+        // pitch (prec*point_mul) than polygon cells (prec); without the kind tag,
+        // a point cell (i,j) and a polygon cell (i,j) would collide in the map
+        // despite representing entirely different physical regions.
+        let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
                 if min_visible[row as usize] as usize > lod_i {
                     return local;
                 }
                 let b = bboxes[row as usize];
-                let key = ((b.cx() / prec).floor() as i64, (b.cy() / prec).floor() as i64);
+                let pt = is_point[row as usize];
+                let eff_prec = if pt { prec * point_mul } else { *prec };
+                let key = (
+                    pt as u8,
+                    (b.cx() / eff_prec).floor() as i64,
+                    (b.cy() / eff_prec).floor() as i64,
+                );
                 match local.get(&key) {
                     None => {
                         local.insert(key, row);
