@@ -72,15 +72,3 @@ Checks the structural requirements in [SPEC §5](../SPEC.md):
 - `gsd` values are positive and strictly monotonically decreasing.
 
 Exit code is non-zero on validation failure.
-
-## Notes
-
-This is a reference implementation, not a production tool:
-
-- the full input table is materialized in memory;
-- coordinates are treated as flat 2D — there is no geodesic / spherical handling.
-  The meter-to-degree conversion is a flat `1° = 111320 m`, latitude is ignored,
-  and antimeridian-crossing bboxes are not detected. Reproject to a meter-based
-  CRS for accurate results;
-- the priority during thinning is `bbox area DESC` (with a row-index hash tie-break),
-  so larger features tend to land in coarser LoDs.
