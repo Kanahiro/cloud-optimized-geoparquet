@@ -221,8 +221,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let n_rows = table.num_rows();
     eprintln!("      features: {n_rows}");
 
-    eprintln!("[2/4] Computing per-feature bbox");
-    let bboxes = compute_bboxes(&table, geom_col_idx)?;
+    let (bboxes, existing_bbox_col) =
+        match read_existing_bboxes(&table, input_geo.as_ref(), &geom_col_name) {
+            Some((name, bb)) => {
+                eprintln!("[2/4] Reusing existing bbox column `{name}` from input");
+                (bb, Some(name))
+            }
+            None => {
+                eprintln!("[2/4] Computing per-feature bbox from WKB");
+                (compute_bboxes(&table, geom_col_idx)?, None)
+            }
+        };
 
     eprintln!("[3/4] Assigning features to {} LoD(s)", gsds.len());
     let assignment = assign_lods(&bboxes, &gsds, input_units)?;
@@ -267,11 +276,16 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
     // Build output schema: input schema (drop pre-existing `bbox` if any) + our bbox struct.
-    let drop_names: Vec<&str> = vec!["bbox"];
+    let mut drop_names: Vec<String> = vec!["bbox".to_string()];
+    if let Some(name) = existing_bbox_col.as_ref() {
+        if !drop_names.iter().any(|n| n == name) {
+            drop_names.push(name.clone());
+        }
+    }
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
-        if drop_names.contains(&f.name().as_str()) {
+        if drop_names.iter().any(|n| n == f.name()) {
             eprintln!("      note: dropping input column `{}` (will be overwritten)", f.name());
             continue;
         }
@@ -494,6 +508,55 @@ fn guess_geometry_column(schema: &Schema) -> Option<String> {
         }
     }
     None
+}
+
+/// If the input declares a bbox covering column (GeoParquet 1.1 `covering.bbox`),
+/// read the per-row bboxes directly from it instead of recomputing from WKB.
+/// Returns `None` if the metadata is missing, the referenced column is not a
+/// top-level Float64 struct with the expected children, or any value is null.
+fn read_existing_bboxes(
+    table: &RecordBatch,
+    input_geo: Option<&GeoMeta>,
+    geom_col: &str,
+) -> Option<(String, Vec<Bbox>)> {
+    let covering = input_geo?.columns.get(geom_col)?.covering.as_ref()?;
+    let b = &covering.bbox;
+    if b.xmin.len() != 2 || b.ymin.len() != 2 || b.xmax.len() != 2 || b.ymax.len() != 2 {
+        return None;
+    }
+    let col_name = &b.xmin[0];
+    if &b.ymin[0] != col_name || &b.xmax[0] != col_name || &b.ymax[0] != col_name {
+        return None;
+    }
+    let col_idx = table.schema().index_of(col_name).ok()?;
+    let struct_arr = table
+        .column(col_idx)
+        .as_any()
+        .downcast_ref::<StructArray>()?;
+    let get = |name: &str| -> Option<&Float64Array> {
+        struct_arr
+            .column_by_name(name)?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+    };
+    let xmin = get(&b.xmin[1])?;
+    let ymin = get(&b.ymin[1])?;
+    let xmax = get(&b.xmax[1])?;
+    let ymax = get(&b.ymax[1])?;
+    let n = table.num_rows();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if xmin.is_null(i) || ymin.is_null(i) || xmax.is_null(i) || ymax.is_null(i) {
+            return None;
+        }
+        out.push(Bbox {
+            xmin: xmin.value(i),
+            ymin: ymin.value(i),
+            xmax: xmax.value(i),
+            ymax: ymax.value(i),
+        });
+    }
+    Some((col_name.clone(), out))
 }
 
 fn compute_bboxes(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<Bbox>> {
