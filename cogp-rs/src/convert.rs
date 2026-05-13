@@ -752,8 +752,11 @@ fn assign_lods(
     let line_mul = line_thinning_factor as f64;
 
     // Coarsest LoD at which each feature is independently meaningful (its bbox
-    // size ≥ that LoD's prec). Points have no extent so are always eligible
-    // from LoD 0; the point grid coarsening above keeps them from over-saturating.
+    // diagonal ≥ that LoD's prec). Diagonal — rather than max(w, h) — so a
+    // 45° line is rated by its actual length, not its axis-aligned shadow.
+    // Compared in squared form to avoid a per-row sqrt. Points have no extent
+    // so are always eligible from LoD 0.
+    let sq_precs: Vec<f64> = precs.iter().map(|p| p * p).collect();
     let min_visible: Vec<u16> = bboxes
         .par_iter()
         .zip(kinds.par_iter())
@@ -761,12 +764,12 @@ fn assign_lods(
             if *k == GeomKind::Point {
                 return 0u16;
             }
-            let size = b.width().max(b.height());
-            if size <= 0.0 {
+            let sq_diag = b.width().powi(2) + b.height().powi(2);
+            if sq_diag <= 0.0 {
                 return 0u16;
             }
-            for (i, prec) in precs.iter().enumerate() {
-                if size >= *prec {
+            for (i, sp) in sq_precs.iter().enumerate() {
+                if sq_diag >= *sp {
                     return i as u16;
                 }
             }
@@ -855,23 +858,26 @@ fn assign_lods(
     Ok(out)
 }
 
-/// Primary order: bbox Manhattan extent `width + height` (bits — gives a total
-/// order over f64 including NaN guard). Used as a kind-agnostic "size" proxy:
-/// for polygons it favors the larger/more-elongated feature; for axis-aligned
-/// lines it equals the actual length so longer lines win; for points it is 0
-/// so ties fall through to the hashed secondary. Secondary: hashed row index
-/// for a deterministic tie-break.
+/// Primary order: bbox diagonal `w² + h²` (squared, monotonic in the real
+/// diagonal, bits give a total order over f64 including NaN guard). Used as
+/// a kind-agnostic, orientation-independent "size" proxy: a 45° line scores
+/// the same as an axis-aligned line of equal true length, and a square
+/// polygon scores the same as a 90°-rotated one. For points it is 0 so ties
+/// fall through to the hashed secondary. Secondary: hashed row index for a
+/// deterministic tie-break.
 fn priority(b: &Bbox, row: u32) -> (u64, u64) {
-    let extent = b.width().max(0.0) + b.height().max(0.0);
-    let extent_bits = if extent.is_finite() && extent >= 0.0 {
-        extent.to_bits()
+    let w = b.width().max(0.0);
+    let h = b.height().max(0.0);
+    let sq_diag = w * w + h * h;
+    let sq_bits = if sq_diag.is_finite() && sq_diag >= 0.0 {
+        sq_diag.to_bits()
     } else {
         0
     };
-    let mut h = row as u64;
-    h = h.wrapping_mul(0x9E3779B97F4A7C15);
-    h ^= h >> 30;
-    (extent_bits, h)
+    let mut hash = row as u64;
+    hash = hash.wrapping_mul(0x9E3779B97F4A7C15);
+    hash ^= hash >> 30;
+    (sq_bits, hash)
 }
 
 /// Sort-Tile-Recursive packing: divide into ~sqrt(N/M) strips by center-x, then sort by
