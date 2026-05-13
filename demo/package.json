@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "cogp": "file:..",
+    "cogp": "file:../cogp-js",
     "maplibre-gl": "^4.7.0"
   },
   "devDependencies": {
