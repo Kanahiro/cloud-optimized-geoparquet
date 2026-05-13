@@ -2,73 +2,102 @@
 
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](../SPEC.md).
 
-The convert command uses grid-based density thinning per LoD and
-Sort-Tile-Recursive (STR) bbox packing inside each LoD.
+`convert` reorders the features of a GeoParquet file across row groups using
+grid-based density thinning per LoD and Sort-Tile-Recursive (STR) bbox packing
+inside each LoD. `validate` checks the structural rules in SPEC §5.
 
-## Build
+## Install
 
-```
-cargo build --release
-```
+Pre-built binaries for Linux / macOS / Windows are attached to each
+[GitHub release](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases).
 
-## Usage
-
-### Convert a GeoParquet 1.x file into a COGP file
+Or build from source:
 
 ```
-# Auto-derive GSDs from Web Mercator zoom levels (default: z0..=z16)
+cargo build --release -p cogp
+# binary at cogp-rs/target/release/cogp
+```
+
+## Quickstart
+
+```
 cogp convert input.parquet output.cogp.parquet
-
-# Specify a narrower zoom range
-cogp convert input.parquet output.cogp.parquet --minzoom 4 --maxzoom 14
-
-# Or pass explicit GSDs directly
-cogp convert input.parquet output.cogp.parquet \
-    --gsd 1000000,500000,100000,10000 \
-    --row-group-size 10000
+cogp validate output.cogp.parquet
 ```
 
-- `--gsd` — comma-separated GSD list, **meters**, strictly decreasing (coarsest first).
-  Mutually exclusive with `--minzoom`/`--maxzoom`.
-- `--minzoom` / `--maxzoom` — Web Mercator zoom range used when `--gsd` is omitted
-  (defaults 0 and 16). The per-LoD GSD is the Web Mercator per-pixel resolution at
-  the equator: `156543.03 m / 2^zoom`. Empty LoDs (no features assigned) are
-  automatically dropped.
-- `--row-group-size` — max Parquet row group size in rows (default 10000).
-- `--input-units` — `auto` (default), `degrees`, or `meters`. `auto` reads the
-  GeoParquet `crs` PROJJSON: `ProjectedCRS` → meters, otherwise degrees (absent /
-  null `crs` defaults to OGC:CRS84 → degrees). Pass `degrees` or `meters`
-  explicitly to override detection.
+The defaults auto-derive 17 LoDs from Web Mercator z0..=z16 and work on any
+GeoParquet 1.x file with a WKB geometry column.
+
+## convert
+
+```
+cogp convert <INPUT> <OUTPUT> [OPTIONS]
+```
+
+Examples:
+
+```
+# Narrow the zoom range and bump the row group size for a small dataset.
+cogp convert input.parquet output.cogp.parquet \
+    --minzoom 4 --maxzoom 12 --row-group-size 20000
+
+# Non-Web-Mercator renderer: pass GSDs directly (meters, coarse to fine).
+cogp convert input.parquet output.cogp.parquet \
+    --gsd 1000,500,100,50
+
+# Point dataset already in a projected CRS; thin points more aggressively.
+cogp convert points.parquet points.cogp.parquet \
+    --input-units meters --point-thinning-factor 8
+```
+
+LoD selection (mutually exclusive):
+
+- `--gsd 1000,500,100,50` — explicit ground sample distances in **meters**,
+  strictly decreasing. Use this for non-Web-Mercator renderers.
+- `--minzoom` / `--maxzoom` (default `0` / `16`) — derive GSDs from a Web
+  Mercator tile pyramid: `GSD(z) = 40_075_016 / (base_resolution · 2^z)` m.
+  Empty LoDs (no features assigned) are dropped automatically.
+- `--base-resolution` (default `512`) — units per tile side used in the
+  Web Mercator GSD formula above. `512` matches MapLibre's 512 px tiles.
+  Controls thinning granularity only; ignored when `--gsd` is given.
+
+Other options:
+
+- `--row-group-size` (default `10000`) — max Parquet row group size in rows.
+  Row group boundaries always align with LoD boundaries.
+- `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
+  PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
+  per OGC:CRS84). Override with `degrees` or `meters` explicitly.
   **For datasets spanning high latitudes or the antimeridian, reproject to a
-  meter-based CRS (UTM, equal-area, etc.) before running `convert`. The
-  degree-to-meter conversion is rendering-grade, not geodesic.**
+  meter-based CRS before running `convert`.** The degree→meter conversion is
+  rendering-grade, not geodesic.
+- `--point-thinning-factor` (default `4`) — point-like features (zero-area
+  bbox) thin on a grid this many times coarser per axis than polygons, since
+  points occupy a single cell visually. Set to `1` to disable.
 - `--geometry-column` — override the auto-detected primary geometry column.
+  Input must be a WKB `Binary`/`LargeBinary` Arrow column.
 
 The output file:
 
-- preserves all original columns (overwriting any pre-existing `bbox` column);
-- adds a `bbox` struct column with `xmin/ymin/xmax/ymax: f64`;
-- emits one or more row groups per LoD; row group boundaries always align with
-  LoD boundaries;
-- writes valid GeoParquet 1.1 `geo` metadata that points `covering.bbox` at the
-  `bbox` struct column;
-- writes COGP `cogp` metadata listing the row-group-end and GSD for each LoD.
+- preserves all original columns (overwriting any pre-existing `bbox`
+  column or input covering-bbox struct);
+- adds a `bbox` struct column with `xmin/ymin/xmax/ymax: f64` and writes
+  GeoParquet 1.1 `geo` metadata that points `covering.bbox` at it;
+- emits one or more row groups per LoD, written in coarse-to-fine order;
+- writes `cogp` metadata listing the `row_group_end` and `gsd` of each LoD.
 
-Input must use WKB geometry in a `Binary`/`LargeBinary` Arrow column.
-
-### Validate a COGP file
+## validate
 
 ```
-cogp validate file.cogp.parquet
+cogp validate <FILE>
 ```
 
-Checks the structural requirements in [SPEC §5](../SPEC.md):
+Checks SPEC §5:
 
-- GeoParquet 1.x `geo` metadata is present, with a `covering.bbox`;
+- `geo` metadata is present (GeoParquet 1.x) with a `covering.bbox`;
 - each covering bbox column has Parquet row group min/max statistics;
 - `cogp` metadata is present with a non-empty `lods` array;
-- `row_group_end` values are valid, strictly monotonically increasing, and the
-  final one equals `num_row_groups - 1`;
-- `gsd` values are positive and strictly monotonically decreasing.
+- `row_group_end` values are strictly increasing and end at `num_row_groups - 1`;
+- `gsd` values are positive and strictly decreasing.
 
-Exit code is non-zero on validation failure.
+Exits non-zero on failure.
