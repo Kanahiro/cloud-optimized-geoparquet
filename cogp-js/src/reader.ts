@@ -1,18 +1,16 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
 import { compressors as defaultCompressors } from 'hyparquet-compressors';
-import { Table } from 'apache-arrow';
 
 import {
   type Bbox,
   type BboxColumnIndexes,
   findBboxColumnIndexes,
   type FileMetadataLike,
+  rowGroupBbox,
   rowGroupIntersects,
-  type RowGroupLike,
 } from './bbox.js';
-import { rowGroupPrefixForLod, selectLodByGsd } from './lod.js';
+import { selectLodByGsd } from './lod.js';
 import { type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
-import { rowsToArrowTable } from './arrow.js';
 import { type FeatureCollection, rowsToFeatureCollection } from './geojson.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
@@ -169,34 +167,14 @@ export class CogpReader {
     return selectLodByGsd(this.lods, targetGsd);
   }
 
-  /** Read a contiguous LoD prefix, optionally bbox-pruned, as a single Arrow Table. */
-  async readTable(opts: ReadOptions = {}): Promise<Table> {
-    const rows = await this.readRows(opts);
-    return rowsToArrowTable(rows);
-  }
-
   /**
    * Read a contiguous LoD prefix, optionally bbox-pruned, as a GeoJSON
-   * FeatureCollection. Faster than `readTable` for map rendering: the
-   * geometry column is decoded straight from WKB and other columns flow into
-   * `properties` without going through Arrow's type system.
+   * FeatureCollection. The geometry column is decoded straight from WKB and
+   * other columns flow into `properties`.
    */
   async readAsGeoJSON(opts: ReadOptions = {}): Promise<FeatureCollection> {
     const rows = await this.readRows(opts);
     return rowsToFeatureCollection(rows, this.geo.primary_column);
-  }
-
-  /**
-   * Yield an Arrow Table per surviving row group, in coarse-to-fine order.
-   * Useful for progressive rendering: the first yield is the coarsest LoD.
-   */
-  async *stream(opts: ReadOptions = {}): AsyncGenerator<Table> {
-    const maxLod = opts.maxLod ?? this.lods.length - 1;
-    const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLod, bbox);
-    for (const rg of rgs) {
-      yield rowsToArrowTable(await this.readRowGroupsAsRows([rg], opts.columns));
-    }
   }
 
   /** Bbox of a single row group as derived from covering column statistics. */
@@ -204,13 +182,16 @@ export class CogpReader {
     if (!this.bboxColIdx) return null;
     const rg = this.metadata.row_groups[rgIndex];
     if (!rg) return null;
-    return rowGroupEnvelopeFromIdx(rg, this.bboxColIdx);
+    return rowGroupBbox(rg, this.bboxColIdx);
   }
 
   private candidateRowGroups(maxLod: number, bbox?: Bbox): number[] {
-    const range = rowGroupPrefixForLod(this.lods, maxLod);
+    if (maxLod < 0 || maxLod >= this.lods.length) {
+      throw new Error(`maxLod ${maxLod} out of range [0, ${this.lods.length})`);
+    }
+    const end = this.lods[maxLod]!.row_group_end;
     const out: number[] = [];
-    for (let i = range.start; i <= range.end; i++) {
+    for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
       if (bbox && this.bboxColIdx) {
         if (!rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
@@ -269,24 +250,6 @@ export class CogpReader {
     return n;
   }
 
-}
-
-function rowGroupEnvelopeFromIdx(rg: RowGroupLike, idx: BboxColumnIndexes): Bbox | null {
-  const stat = (i: number) => rg.columns[i]?.meta_data?.statistics ?? null;
-  const num = (s: unknown, k: 'min' | 'max'): number | null => {
-    if (!s || typeof s !== 'object') return null;
-    const rec = s as Record<string, unknown>;
-    const v = k === 'min' ? (rec['min_value'] ?? rec['min']) : (rec['max_value'] ?? rec['max']);
-    if (typeof v === 'number') return v;
-    if (typeof v === 'bigint') return Number(v);
-    return null;
-  };
-  const minX = num(stat(idx.xmin), 'min');
-  const minY = num(stat(idx.ymin), 'min');
-  const maxX = num(stat(idx.xmax), 'max');
-  const maxY = num(stat(idx.ymax), 'max');
-  if (minX === null || minY === null || maxX === null || maxY === null) return null;
-  return { minX, minY, maxX, maxY };
 }
 
 function normalizeBbox(input?: BboxInput): Bbox | undefined {

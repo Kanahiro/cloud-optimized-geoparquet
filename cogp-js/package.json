@@ -19,7 +19,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "apache-arrow": "^17.0.0",
     "hyparquet": "^1.10.0",
     "hyparquet-compressors": "^1.1.1"
   },

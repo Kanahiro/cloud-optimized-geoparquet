@@ -23,27 +23,24 @@ for (const gsd of [100000, 5000, 500, 50]) {
   console.log(`  target ${gsd}m -> lod ${idx} (gsd ${reader.lods[idx].gsd.toFixed(2)}m)`);
 }
 
-console.log('\n---- coarsest LoD as Arrow Table ----');
-const coarse = await reader.readTable({ maxLod: 0 });
-console.log('numRows:', coarse.numRows);
-console.log('schema :', coarse.schema.fields.map(f => `${f.name}:${f.type}`).join(', '));
-const geomVec = coarse.getChild(reader.primaryGeometryColumn);
-console.log('geometry vector type:', geomVec?.type?.toString());
-console.log('first WKB bytes:', geomVec?.get(0)?.length, 'bytes');
+console.log('\n---- coarsest LoD as GeoJSON ----');
+const coarse = await reader.readAsGeoJSON({ maxLod: 0 });
+console.log('features:', coarse.features.length);
+console.log('first feature geometry type:', coarse.features[0]?.geometry?.type);
 
 console.log('\n---- full file ----');
-const full = await reader.readTable();
-console.log('numRows:', full.numRows);
+const full = await reader.readAsGeoJSON();
+console.log('features:', full.features.length);
 
 console.log('\n---- bbox filter ----');
 // Data is around lng/lat (142.4, 44.15) — central Hokkaido
-const filtered = await reader.readTable({
+const filtered = await reader.readAsGeoJSON({
   bbox: [142.35, 44.10, 142.65, 44.25],
 });
-console.log('within data bbox:', filtered.numRows);
+console.log('within data bbox:', filtered.features.length);
 
-const noHit = await reader.readTable({ bbox: [0, 0, 1, 1] });
-console.log('outside bbox (should be 0):', noHit.numRows);
+const noHit = await reader.readAsGeoJSON({ bbox: [0, 0, 1, 1] });
+console.log('outside bbox (should be 0):', noHit.features.length);
 
 console.log('\n---- readAsGeoJSON (bbox around the data) ----');
 const fc = await reader.readAsGeoJSON({
@@ -52,15 +49,6 @@ const fc = await reader.readAsGeoJSON({
 });
 console.log('features:', fc.features.length);
 console.log('first feature geometry type:', fc.features[0]?.geometry?.type);
-
-console.log('\n---- stream() ----');
-let streamed = 0;
-let batches = 0;
-for await (const batch of reader.stream({ maxLod: 3 })) {
-  streamed += batch.numRows;
-  batches++;
-}
-console.log(`streamed ${streamed} rows in ${batches} batches (up to lod 3)`);
 
 console.log('\nOK');
 
