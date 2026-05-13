@@ -230,10 +230,10 @@ function rowsToFeatureCollection(
 }
 
 // Target ground-sample distance for a tile zoom level. Must match the
-// `--base-resolution` the cogp file was authored with (default 512): the
+// `--base-resolution` the cogp file was authored with (default 1024): the
 // LoD-i GSD is `(2π · 6_378_137) / (base · 2^i)` m at the equator, so using
 // the same base here keeps `zoom ↔ LoD index` 1:1.
-const BASE_RESOLUTION = 512;
+const BASE_RESOLUTION = 1024;
 const EARTH_CIRCUMFERENCE_M = 40075016.685578488;
 const BASE_GSD_Z0 = EARTH_CIRCUMFERENCE_M / BASE_RESOLUTION;
 function gsdForZoom(zoom: number): number {

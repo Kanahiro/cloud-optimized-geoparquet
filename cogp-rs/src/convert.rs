@@ -65,11 +65,11 @@ pub struct ConvertArgs {
     /// meters at the equator — i.e. it bakes in the Web Mercator equatorial
     /// circumference and the standard `2^z` tile pyramid. This controls
     /// *thinning* granularity, not output coordinate precision. The default
-    /// of 4096 matches the MVT coordinate extent, so thinning aligns with
-    /// the quantization grid of typical vector-tile renderers. Ignored when
-    /// --gsd is given (in that case the GSDs are taken verbatim and no
-    /// projection is assumed).
-    #[arg(long, default_value_t = 4096)]
+    /// of 1024 keeps the thinning grid at ~4× the typical 256-pixel tile
+    /// resolution, so features collapsing within a few subpixels are
+    /// dropped. Ignored when --gsd is given (in that case the GSDs are
+    /// taken verbatim and no projection is assumed).
+    #[arg(long, default_value_t = 1024)]
     pub base_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times coarser than `prec` per axis, yielding ~factor² fewer
@@ -131,7 +131,7 @@ fn detect_input_units(input_geo: Option<&GeoMeta>, geom_col: &str) -> InputUnits
 const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_488;
 
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
-/// into `base_resolution` units per side. The default of 4096 yields ~9784 m
+/// into `base_resolution` units per side. The default of 1024 yields ~39136 m
 /// per unit at zoom 0 — the smallest distance the thinning grid distinguishes
 /// at the coarsest LoD.
 fn base_unit_gsd_z0(base_resolution: u32) -> f64 {

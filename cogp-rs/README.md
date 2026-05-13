@@ -57,10 +57,11 @@ LoD selection (mutually exclusive):
 - `--minzoom` / `--maxzoom` (default `0` / `16`) — derive GSDs from a Web
   Mercator tile pyramid: `GSD(z) = 40_075_016 / (base_resolution · 2^z)` m.
   Empty LoDs (no features assigned) are dropped automatically.
-- `--base-resolution` (default `4096`) — units per tile side used in the
-  Web Mercator GSD formula above. `4096` matches the MVT coordinate extent,
-  so the thinning grid aligns with typical vector-tile quantization.
-  Controls thinning granularity only; ignored when `--gsd` is given.
+- `--base-resolution` (default `1024`) — units per tile side used in the
+  Web Mercator GSD formula above. `1024` keeps the thinning grid at ~4× the
+  typical 256-pixel tile resolution, so features collapsing within a few
+  subpixels are dropped. Controls thinning granularity only; ignored when
+  `--gsd` is given.
 
 Other options:
 
