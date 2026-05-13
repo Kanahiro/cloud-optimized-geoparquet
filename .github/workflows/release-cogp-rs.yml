@@ -30,8 +30,9 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        run: rustup target add ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Build
         working-directory: cogp-rs
         run: cargo build --release --target ${{ matrix.target }}
@@ -59,7 +60,7 @@ jobs:
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash | Out-File -Encoding ASCII "dist/$name.zip.sha256"
       - name: Upload assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.release.tag_name || inputs.tag }}
           files: |
