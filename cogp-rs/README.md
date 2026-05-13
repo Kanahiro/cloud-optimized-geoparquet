@@ -79,10 +79,12 @@ Other options:
 
 The output file:
 
-- preserves all original columns (overwriting any pre-existing `bbox`
-  column or input covering-bbox struct);
-- adds a `bbox` struct column with `xmin/ymin/xmax/ymax: f64` and writes
-  GeoParquet 1.1 `geo` metadata that points `covering.bbox` at it;
+- preserves all original columns except the covering bbox: if the input has a
+  GeoParquet 1.1 `covering.bbox` struct, its values are reused (not
+  recomputed) and the original column is dropped; any column literally named
+  `bbox` is also dropped;
+- writes a canonical `bbox` struct column (`xmin/ymin/xmax/ymax: f64`) and
+  points GeoParquet 1.1 `covering.bbox` at it;
 - emits one or more row groups per LoD, written in coarse-to-fine order;
 - writes `cogp` metadata listing the `row_group_end` and `gsd` of each LoD.
 
