@@ -3,6 +3,10 @@ name: Deploy demo to GitHub Pages
 on:
   push:
     branches: [main]
+    paths:
+      - 'demo/**'
+      - 'cogp-js/**'
+      - '.github/workflows/deploy-demo.yml'
   workflow_dispatch:
 
 permissions:
