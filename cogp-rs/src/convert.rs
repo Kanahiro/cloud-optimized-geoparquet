@@ -31,14 +31,20 @@ pub struct ConvertArgs {
     /// Output COGP file
     pub output: PathBuf,
     /// Comma-separated GSD list, meters, coarse to fine (e.g. 1000,500,100,50).
-    /// If omitted, GSDs are auto-derived from --minzoom..=--maxzoom using the
-    /// Web Mercator per-pixel resolution at the equator.
+    /// Projection-agnostic: each value is the ground sample distance in meters
+    /// at which a LoD becomes meaningful. If omitted, GSDs are auto-derived
+    /// from --minzoom..=--maxzoom assuming a Web Mercator tile pyramid
+    /// (see --minzoom/--maxzoom/--base-resolution). Pass --gsd directly if
+    /// you target a non-Web-Mercator renderer.
     #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["minzoom", "maxzoom"])]
     pub gsd: Vec<f64>,
-    /// Coarsest Web Mercator zoom level (used only when --gsd is omitted)
+    /// Coarsest Web Mercator zoom level for GSD auto-derivation. Used only
+    /// when --gsd is omitted. Assumes the consumer renders on a Web Mercator
+    /// (EPSG:3857) tile pyramid; for other projections, supply --gsd.
     #[arg(long, default_value_t = 0)]
     pub minzoom: u32,
-    /// Finest Web Mercator zoom level (used only when --gsd is omitted)
+    /// Finest Web Mercator zoom level for GSD auto-derivation. Used only
+    /// when --gsd is omitted. Same Web Mercator assumption as --minzoom.
     #[arg(long, default_value_t = 16)]
     pub maxzoom: u32,
     /// Parquet row group size in rows
@@ -52,20 +58,24 @@ pub struct ConvertArgs {
     /// Override auto-detected primary geometry column
     #[arg(long)]
     pub geometry_column: Option<String>,
-    /// Base resolution per tile side (units) used to derive the LoD thinning
-    /// grid when auto-deriving GSDs from zoom. The LoD-i GSD is the ground
-    /// distance covered by one base unit at zoom i (≈ `40_075_016 / (base ·
-    /// 2^i)` meters at the equator). Independent of the renderer's MVT
-    /// coordinate extent — this controls *thinning* granularity, not output
-    /// coordinate precision. The default of 512 matches MapLibre's 512-pixel
-    /// tile rendering. Ignored when `--gsd` is given.
+    /// **Web Mercator only.** Base resolution per tile side (units) used to
+    /// derive the LoD thinning grid when auto-deriving GSDs from
+    /// --minzoom/--maxzoom. The LoD-i GSD is the ground distance covered by
+    /// one base unit at zoom i, computed as `40_075_016 / (base · 2^i)`
+    /// meters at the equator — i.e. it bakes in the Web Mercator equatorial
+    /// circumference and the standard `2^z` tile pyramid. Independent of the
+    /// renderer's MVT coordinate extent: this controls *thinning*
+    /// granularity, not output coordinate precision. The default of 512
+    /// matches MapLibre's 512-pixel tile rendering. Ignored when --gsd is
+    /// given (in that case the GSDs are taken verbatim and no projection is
+    /// assumed).
     #[arg(long, default_value_t = 512)]
     pub base_resolution: u32,
     /// Point-like features (zero-area bbox) use a thinning grid this many
     /// times coarser than `prec` per axis, yielding ~factor² fewer points
     /// per LoD than polygons. Compensates for the fact that polygons span
     /// multiple cells visually while points occupy one, so equal grid
-    /// density looks too dense for points. `1` disables (legacy behavior).
+    /// density looks too dense for points. Set to `1` to disable.
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
 }
@@ -167,6 +177,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             bail!("GSD values must be positive, got {:?}", gsds);
         }
     }
+    if args.point_thinning_factor == 0 {
+        bail!(
+            "--point-thinning-factor must be >= 1 (got {})",
+            args.point_thinning_factor
+        );
+    }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
     let file = File::open(&args.input)
@@ -240,33 +256,21 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             }
         };
 
-    if args.point_thinning_factor == 0 {
-        bail!(
-            "--point-thinning-factor must be >= 1 (got {})",
-            args.point_thinning_factor
-        );
-    }
     eprintln!("[3/4] Assigning features to {} LoD(s)", gsds.len());
     let assignment = assign_lods(&bboxes, &gsds, input_units, args.point_thinning_factor)?;
     let mut per_lod_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, lod_i) in assignment.iter().enumerate() {
         per_lod_full[*lod_i as usize].push(idx as u32);
     }
-    // SPEC §5.3 requires each LoD entry to have a real row group end; a LoD with zero
-    // features cannot be represented. Drop empty LoDs and keep the GSDs that survive.
-    let mut gsds: Vec<f64> = gsds;
-    let mut per_lod: Vec<Vec<u32>> = Vec::with_capacity(per_lod_full.len());
-    let mut kept_gsds: Vec<f64> = Vec::with_capacity(gsds.len());
-    let mut dropped = 0usize;
-    for (rows, g) in per_lod_full.into_iter().zip(gsds.iter().copied()) {
-        if rows.is_empty() {
-            dropped += 1;
-        } else {
-            per_lod.push(rows);
-            kept_gsds.push(g);
-        }
-    }
-    gsds = kept_gsds;
+    // SPEC §5.3 requires each LoD entry to have a real row group end, so a LoD
+    // with zero features cannot be represented. Drop those and keep the GSDs
+    // that survive.
+    let dropped = per_lod_full.iter().filter(|r| r.is_empty()).count();
+    let (mut per_lod, gsds): (Vec<Vec<u32>>, Vec<f64>) = per_lod_full
+        .into_iter()
+        .zip(gsds.iter().copied())
+        .filter(|(rows, _)| !rows.is_empty())
+        .unzip();
     if per_lod.is_empty() {
         bail!("no LoDs received any features; check input data and GSD selection");
     }
@@ -281,39 +285,31 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    // STR-pack each LoD.
-    for (i, rows) in per_lod.iter_mut().enumerate() {
+    for rows in per_lod.iter_mut() {
         str_pack(rows, &bboxes, args.row_group_size);
-        let _ = i;
     }
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
-    // Build output schema: input schema (drop pre-existing `bbox` if any) + our bbox struct.
-    let mut drop_names: Vec<String> = vec!["bbox".to_string()];
-    if let Some(name) = existing_bbox_col.as_ref() {
-        if !drop_names.iter().any(|n| n == name) {
-            drop_names.push(name.clone());
-        }
-    }
+    // Replace any pre-existing `bbox` column (and the bbox covering column we
+    // already consumed into `bboxes`) with the freshly-built struct.
+    let drop_names: Vec<&str> = std::iter::once("bbox")
+        .chain(existing_bbox_col.as_deref().filter(|n| *n != "bbox"))
+        .collect();
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
-        if drop_names.iter().any(|n| n == f.name()) {
+        if drop_names.contains(&f.name().as_str()) {
             eprintln!("      note: dropping input column `{}` (will be overwritten)", f.name());
             continue;
         }
         output_fields.push(f.clone());
         keep_col_indices.push(i);
     }
-    let bbox_field = bbox_struct_field();
-    output_fields.push(Arc::new(bbox_field.clone()));
-    let bbox_column_position = output_fields.len() - 1;
+    output_fields.push(Arc::new(bbox_struct_field()));
     let output_schema = Arc::new(Schema::new(output_fields));
 
-    // Build full bbox struct array once.
     let bbox_struct = build_bbox_struct(&bboxes)?;
 
-    // Compute dataset-level bbox (parallel reduce).
     let dataset_bbox = bboxes
         .par_iter()
         .fold(Bbox::empty, |mut acc, b| {
@@ -343,10 +339,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .with_context(|| format!("creating {}", args.output.display()))?;
     let mut writer = ArrowWriter::try_new(out_file, output_schema.clone(), Some(props))?;
 
-    // Producer/consumer pipeline: a background thread builds RecordBatches (`take` per
-    // column is non-trivial for wide tables) while the main thread flushes the previous
-    // batch through the parquet writer. Channel capacity of 2 gives enough buffer to
-    // overlap I/O without blowing up memory.
+    // Background thread builds RecordBatches (`take` per column is non-trivial
+    // for wide tables) while the main thread flushes the previous batch through
+    // the parquet writer. Capacity 2 overlaps I/O without unbounded buffering.
     let (tx, rx) = sync_channel::<(usize, RecordBatch)>(2);
     let producer_schema = output_schema.clone();
     let producer_table = Arc::new(table);
@@ -367,7 +362,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 cols.push(take(bbox_arr.as_ref(), &indices, None)?);
                 let batch = RecordBatch::try_new(producer_schema.clone(), cols)?;
                 if tx.send((lod_i, batch)).is_err() {
-                    // consumer dropped the channel (e.g. parquet write failed)
                     return Ok(());
                 }
             }
@@ -375,7 +369,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         Ok(())
     });
 
-    let _ = bbox_column_position;
     let mut current_rg: i64 = -1;
     let mut last_lod: Option<usize> = None;
     let mut lods_meta: Vec<Lod> = Vec::with_capacity(gsds.len());
@@ -403,7 +396,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .join()
         .map_err(|e| anyhow!("batch producer panicked: {:?}", e))??;
 
-    // Build geo metadata: preserve original column metadata if available, override covering + bbox.
     let mut columns: BTreeMap<String, GeoColumn> = BTreeMap::new();
     if let Some(g) = &input_geo {
         if let Some(orig) = g.columns.get(&geom_col_name) {
@@ -470,14 +462,17 @@ fn default_covering() -> Covering {
     }
 }
 
-fn bbox_struct_field() -> Field {
-    let fields = Fields::from(vec![
+fn bbox_child_fields() -> Fields {
+    Fields::from(vec![
         Field::new("xmin", DataType::Float64, false),
         Field::new("ymin", DataType::Float64, false),
         Field::new("xmax", DataType::Float64, false),
         Field::new("ymax", DataType::Float64, false),
-    ]);
-    Field::new("bbox", DataType::Struct(fields), false)
+    ])
+}
+
+fn bbox_struct_field() -> Field {
+    Field::new("bbox", DataType::Struct(bbox_child_fields()), false)
 }
 
 fn build_bbox_struct(bboxes: &[Bbox]) -> Result<StructArray> {
@@ -493,14 +488,8 @@ fn build_bbox_struct(bboxes: &[Bbox]) -> Result<StructArray> {
     let ymax: ArrayRef = Arc::new(Float64Array::from(
         bboxes.par_iter().map(|b| b.ymax).collect::<Vec<_>>(),
     ));
-    let fields = Fields::from(vec![
-        Field::new("xmin", DataType::Float64, false),
-        Field::new("ymin", DataType::Float64, false),
-        Field::new("xmax", DataType::Float64, false),
-        Field::new("ymax", DataType::Float64, false),
-    ]);
     Ok(StructArray::try_new(
-        fields,
+        bbox_child_fields(),
         vec![xmin, ymin, xmax, ymax],
         None,
     )?)
@@ -636,18 +625,20 @@ fn assign_lods(
         })
         .collect();
 
-    // Zero-area bbox → point-like (true Point or coincident multi-point). These need
-    // a coarser grid than extent features: polygons of size==prec span ~1 cell so 1
-    // pick/cell already overlaps visually, but points are point-sized so a full cell
-    // grid renders saturated. Multiplying prec by `point_thinning_factor` per axis
-    // gives ~factor² fewer points per LoD.
+    // Zero-area bbox → point-like. Points need a coarser grid than extent
+    // features: a polygon of size≈prec spans ~1 cell so 1-pick-per-cell already
+    // overlaps visually, but a point occupies no area so a full grid renders
+    // saturated. Multiplying prec by `point_thinning_factor` per axis gives
+    // ~factor² fewer points per LoD.
     let is_point: Vec<bool> = bboxes
         .par_iter()
         .map(|b| b.width() <= 0.0 && b.height() <= 0.0)
         .collect();
     let point_mul = point_thinning_factor as f64;
 
-    // For each feature, the coarsest LoD index at which it becomes independently meaningful.
+    // Coarsest LoD at which each feature is independently meaningful (its bbox
+    // size ≥ that LoD's prec). Points have size 0 so are always eligible from
+    // LoD 0; the point grid coarsening above keeps them from over-saturating.
     let min_visible: Vec<u16> = bboxes
         .par_iter()
         .map(|b| {
@@ -665,14 +656,11 @@ fn assign_lods(
         .collect();
 
     for (lod_i, prec) in precs.iter().enumerate() {
-        // Build the per-cell winner map in parallel: each rayon thread accumulates a
-        // local HashMap, then the reduce step merges them, picking the higher priority
-        // entry on collisions. This keeps the priority semantics identical to the
-        // sequential version (priority is a total order on (area_bits, row_hash)).
-        // Key namespaced by feature kind because point cells use a different grid
-        // pitch (prec*point_mul) than polygon cells (prec); without the kind tag,
-        // a point cell (i,j) and a polygon cell (i,j) would collide in the map
-        // despite representing entirely different physical regions.
+        // Per-cell winner map built in parallel: each thread folds into a local
+        // HashMap, then reduce merges them keeping the higher-priority row on
+        // collision. The key is `(kind, ix, iy)` — kind-tagged because point
+        // cells use grid pitch `prec*point_mul` while polygon cells use `prec`,
+        // and an untagged `(ix, iy)` would conflate the two grids.
         let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
@@ -731,7 +719,6 @@ fn assign_lods(
             break;
         }
     }
-    // Anything left over → finest LoD.
     for r in remaining {
         assigned[r as usize] = last_lod as i32;
     }
@@ -745,8 +732,9 @@ fn assign_lods(
     Ok(out)
 }
 
+/// Primary order: bbox area (bits — gives a total order over f64 including NaN
+/// guard); secondary: hashed row index for a deterministic tie-break.
 fn priority(b: &Bbox, row: u32) -> (u64, u64) {
-    // Primary: area (encoded as bits for total ordering); secondary: hash of row for stable tie-break.
     let area = b.width().max(0.0) * b.height().max(0.0);
     let area_bits = if area.is_finite() && area >= 0.0 {
         area.to_bits()
