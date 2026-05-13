@@ -66,6 +66,7 @@ map.on('load', () => {
 });
 
 const urlInput = document.getElementById('url') as HTMLInputElement;
+const presetSelect = document.getElementById('preset') as HTMLSelectElement;
 const loadBtn = document.getElementById('load') as HTMLButtonElement;
 const flyBtn = document.getElementById('fly') as HTMLButtonElement;
 const statusEl = document.getElementById('status') as HTMLDivElement;
@@ -88,6 +89,13 @@ let active: ActiveDataset | null = null;
 
 loadBtn.addEventListener('click', () => {
   void loadDataset(urlInput.value.trim());
+});
+
+presetSelect.addEventListener('change', () => {
+  const url = presetSelect.value;
+  if (!url) return;
+  urlInput.value = url;
+  void loadDataset(url);
 });
 
 flyBtn.addEventListener('click', () => {
