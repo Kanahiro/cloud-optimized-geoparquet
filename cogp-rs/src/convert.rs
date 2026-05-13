@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray, UInt32Array};
-use arrow::compute::{concat_batches, take};
+use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -236,11 +236,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     for batch in reader {
         input_batches.push(batch?);
     }
-    let table: RecordBatch = if input_batches.is_empty() {
+    if input_batches.is_empty() {
         bail!("input file has no rows");
-    } else {
-        concat_batches(&input_schema, &input_batches)?
-    };
+    }
+
+    // arrow's GenericBytesBuilder<i32> panics with "byte array offset overflow"
+    // once cumulative bytes exceed i32::MAX (~2 GiB). With polygon-heavy inputs
+    // a Binary geometry column easily crosses that line during concat_batches.
+    // Upcast to LargeBinary (i64 offsets) when the total would overflow.
+    let (input_batches, input_schema) =
+        upcast_geom_if_needed(input_batches, input_schema, geom_col_idx, &geom_col_name)?;
+    let table: RecordBatch = concat_batches(&input_schema, &input_batches)?;
     let n_rows = table.num_rows();
     eprintln!("      features: {n_rows}");
 
@@ -493,6 +499,60 @@ fn build_bbox_struct(bboxes: &[Bbox]) -> Result<StructArray> {
         vec![xmin, ymin, xmax, ymax],
         None,
     )?)
+}
+
+/// If the geometry column is Binary (i32 offsets) and the combined WKB bytes
+/// across batches would overflow i32 during `concat_batches`, upcast it to
+/// LargeBinary (i64 offsets). Returns the (possibly rewritten) batches and the
+/// matching schema. A 1 GiB threshold leaves headroom for arrow's internal
+/// rounding and keeps small datasets on the cheaper Binary path.
+fn upcast_geom_if_needed(
+    batches: Vec<RecordBatch>,
+    schema: Arc<Schema>,
+    geom_col_idx: usize,
+    geom_col_name: &str,
+) -> Result<(Vec<RecordBatch>, Arc<Schema>)> {
+    if !matches!(schema.field(geom_col_idx).data_type(), DataType::Binary) {
+        return Ok((batches, schema));
+    }
+    let total: usize = batches
+        .iter()
+        .map(|b| {
+            b.column(geom_col_idx)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .map(|a| a.value_data().len())
+                .unwrap_or(0)
+        })
+        .sum();
+    if total < 1 << 30 {
+        return Ok((batches, schema));
+    }
+    eprintln!(
+        "      geometry column `{geom_col_name}` is {} bytes — upcasting Binary → LargeBinary to avoid i32 offset overflow",
+        total
+    );
+    let mut new_fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
+    let old_field = &new_fields[geom_col_idx];
+    new_fields[geom_col_idx] = Field::new(
+        old_field.name(),
+        DataType::LargeBinary,
+        old_field.is_nullable(),
+    )
+    .with_metadata(old_field.metadata().clone());
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    let new_batches = batches
+        .into_iter()
+        .map(|b| -> Result<RecordBatch> {
+            let mut cols: Vec<ArrayRef> = b.columns().to_vec();
+            cols[geom_col_idx] = cast(cols[geom_col_idx].as_ref(), &DataType::LargeBinary)?;
+            Ok(RecordBatch::try_new(new_schema.clone(), cols)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((new_batches, new_schema))
 }
 
 fn guess_geometry_column(schema: &Schema) -> Option<String> {
