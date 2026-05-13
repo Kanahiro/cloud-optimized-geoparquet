@@ -23,32 +23,32 @@ for (const gsd of [100000, 5000, 500, 50]) {
   console.log(`  target ${gsd}m -> lod ${idx} (gsd ${reader.lods[idx].gsd.toFixed(2)}m)`);
 }
 
-console.log('\n---- coarsest LoD as GeoJSON ----');
-const coarse = await reader.readAsGeoJSON({ maxLod: 0 });
-console.log('features:', coarse.features.length);
-console.log('first feature geometry type:', coarse.features[0]?.geometry?.type);
+console.log('\n---- coarsest LoD as rows ----');
+const coarse = await reader.readRows({ maxLod: 0 });
+console.log('rows:', coarse.length);
+console.log('first row geometry type:', coarse[0]?.[reader.primaryGeometryColumn]?.type);
 
 console.log('\n---- full file ----');
-const full = await reader.readAsGeoJSON();
-console.log('features:', full.features.length);
+const full = await reader.readRows();
+console.log('rows:', full.length);
 
 console.log('\n---- bbox filter ----');
 // Data is around lng/lat (142.4, 44.15) — central Hokkaido
-const filtered = await reader.readAsGeoJSON({
+const filtered = await reader.readRows({
   bbox: [142.35, 44.10, 142.65, 44.25],
 });
-console.log('within data bbox:', filtered.features.length);
+console.log('within data bbox:', filtered.length);
 
-const noHit = await reader.readAsGeoJSON({ bbox: [0, 0, 1, 1] });
-console.log('outside bbox (should be 0):', noHit.features.length);
+const noHit = await reader.readRows({ bbox: [0, 0, 1, 1] });
+console.log('outside bbox (should be 0):', noHit.length);
 
-console.log('\n---- readAsGeoJSON (bbox around the data) ----');
-const fc = await reader.readAsGeoJSON({
+console.log('\n---- readRows (bbox around the data, target gsd=150m) ----');
+const rows = await reader.readRows({
   bbox: [142.35, 44.10, 142.65, 44.25],
   maxLod: reader.selectLod(150),
 });
-console.log('features:', fc.features.length);
-console.log('first feature geometry type:', fc.features[0]?.geometry?.type);
+console.log('rows:', rows.length);
+console.log('first row geometry type:', rows[0]?.[reader.primaryGeometryColumn]?.type);
 
 console.log('\nOK');
 

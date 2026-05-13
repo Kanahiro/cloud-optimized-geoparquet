@@ -1,6 +1,6 @@
 import maplibregl, { type LngLatBoundsLike } from 'maplibre-gl';
 import { CogpReader } from 'cogp';
-import type { FeatureCollection } from 'geojson';
+import type { Feature, FeatureCollection, Geometry } from 'geojson';
 
 const EMPTY_FC: FeatureCollection = { type: 'FeatureCollection', features: [] };
 
@@ -184,15 +184,41 @@ async function refreshViewport(): Promise<void> {
   const myLoadId = ++ds.loadId;
   setStatus(`Reading at z=${z} (lod ≤ ${maxLod}) …`);
   try {
-    const fc = await ds.reader.readAsGeoJSON({ bbox, maxLod });
+    const rows = await ds.reader.readRows({ bbox, maxLod });
     if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
+    const fc = rowsToFeatureCollection(rows, ds.reader.primaryGeometryColumn);
     const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;
-    src?.setData(fc as FeatureCollection);
+    src?.setData(fc);
     setStatus(`Rendered ${fc.features.length} features at z=${z} (lod ≤ ${maxLod}).`);
   } catch (err) {
     console.warn('read failed', err);
     setStatus(`Read error: ${(err as Error).message}`);
   }
+}
+
+// hyparquet decodes geometry to GeoJSON Geometry directly; we just wrap each
+// row as a Feature. `bigint` values (int64 columns) aren't JSON-serializable
+// so MapLibre would choke on them — coerce to Number (precision loss past
+// 2^53 is acceptable for rendering). `Uint8Array` blobs are dropped.
+function rowsToFeatureCollection(
+  rows: ReadonlyArray<Record<string, unknown>>,
+  geomColumn: string,
+): FeatureCollection {
+  const features: Feature[] = [];
+  for (const row of rows) {
+    const geometry = row[geomColumn] as Geometry | null | undefined;
+    if (!geometry) continue;
+    const properties: Record<string, unknown> = {};
+    for (const k in row) {
+      if (k === geomColumn) continue;
+      const v = row[k];
+      if (typeof v === 'bigint') properties[k] = Number(v);
+      else if (v instanceof Uint8Array) continue;
+      else properties[k] = v;
+    }
+    features.push({ type: 'Feature', geometry, properties });
+  }
+  return { type: 'FeatureCollection', features };
 }
 
 // Target ground-sample distance for a tile zoom level. Must match the

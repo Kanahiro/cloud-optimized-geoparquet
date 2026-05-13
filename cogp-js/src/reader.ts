@@ -1,17 +1,17 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
-import { compressors as defaultCompressors } from 'hyparquet-compressors';
+import { compressors } from 'hyparquet-compressors';
 
 import {
   type Bbox,
   type BboxColumnIndexes,
+  bboxesIntersect,
   findBboxColumnIndexes,
   type FileMetadataLike,
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
 import { selectLodByGsd } from './lod.js';
-import { type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
-import { type FeatureCollection, rowsToFeatureCollection } from './geojson.js';
+import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
@@ -19,54 +19,11 @@ interface FullFileMetadata extends FileMetadataLike {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
 }
 
-// By default hyparquet's geoparquet integration decodes WKB into GeoJSON
-// objects. That would (a) defeat the point of returning an Arrow Table with a
-// Binary geometry column, and (b) be a large wasted allocation for callers
-// that re-encode downstream (MVT, WKB sinks, etc.). We pass through the raw
-// bytes so the geometry column stays as Uint8Array, which our Arrow builder
-// renders as a Binary vector matching the on-disk schema.
-//
-// hyparquet expects the `parsers` option to contain *every* parser function:
-// when an `options.parsers` is passed it overwrites — not merges with — the
-// internal defaults at column-read time. So we replicate the default parser
-// set here and swap in pass-through implementations for geometry/geography.
-const utf8Decoder = new TextDecoder();
-const PASSTHROUGH_PARSERS = {
-  timestampFromMilliseconds: (millis: bigint) => new Date(Number(millis)),
-  timestampFromMicroseconds: (micros: bigint) => new Date(Number(micros / 1000n)),
-  timestampFromNanoseconds: (nanos: bigint) => new Date(Number(nanos / 1000000n)),
-  dateFromDays: (days: number) => new Date(days * 86400000),
-  stringFromBytes: (bytes: Uint8Array | null | undefined) =>
-    bytes ? utf8Decoder.decode(bytes) : bytes,
-  geometryFromBytes: (b: Uint8Array) => b,
-  geographyFromBytes: (b: Uint8Array) => b,
-  uuidFromBytes: (bytes: Uint8Array | null | undefined) => {
-    if (!bytes) return undefined;
-    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-    return (
-      hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' +
-      hex.slice(16, 20) + '-' + hex.slice(20, 32)
-    );
-  },
-};
-
 export type BboxInput = Bbox | readonly [number, number, number, number];
 
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
-  /**
-   * Override parquet value parsers. By default we keep geometry/geography
-   * columns as raw `Uint8Array` (WKB) — overriding `geometryFromBytes` here
-   * lets you decode to GeoJSON, Geo-Arrow, etc.
-   */
-  parsers?: Partial<typeof PASSTHROUGH_PARSERS>;
-  /**
-   * Custom decompressor map. By default we use `hyparquet-compressors` which
-   * ships SNAPPY, GZIP, ZSTD, LZ4, BROTLI. Pass your own to swap in a
-   * lighter-weight bundle or to add codecs.
-   */
-  compressors?: Record<string, (input: Uint8Array, outputLength: number) => Uint8Array>;
 }
 
 export interface ReadOptions {
@@ -84,7 +41,7 @@ export class CogpReader {
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     const file = await asyncBufferFromUrl(fetchOpts as { url: string });
-    return CogpReader.fromAsyncBuffer(file, url, opts);
+    return CogpReader.fromAsyncBuffer(file, url);
   }
 
   /**
@@ -96,27 +53,24 @@ export class CogpReader {
   static async fromAsyncBuffer(
     file: { byteLength: number; slice: (start: number, end?: number) => unknown },
     url: string,
-    opts: OpenOptions = {},
   ): Promise<CogpReader> {
-    const parsers = { ...PASSTHROUGH_PARSERS, ...(opts.parsers ?? {}) };
-    const compressors = opts.compressors ?? defaultCompressors;
-    const metadata = (await parquetMetadataAsync(file as never, { parsers } as never)) as unknown as FullFileMetadata;
-    return new CogpReader(file, metadata, url, parsers, compressors);
+    const metadata = (await parquetMetadataAsync(file as never)) as unknown as FullFileMetadata;
+    return new CogpReader(file, metadata, url);
   }
 
   readonly cogp: CogpMeta;
   readonly geo: GeoMeta;
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
-  /** Column indexes (within a row group's columns list) of covering bbox sub-columns, if available. */
-  private readonly bboxColIdx: BboxColumnIndexes | null;
+  /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
+  private readonly bboxColIdx: BboxColumnIndexes;
+  /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
+  private readonly bboxPaths: BboxCovering;
 
   private constructor(
     private readonly file: unknown,
     readonly metadata: FullFileMetadata,
     readonly url: string,
-    private readonly parsers: typeof PASSTHROUGH_PARSERS,
-    private readonly compressors: Record<string, (input: Uint8Array, outputLength: number) => Uint8Array>,
   ) {
     const doc = extractCogpDocument(metadata.key_value_metadata);
     this.cogp = doc.cogp;
@@ -130,18 +84,22 @@ export class CogpReader {
     }
     this.rowOffsets = offsets;
 
+    // SPEC: COGP mandates a per-feature bbox covering on the primary
+    // geometry column. Surface a clear error rather than silently falling
+    // back to "no spatial filter" when the file is malformed.
     const primaryCol = this.geo.columns[this.geo.primary_column];
     const covering = primaryCol?.covering;
-    const firstRg = metadata.row_groups[0];
-    if (covering && firstRg) {
-      try {
-        this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
-      } catch {
-        this.bboxColIdx = null;
-      }
-    } else {
-      this.bboxColIdx = null;
+    if (!covering?.bbox) {
+      throw new Error(
+        `not a COGP file: primary geometry column \`${this.geo.primary_column}\` is missing \`covering.bbox\``,
+      );
     }
+    this.bboxPaths = covering.bbox;
+    const firstRg = metadata.row_groups[0];
+    if (!firstRg) {
+      throw new Error('cogp file has no row groups');
+    }
+    this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
   }
 
   get lods() {
@@ -168,18 +126,52 @@ export class CogpReader {
   }
 
   /**
-   * Read a contiguous LoD prefix, optionally bbox-pruned, as a GeoJSON
-   * FeatureCollection. The geometry column is decoded straight from WKB and
-   * other columns flow into `properties`.
+   * Read a contiguous LoD prefix, optionally bbox-pruned, as plain row
+   * records. The geometry column carries a GeoJSON Geometry object (decoded
+   * by hyparquet from the on-disk WKB).
+   *
+   * Bbox pruning runs at two levels: row groups whose covering envelope
+   * misses the query are skipped entirely (no I/O), then surviving groups
+   * are filtered row-by-row against each row's per-feature bbox column.
    */
-  async readAsGeoJSON(opts: ReadOptions = {}): Promise<FeatureCollection> {
-    const rows = await this.readRows(opts);
-    return rowsToFeatureCollection(rows, this.geo.primary_column);
+  async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
+    const maxLod = opts.maxLod ?? this.lods.length - 1;
+    const bbox = normalizeBbox(opts.bbox);
+    const rgs = this.candidateRowGroups(maxLod, bbox);
+    // When filtering by bbox we need the per-row bbox struct on hand. If the
+    // caller provided a custom column selection that excludes it, splice the
+    // struct's top-level name in transparently — hyparquet reads the whole
+    // struct when you name its root.
+    let columns = opts.columns;
+    if (bbox && columns) {
+      const top = this.bboxPaths.xmin[0]!;
+      if (!columns.includes(top)) columns = [...columns, top];
+    }
+    const rows = await this.readRowGroupsAsRows(rgs, columns);
+    if (!bbox) return rows;
+    return this.filterRowsByBbox(rows, bbox);
+  }
+
+  private filterRowsByBbox(
+    rows: Record<string, unknown>[],
+    query: Bbox,
+  ): Record<string, unknown>[] {
+    const paths = this.bboxPaths;
+    return rows.filter((row) =>
+      bboxesIntersect(
+        {
+          minX: readNum(row, paths.xmin),
+          minY: readNum(row, paths.ymin),
+          maxX: readNum(row, paths.xmax),
+          maxY: readNum(row, paths.ymax),
+        },
+        query,
+      ),
+    );
   }
 
   /** Bbox of a single row group as derived from covering column statistics. */
   rowGroupEnvelope(rgIndex: number): Bbox | null {
-    if (!this.bboxColIdx) return null;
     const rg = this.metadata.row_groups[rgIndex];
     if (!rg) return null;
     return rowGroupBbox(rg, this.bboxColIdx);
@@ -193,20 +185,10 @@ export class CogpReader {
     const out: number[] = [];
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
-      if (bbox && this.bboxColIdx) {
-        if (!rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
-      }
+      if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
       out.push(i);
     }
     return out;
-  }
-
-  /** Read rows for the given options as plain row records (no Arrow). */
-  private async readRows(opts: ReadOptions): Promise<Record<string, unknown>[]> {
-    const maxLod = opts.maxLod ?? this.lods.length - 1;
-    const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLod, bbox);
-    return this.readRowGroupsAsRows(rgs, opts.columns);
   }
 
   private async readRowGroupsAsRows(
@@ -231,8 +213,7 @@ export class CogpReader {
         metadata: this.metadata,
         rowStart,
         rowEnd,
-        parsers: this.parsers,
-        compressors: this.compressors,
+        compressors,
       };
       if (columns) readArgs['columns'] = columns;
       const rows = (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
@@ -258,4 +239,13 @@ function normalizeBbox(input?: BboxInput): Bbox | undefined {
     return { minX: input[0]!, minY: input[1]!, maxX: input[2]!, maxY: input[3]! };
   }
   return input as Bbox;
+}
+
+// Walk a path-in-schema like `['bbox','xmin']` against a hyparquet row object.
+// The struct is mandated by COGP and read unconditionally when filtering, so
+// every segment is guaranteed to resolve to a number.
+function readNum(row: Record<string, unknown>, path: readonly string[]): number {
+  let cur: unknown = row;
+  for (const p of path) cur = (cur as Record<string, unknown>)[p];
+  return cur as number;
 }
