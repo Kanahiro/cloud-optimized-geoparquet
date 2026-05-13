@@ -22,7 +22,7 @@ use crate::meta::{
     default_generator, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Lod,
     COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
-use crate::wkb_bbox::{bbox_from_wkb, Bbox};
+use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
 
 #[derive(Args)]
 pub struct ConvertArgs {
@@ -71,13 +71,21 @@ pub struct ConvertArgs {
     /// projection is assumed).
     #[arg(long, default_value_t = 4096)]
     pub base_resolution: u32,
-    /// Point-like features (zero-area bbox) use a thinning grid this many
-    /// times coarser than `prec` per axis, yielding ~factor² fewer points
-    /// per LoD than polygons. Compensates for the fact that polygons span
-    /// multiple cells visually while points occupy one, so equal grid
+    /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
+    /// many times coarser than `prec` per axis, yielding ~factor² fewer
+    /// points per LoD than polygons. Compensates for the fact that polygons
+    /// span multiple cells visually while points occupy one, so equal grid
     /// density looks too dense for points. Set to `1` to disable.
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
+    /// LineString-like features (WKB LineString / MultiLineString) use a
+    /// thinning grid this many times coarser than `prec` per axis. Lines
+    /// are 1D so multiple parallel/near-parallel lines within `prec` overlap
+    /// visually even when their bbox centers fall into distinct cells; this
+    /// factor compensates. Smaller than `--point-thinning-factor` because
+    /// lines still span many cells along their length. Set to `1` to disable.
+    #[arg(long, default_value_t = 2)]
+    pub line_thinning_factor: u32,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -183,6 +191,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             args.point_thinning_factor
         );
     }
+    if args.line_thinning_factor == 0 {
+        bail!(
+            "--line-thinning-factor must be >= 1 (got {})",
+            args.line_thinning_factor
+        );
+    }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
     let file = File::open(&args.input)
@@ -250,20 +264,30 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let n_rows = table.num_rows();
     eprintln!("      features: {n_rows}");
 
-    let (bboxes, existing_bbox_col) =
+    let (bboxes, kinds, existing_bbox_col) =
         match read_existing_bboxes(&table, input_geo.as_ref(), &geom_col_name) {
             Some((name, bb)) => {
                 eprintln!("[2/4] Reusing existing bbox column `{name}` from input");
-                (bb, Some(name))
+                let kinds = compute_kinds(&table, geom_col_idx)?;
+                (bb, kinds, Some(name))
             }
             None => {
                 eprintln!("[2/4] Computing per-feature bbox from WKB");
-                (compute_bboxes(&table, geom_col_idx)?, None)
+                let pairs = compute_bboxes_and_kinds(&table, geom_col_idx)?;
+                let (bb, kinds): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+                (bb, kinds, None)
             }
         };
 
     eprintln!("[3/4] Assigning features to {} LoD(s)", gsds.len());
-    let assignment = assign_lods(&bboxes, &gsds, input_units, args.point_thinning_factor)?;
+    let assignment = assign_lods(
+        &bboxes,
+        &kinds,
+        &gsds,
+        input_units,
+        args.point_thinning_factor,
+        args.line_thinning_factor,
+    )?;
     let mut per_lod_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, lod_i) in assignment.iter().enumerate() {
         per_lod_full[*lod_i as usize].push(idx as u32);
@@ -621,7 +645,10 @@ fn read_existing_bboxes(
     Some((col_name.clone(), out))
 }
 
-fn compute_bboxes(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<Bbox>> {
+fn compute_bboxes_and_kinds(
+    table: &RecordBatch,
+    geom_col_idx: usize,
+) -> Result<Vec<(Bbox, GeomKind)>> {
     let col = table.column(geom_col_idx);
     let n = col.len();
     if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
@@ -652,6 +679,37 @@ fn compute_bboxes(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<Bbox>>
     }
 }
 
+fn compute_kinds(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<GeomKind>> {
+    let col = table.column(geom_col_idx);
+    let n = col.len();
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if arr.is_null(i) {
+                    bail!("null geometry at row {i}");
+                }
+                kind_from_wkb(arr.value(i))
+            })
+            .collect()
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if arr.is_null(i) {
+                    bail!("null geometry at row {i}");
+                }
+                kind_from_wkb(arr.value(i))
+            })
+            .collect()
+    } else {
+        bail!(
+            "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
+            col.data_type()
+        );
+    }
+}
+
 /// Grid-based density thinning. Returns an assignment of each row to a LoD index.
 ///
 /// For each LoD (coarse → fine), bucket remaining features into grid cells of side
@@ -659,13 +717,15 @@ fn compute_bboxes(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<Bbox>>
 /// priority feature to assign to this LoD; the rest fall through to the next LoD.
 ///
 /// Features whose bbox is smaller than `prec` are deferred to a finer LoD where they
-/// become independently meaningful — except point-like features (size <= 0) which
-/// are always eligible from the coarsest LoD.
+/// become independently meaningful — except Point-kind features which are always
+/// eligible from the coarsest LoD (they have no extent of their own).
 fn assign_lods(
     bboxes: &[Bbox],
+    kinds: &[GeomKind],
     gsds: &[f64],
     units: InputUnits,
     point_thinning_factor: u32,
+    line_thinning_factor: u32,
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
@@ -685,23 +745,22 @@ fn assign_lods(
         })
         .collect();
 
-    // Zero-area bbox → point-like. Points need a coarser grid than extent
-    // features: a polygon of size≈prec spans ~1 cell so 1-pick-per-cell already
-    // overlaps visually, but a point occupies no area so a full grid renders
-    // saturated. Multiplying prec by `point_thinning_factor` per axis gives
-    // ~factor² fewer points per LoD.
-    let is_point: Vec<bool> = bboxes
-        .par_iter()
-        .map(|b| b.width() <= 0.0 && b.height() <= 0.0)
-        .collect();
+    // Kind-specific grid coarsening. Polygons span area so 1-pick-per-prec-cell
+    // overlaps visually; points are 0D and lines are 1D in the cross-axis, so
+    // their picks look saturated at the same density — coarsen each accordingly.
     let point_mul = point_thinning_factor as f64;
+    let line_mul = line_thinning_factor as f64;
 
     // Coarsest LoD at which each feature is independently meaningful (its bbox
-    // size ≥ that LoD's prec). Points have size 0 so are always eligible from
-    // LoD 0; the point grid coarsening above keeps them from over-saturating.
+    // size ≥ that LoD's prec). Points have no extent so are always eligible
+    // from LoD 0; the point grid coarsening above keeps them from over-saturating.
     let min_visible: Vec<u16> = bboxes
         .par_iter()
-        .map(|b| {
+        .zip(kinds.par_iter())
+        .map(|(b, k)| {
+            if *k == GeomKind::Point {
+                return 0u16;
+            }
             let size = b.width().max(b.height());
             if size <= 0.0 {
                 return 0u16;
@@ -718,9 +777,9 @@ fn assign_lods(
     for (lod_i, prec) in precs.iter().enumerate() {
         // Per-cell winner map built in parallel: each thread folds into a local
         // HashMap, then reduce merges them keeping the higher-priority row on
-        // collision. The key is `(kind, ix, iy)` — kind-tagged because point
-        // cells use grid pitch `prec*point_mul` while polygon cells use `prec`,
-        // and an untagged `(ix, iy)` would conflate the two grids.
+        // collision. The key is `(kind, ix, iy)` — kind-tagged because each
+        // kind uses a different grid pitch, and an untagged `(ix, iy)` would
+        // conflate the grids.
         let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
@@ -728,10 +787,14 @@ fn assign_lods(
                     return local;
                 }
                 let b = bboxes[row as usize];
-                let pt = is_point[row as usize];
-                let eff_prec = if pt { prec * point_mul } else { *prec };
+                let k = kinds[row as usize];
+                let eff_prec = match k {
+                    GeomKind::Point => prec * point_mul,
+                    GeomKind::Line => prec * line_mul,
+                    GeomKind::Polygon => *prec,
+                };
                 let key = (
-                    pt as u8,
+                    k as u8,
                     (b.cx() / eff_prec).floor() as i64,
                     (b.cy() / eff_prec).floor() as i64,
                 );
@@ -792,19 +855,23 @@ fn assign_lods(
     Ok(out)
 }
 
-/// Primary order: bbox area (bits — gives a total order over f64 including NaN
-/// guard); secondary: hashed row index for a deterministic tie-break.
+/// Primary order: bbox Manhattan extent `width + height` (bits — gives a total
+/// order over f64 including NaN guard). Used as a kind-agnostic "size" proxy:
+/// for polygons it favors the larger/more-elongated feature; for axis-aligned
+/// lines it equals the actual length so longer lines win; for points it is 0
+/// so ties fall through to the hashed secondary. Secondary: hashed row index
+/// for a deterministic tie-break.
 fn priority(b: &Bbox, row: u32) -> (u64, u64) {
-    let area = b.width().max(0.0) * b.height().max(0.0);
-    let area_bits = if area.is_finite() && area >= 0.0 {
-        area.to_bits()
+    let extent = b.width().max(0.0) + b.height().max(0.0);
+    let extent_bits = if extent.is_finite() && extent >= 0.0 {
+        extent.to_bits()
     } else {
         0
     };
     let mut h = row as u64;
     h = h.wrapping_mul(0x9E3779B97F4A7C15);
     h ^= h >> 30;
-    (area_bits, h)
+    (extent_bits, h)
 }
 
 /// Sort-Tile-Recursive packing: divide into ~sqrt(N/M) strips by center-x, then sort by
