@@ -1,0 +1,14 @@
+# Node
+node_modules/
+dist/
+
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
