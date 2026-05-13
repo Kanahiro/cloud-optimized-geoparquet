@@ -1,0 +1,69 @@
+name: Release cogp-rs binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload assets to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        working-directory: cogp-rs
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        working-directory: cogp-rs
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          name="cogp-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/cogp" "dist/${name}/"
+          cp ../LICENSE ../README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          shasum -a 256 "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        working-directory: cogp-rs
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event.release.tag_name }}") { "${{ github.event.release.tag_name }}" } else { "${{ inputs.tag }}" }
+          $name = "cogp-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cogp.exe" "dist/$name/"
+          Copy-Item "../LICENSE","../README.md" "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash | Out-File -Encoding ASCII "dist/$name.zip.sha256"
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          files: |
+            cogp-rs/dist/*.tar.gz
+            cogp-rs/dist/*.tar.gz.sha256
+            cogp-rs/dist/*.zip
+            cogp-rs/dist/*.zip.sha256
