@@ -86,6 +86,14 @@ pub struct ConvertArgs {
     /// lines still span many cells along their length. Set to `1` to disable.
     #[arg(long, default_value_t = 2)]
     pub line_thinning_factor: u32,
+    /// Optional cap on how fast the per-LoD feature count grows. The natural
+    /// progression is ~4× per LoD (cell-area halves each axis), which can feel
+    /// abrupt when LoD 0 is intentionally sparse. Setting this to `N` (e.g.
+    /// `2.0`) restricts LoD i to at most `N × |LoD i-1|` features; surplus
+    /// cell-winners (lowest-priority first) are deferred to finer LoDs. LoD 0
+    /// is uncapped. When omitted, no cap is applied.
+    #[arg(long)]
+    pub lod_feature_growth: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -197,6 +205,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             args.line_thinning_factor
         );
     }
+    if let Some(g) = args.lod_feature_growth {
+        if !(g > 0.0 && g.is_finite()) {
+            bail!(
+                "--lod-feature-growth must be a finite positive number (got {})",
+                g
+            );
+        }
+    }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
     let file = File::open(&args.input)
@@ -287,6 +303,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         input_units,
         args.point_thinning_factor,
         args.line_thinning_factor,
+        args.lod_feature_growth,
     )?;
     let mut per_lod_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, lod_i) in assignment.iter().enumerate() {
@@ -726,6 +743,7 @@ fn assign_lods(
     units: InputUnits,
     point_thinning_factor: u32,
     line_thinning_factor: u32,
+    lod_feature_growth: Option<f64>,
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
@@ -774,6 +792,7 @@ fn assign_lods(
         })
         .collect();
 
+    let mut prev_picked: usize = 0;
     for (lod_i, prec) in precs.iter().enumerate() {
         // Per-cell winner map built in parallel: each thread folds into a local
         // HashMap, then reduce merges them keeping the higher-priority row on
@@ -832,7 +851,25 @@ fn assign_lods(
                 }
                 a
             });
-        let picked: Vec<u32> = best.values().copied().collect();
+        let mut picked: Vec<u32> = best.values().copied().collect();
+        // Smooth feature-count growth across LoDs: cap LoD i at
+        // `growth × |LoD i-1|`, deferring the lowest-priority cell winners to
+        // finer LoDs. LoD 0 is uncapped — it sets the baseline.
+        if let Some(growth) = lod_feature_growth {
+            if lod_i > 0 {
+                let cap = ((prev_picked as f64) * growth).ceil() as usize;
+                if picked.len() > cap {
+                    let mut with_pri: Vec<(u32, (u64, u64))> = picked
+                        .par_iter()
+                        .map(|&r| (r, priority(&bboxes[r as usize], r)))
+                        .collect();
+                    with_pri.par_sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                    with_pri.truncate(cap);
+                    picked = with_pri.into_iter().map(|(r, _)| r).collect();
+                }
+            }
+        }
+        prev_picked = picked.len();
         for r in &picked {
             assigned[*r as usize] = lod_i as i32;
         }
