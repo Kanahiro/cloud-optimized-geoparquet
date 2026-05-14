@@ -192,7 +192,7 @@ async function refreshViewport(): Promise<void> {
   const myLoadId = ++ds.loadId;
   setStatus(`Reading at ${gsdLabel}/px (lod ≤ ${maxLod}) …`);
   try {
-    const rows = await ds.reader.readRows({ bbox, maxLod });
+    const rows = await ds.reader.readRows({ bbox, maxLod, maxRows: 100_000 });
     if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
     const fc = rowsToFeatureCollection(rows, ds.reader.primaryGeometryColumn);
     const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;

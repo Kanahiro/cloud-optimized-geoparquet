@@ -42,6 +42,19 @@ export interface ReadOptions {
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];
+  /**
+   * Fetch budget: cap on cumulative `num_rows` of selected row groups. Row
+   * groups are picked in LoD/file order (post-bbox-prune); selection stops
+   * once adding the next group would push the cumulative count over this
+   * limit. A row group is never partially loaded, so the returned row count
+   * may be less than `maxRows` (especially after per-row bbox filtering).
+   */
+  maxRows?: number;
+  /**
+   * Fetch budget: cap on cumulative `total_byte_size` (uncompressed) of
+   * selected row groups, in bytes. Same selection semantics as `maxRows`.
+   */
+  maxBytes?: number;
 }
 
 export class CogpReader {
@@ -156,7 +169,7 @@ export class CogpReader {
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLod = opts.maxLod ?? this.lods.length - 1;
     const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLod, bbox);
+    const rgs = this.candidateRowGroups(maxLod, bbox, opts.maxRows, opts.maxBytes);
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
@@ -196,16 +209,29 @@ export class CogpReader {
     return rowGroupBbox(rg, this.bboxColIdx);
   }
 
-  private candidateRowGroups(maxLod: number, bbox?: Bbox): number[] {
+  private candidateRowGroups(
+    maxLod: number,
+    bbox?: Bbox,
+    maxRows?: number,
+    maxBytes?: number,
+  ): number[] {
     if (maxLod < 0 || maxLod >= this.lods.length) {
       throw new Error(`maxLod ${maxLod} out of range [0, ${this.lods.length})`);
     }
     const end = this.lods[maxLod]!.row_group_end;
     const out: number[] = [];
+    let rowsAcc = 0;
+    let bytesAcc = 0;
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
       if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
+      const n = Number(rg.num_rows ?? 0);
+      const b = Number(rg.total_byte_size ?? 0);
+      if (maxRows !== undefined && rowsAcc + n > maxRows) break;
+      if (maxBytes !== undefined && bytesAcc + b > maxBytes) break;
       out.push(i);
+      rowsAcc += n;
+      bytesAcc += b;
     }
     return out;
   }

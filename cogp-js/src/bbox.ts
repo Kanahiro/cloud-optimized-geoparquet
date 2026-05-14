@@ -34,6 +34,7 @@ export interface ColumnChunk {
 export interface RowGroupLike {
   columns: ColumnChunk[];
   num_rows?: number | bigint;
+  total_byte_size?: number | bigint;
 }
 
 export interface FileMetadataLike {
