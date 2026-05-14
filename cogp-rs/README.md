@@ -39,7 +39,7 @@ Examples:
 ```
 # Narrow the zoom range and bump the row group size for a small dataset.
 cogp convert input.parquet output.cogp.parquet \
-    --minzoom 4 --maxzoom 12 --row-group-size 20000
+    --webmerc-minzoom 4 --webmerc-maxzoom 12 --row-group-size 20000
 
 # Non-Web-Mercator renderer: pass GSDs directly (meters, coarse to fine).
 cogp convert input.parquet output.cogp.parquet \
@@ -54,10 +54,11 @@ LoD selection (mutually exclusive):
 
 - `--gsd 1000,500,100,50` — explicit ground sample distances in **meters**,
   strictly decreasing. Use this for non-Web-Mercator renderers.
-- `--minzoom` / `--maxzoom` (default `0` / `16`) — derive GSDs from a Web
-  Mercator tile pyramid: `GSD(z) = 40_075_016 / (base_resolution · 2^z)` m.
-  Empty LoDs (no features assigned) are dropped automatically.
-- `--base-resolution` (default `1024`) — units per tile side used in the
+- `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `16`) — derive
+  GSDs from a Web Mercator tile pyramid:
+  `GSD(z) = 40_075_016 / (webmerc_resolution · 2^z)` m. Empty LoDs (no
+  features assigned) are dropped automatically.
+- `--webmerc-resolution` (default `1024`) — units per tile side used in the
   Web Mercator GSD formula above. `1024` keeps the thinning grid at ~4× the
   typical 256-pixel tile resolution, so features collapsing within a few
   subpixels are dropped. Controls thinning granularity only; ignored when
