@@ -1,14 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray,
+    UInt32Array,
+};
 use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::file::metadata::KeyValue;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
+use parquet::file::metadata::KeyValue;
+use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -103,11 +106,11 @@ pub struct ConvertArgs {
     /// Polygon visibility threshold multiplier applied to `prec` when deciding
     /// the coarsest LoD at which a Polygon first becomes independently
     /// meaningful. A polygon is eligible from LoD `i` once its bbox diagonal
-    /// reaches `factor · prec[i]`. Polygons span area so the default of `1`
-    /// matches the LoD's native resolution; raise to defer small polygons to
-    /// finer LoDs. Distinct from `--polygon-thinning-factor`. Set to `1` to
-    /// disable.
-    #[arg(long, default_value_t = 1)]
+    /// reaches `factor · prec[i]`. Default of `4` defers polygons whose
+    /// diagonal is under ~4 grid cells to a finer LoD, so coarse LoDs aren't
+    /// crowded by tiny polygons. Distinct from `--polygon-thinning-factor`.
+    /// Set to `1` to disable.
+    #[arg(long, default_value_t = 4)]
     pub polygon_visibility_factor: u32,
 }
 
@@ -161,7 +164,11 @@ fn base_unit_gsd_z0(webmerc_resolution: u32) -> f64 {
     WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
 }
 
-fn web_mercator_gsds(webmerc_minzoom: u32, webmerc_maxzoom: u32, webmerc_resolution: u32) -> Vec<f64> {
+fn web_mercator_gsds(
+    webmerc_minzoom: u32,
+    webmerc_maxzoom: u32,
+    webmerc_resolution: u32,
+) -> Vec<f64> {
     let z0 = base_unit_gsd_z0(webmerc_resolution);
     (webmerc_minzoom..=webmerc_maxzoom)
         .map(|z| z0 / (1u64 << z) as f64)
@@ -180,7 +187,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             );
         }
         if args.webmerc_maxzoom > 30 {
-            bail!("--webmerc-maxzoom must be <= 30 (got {})", args.webmerc_maxzoom);
+            bail!(
+                "--webmerc-maxzoom must be <= 30 (got {})",
+                args.webmerc_maxzoom
+            );
         }
         if args.webmerc_resolution == 0 {
             bail!(
@@ -188,7 +198,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 args.webmerc_resolution
             );
         }
-        let derived = web_mercator_gsds(args.webmerc_minzoom, args.webmerc_maxzoom, args.webmerc_resolution);
+        let derived = web_mercator_gsds(
+            args.webmerc_minzoom,
+            args.webmerc_maxzoom,
+            args.webmerc_resolution,
+        );
         eprintln!(
             "      auto-derived {} LoD(s) from Web Mercator z{}..=z{} (resolution {})",
             derived.len(),
@@ -240,8 +254,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
-    let file = File::open(&args.input)
-        .with_context(|| format!("opening {}", args.input.display()))?;
+    let file =
+        File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
 
     let input_schema = builder.schema().clone();
@@ -262,8 +276,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     } else if let Some(g) = &input_geo {
         g.primary_column.clone()
     } else {
-        guess_geometry_column(&input_schema)
-            .ok_or_else(|| anyhow!("could not auto-detect geometry column; pass --geometry-column"))?
+        guess_geometry_column(&input_schema).ok_or_else(|| {
+            anyhow!("could not auto-detect geometry column; pass --geometry-column")
+        })?
     };
     let geom_col_idx = input_schema
         .index_of(&geom_col_name)
@@ -377,7 +392,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
         if drop_names.contains(&f.name().as_str()) {
-            eprintln!("      note: dropping input column `{}` (will be overwritten)", f.name());
+            eprintln!(
+                "      note: dropping input column `{}` (will be overwritten)",
+                f.name()
+            );
             continue;
         }
         output_fields.push(f.clone());
@@ -431,8 +449,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         for (lod_i, rows) in producer_per_lod.iter().enumerate() {
             for chunk in rows.chunks(producer_row_group_size) {
                 let indices = UInt32Array::from(chunk.to_vec());
-                let mut cols: Vec<ArrayRef> =
-                    Vec::with_capacity(producer_schema.fields().len());
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(producer_schema.fields().len());
                 for ki in &producer_keep {
                     cols.push(take(producer_table.column(*ki).as_ref(), &indices, None)?);
                 }
@@ -488,18 +505,20 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             columns.insert(geom_col_name.clone(), c);
         }
     }
-    columns.entry(geom_col_name.clone()).or_insert_with(|| GeoColumn {
-        encoding: "WKB".to_string(),
-        geometry_types: Vec::new(),
-        covering: Some(default_covering()),
-        bbox: Some(vec![
-            dataset_bbox.xmin,
-            dataset_bbox.ymin,
-            dataset_bbox.xmax,
-            dataset_bbox.ymax,
-        ]),
-        crs: None,
-    });
+    columns
+        .entry(geom_col_name.clone())
+        .or_insert_with(|| GeoColumn {
+            encoding: "WKB".to_string(),
+            geometry_types: Vec::new(),
+            covering: Some(default_covering()),
+            bbox: Some(vec![
+                dataset_bbox.xmin,
+                dataset_bbox.ymin,
+                dataset_bbox.xmax,
+                dataset_bbox.ymax,
+            ]),
+            crs: None,
+        });
     let geo_meta = GeoMeta {
         version: GEOPARQUET_VERSION.to_string(),
         primary_column: geom_col_name.clone(),
