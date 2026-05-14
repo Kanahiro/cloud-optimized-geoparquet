@@ -16,7 +16,8 @@
       <p class="hint">
         Load a COGP file via HTTP range requests. Only the row groups whose
         envelopes intersect the current viewport are fetched, and the LoD is
-        auto-selected from the current zoom.
+        auto-selected to match the viewport's on-screen resolution (meters
+        per pixel at the current zoom, latitude, and device pixel ratio).
       </p>
       <p class="hint">
         <a

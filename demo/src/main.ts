@@ -179,7 +179,6 @@ map.on('moveend', () => {
 async function refreshViewport(): Promise<void> {
   if (!active) return;
   const ds = active;
-  const z = Math.max(0, Math.min(22, Math.floor(map.getZoom())));
   const bounds = map.getBounds();
   const bbox = {
     minX: bounds.getWest(),
@@ -187,17 +186,18 @@ async function refreshViewport(): Promise<void> {
     maxX: bounds.getEast(),
     maxY: bounds.getNorth(),
   };
-  const maxLod = ds.reader.selectLod(gsdForZoom(z));
-
+  const gsd = gsdForViewport();
+  const gsdLabel = formatGsd(gsd);
+  const maxLod = ds.reader.selectLod(gsd);
   const myLoadId = ++ds.loadId;
-  setStatus(`Reading at z=${z} (lod ≤ ${maxLod}) …`);
+  setStatus(`Reading at ${gsdLabel}/px (lod ≤ ${maxLod}) …`);
   try {
     const rows = await ds.reader.readRows({ bbox, maxLod });
     if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
     const fc = rowsToFeatureCollection(rows, ds.reader.primaryGeometryColumn);
     const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;
     src?.setData(fc);
-    setStatus(`Rendered ${fc.features.length} features at z=${z} (lod ≤ ${maxLod}).`);
+    setStatus(`Rendered ${fc.features.length} features at ${gsdLabel}/px (lod ≤ ${maxLod}).`);
   } catch (err) {
     console.warn('read failed', err);
     setStatus(`Read error: ${(err as Error).message}`);
@@ -229,13 +229,24 @@ function rowsToFeatureCollection(
   return { type: 'FeatureCollection', features };
 }
 
-// Target ground-sample distance for a tile zoom level. Must match the
-// `--webmerc-resolution` the cogp file was authored with (default 1024): the
-// LoD-i GSD is `(2π · 6_378_137) / (resolution · 2^i)` m at the equator, so
-// using the same value here keeps `zoom ↔ LoD index` 1:1.
-const BASE_RESOLUTION = 1024;
-const EARTH_CIRCUMFERENCE_M = 40075016.685578488;
-const BASE_GSD_Z0 = EARTH_CIRCUMFERENCE_M / BASE_RESOLUTION;
-function gsdForZoom(zoom: number): number {
-  return BASE_GSD_Z0 / Math.pow(2, zoom);
+// Target ground-sample distance (meters per physical screen pixel) at the
+// current viewport center. `map.project` gives CSS-pixel coordinates and
+// `LngLat.distanceTo` gives metric distance, so dividing them yields the
+// effective resolution at this zoom and latitude — Mercator scale
+// distortion is handled by MapLibre. Divide by `devicePixelRatio` to step
+// from CSS pixels to physical screen pixels.
+function gsdForViewport(): number {
+  const center = map.getCenter();
+  const east = new maplibregl.LngLat(center.lng + 0.001, center.lat);
+  const p0 = map.project(center);
+  const p1 = map.project(east);
+  const dxCssPx = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  const dxM = center.distanceTo(east);
+  return dxM / dxCssPx / (window.devicePixelRatio || 1);
+}
+
+function formatGsd(gsdMeters: number): string {
+  if (gsdMeters >= 1000) return `${(gsdMeters / 1000).toFixed(1)} km`;
+  if (gsdMeters >= 1) return `${gsdMeters.toFixed(1)} m`;
+  return `${(gsdMeters * 100).toFixed(1)} cm`;
 }
