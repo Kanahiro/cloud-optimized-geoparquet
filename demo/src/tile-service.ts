@@ -2,7 +2,7 @@ import { CogpReader } from 'cogp';
 
 import { emptyTile, encodeTileRows } from './tile-encoder';
 
-const TILE_MAX_ROWS = 100000;
+const TILE_MAX_ROWS = Infinity;
 const TILE_MAX_BYTES = 20000000;
 
 export interface CogpTileRequest {
