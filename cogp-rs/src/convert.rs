@@ -16,6 +16,7 @@ use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -53,6 +54,9 @@ pub struct ConvertArgs {
     /// Parquet row group size in rows
     #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
+    /// Maximum estimated encoded Parquet row group size in bytes
+    #[arg(long)]
+    pub row_group_max_bytes: Option<usize>,
     /// Coordinate units in the input file. `auto` (default) inspects the GeoParquet
     /// `crs` PROJJSON: `ProjectedCRS` → meters, otherwise degrees. Override with
     /// `degrees` or `meters` if needed.
@@ -120,6 +124,44 @@ pub enum InputUnits {
     Auto,
     Degrees,
     Meters,
+}
+
+const ROW_GROUP_BYTE_CHECK_ROWS: usize = 1024;
+
+fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
+    let count = writer.flushed_row_groups().len();
+    if count == 0 {
+        bail!("internal error: level ended before any row group was written");
+    }
+    Ok((count as i64) - 1)
+}
+
+fn write_batch_with_row_group_limits<W: Write + Send>(
+    writer: &mut ArrowWriter<W>,
+    batch: &RecordBatch,
+    max_rows: usize,
+    max_bytes: Option<usize>,
+) -> Result<()> {
+    let Some(max_bytes) = max_bytes else {
+        writer.write(batch)?;
+        return Ok(());
+    };
+
+    let mut offset = 0;
+    while offset < batch.num_rows() {
+        let buffered_rows = writer.in_progress_rows();
+        let rows_until_row_limit = max_rows.saturating_sub(buffered_rows).max(1);
+        let rows = (batch.num_rows() - offset)
+            .min(rows_until_row_limit)
+            .min(ROW_GROUP_BYTE_CHECK_ROWS);
+        writer.write(&batch.slice(offset, rows))?;
+        offset += rows;
+
+        if writer.in_progress_rows() > 0 && writer.in_progress_size() >= max_bytes {
+            writer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 /// Inspect the GeoParquet column `crs` PROJJSON value to guess coordinate units.
@@ -251,6 +293,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             "--polygon-visibility-factor must be >= 1 (got {})",
             args.polygon_visibility_factor
         );
+    }
+    if args.row_group_size == 0 {
+        bail!("--row-group-size must be >= 1");
     }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
@@ -464,26 +509,31 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         Ok(())
     });
 
-    let mut current_rg: i64 = -1;
     let mut last_level: Option<usize> = None;
     let mut levels_meta: Vec<Level> = Vec::with_capacity(gsds.len());
+    let row_group_max_bytes = args.row_group_max_bytes;
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
+                writer.flush()?;
                 levels_meta.push(Level {
-                    row_group_end: current_rg,
+                    row_group_end: flushed_row_group_end(&writer)?,
                     gsd: gsds[prev],
                 });
             }
         }
-        writer.write(&batch)?;
-        writer.flush()?;
-        current_rg += 1;
+        write_batch_with_row_group_limits(
+            &mut writer,
+            &batch,
+            args.row_group_size,
+            row_group_max_bytes,
+        )?;
         last_level = Some(level_i);
     }
     if let Some(prev) = last_level {
+        writer.flush()?;
         levels_meta.push(Level {
-            row_group_end: current_rg,
+            row_group_end: flushed_row_group_end(&writer)?,
             gsd: gsds[prev],
         });
     }
@@ -540,9 +590,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     });
     let _ = writer.close()?;
 
+    let row_group_count = cogp_meta
+        .levels
+        .last()
+        .map(|level| level.row_group_end + 1)
+        .unwrap_or(0);
     eprintln!(
         "      wrote {} row group(s) across {} level(s)",
-        current_rg + 1,
+        row_group_count,
         cogp_meta.levels.len()
     );
     Ok(())
