@@ -126,7 +126,7 @@ async function loadDataset(url: string): Promise<void> {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     setStatus(
-      `Opened. ${reader.numRowGroups} row groups across ${reader.lods.length} LoDs.`,
+      `Opened. ${reader.numRowGroups} row groups across ${reader.levels.length} levels.`,
     );
     await refreshViewport();
   } catch (err) {
@@ -142,7 +142,7 @@ function renderMetadata(reader: CogpReader): void {
   const summary = {
     primary_column: reader.primaryGeometryColumn,
     num_row_groups: reader.numRowGroups,
-    lods: reader.lods.map((l, i) => ({
+    levels: reader.levels.map((l, i) => ({
       i,
       gsd: l.gsd,
       row_group_end: l.row_group_end,
@@ -187,17 +187,17 @@ async function refreshViewport(): Promise<void> {
     maxX: bounds.getEast(),
     maxY: bounds.getNorth(),
   };
-  const maxLod = ds.reader.selectLod(gsdForZoom(z));
+  const maxLevel = ds.reader.selectLevel(gsdForZoom(z));
 
   const myLoadId = ++ds.loadId;
-  setStatus(`Reading at z=${z} (lod ≤ ${maxLod}) …`);
+  setStatus(`Reading at z=${z} (level ≤ ${maxLevel}) …`);
   try {
-    const rows = await ds.reader.readRows({ bbox, maxLod });
+    const rows = await ds.reader.readRows({ bbox, maxLevel });
     if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
     const fc = rowsToFeatureCollection(rows, ds.reader.primaryGeometryColumn);
     const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;
     src?.setData(fc);
-    setStatus(`Rendered ${fc.features.length} features at z=${z} (lod ≤ ${maxLod}).`);
+    setStatus(`Rendered ${fc.features.length} features at z=${z} (level ≤ ${maxLevel}).`);
   } catch (err) {
     console.warn('read failed', err);
     setStatus(`Read error: ${(err as Error).message}`);
@@ -231,8 +231,8 @@ function rowsToFeatureCollection(
 
 // Target ground-sample distance for a tile zoom level. Must match the
 // `--base-resolution` the cogp file was authored with (default 1024): the
-// LoD-i GSD is `(2π · 6_378_137) / (base · 2^i)` m at the equator, so using
-// the same base here keeps `zoom ↔ LoD index` 1:1.
+// level-i GSD is `(2π · 6_378_137) / (base · 2^i)` m at the equator, so using
+// the same base here keeps `zoom ↔ level index` 1:1.
 const BASE_RESOLUTION = 1024;
 const EARTH_CIRCUMFERENCE_M = 40075016.685578488;
 const BASE_GSD_Z0 = EARTH_CIRCUMFERENCE_M / BASE_RESOLUTION;
