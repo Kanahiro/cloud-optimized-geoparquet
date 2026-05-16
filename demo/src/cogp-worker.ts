@@ -11,7 +11,8 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-const VIEWPORT_MAX_ROWS = 50_000;
+const VIEWPORT_MAX_ROWS = 100_000;
+const VIEWPORT_MAX_ROW_WKB_BYTES = 20_000_000;
 
 interface ActiveDataset {
   url: string;
@@ -52,7 +53,12 @@ async function readViewport(
   }
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetGsd);
-  const rows = await ds.reader.readRows({ bbox, maxLevel, maxRows: VIEWPORT_MAX_ROWS });
+  const rows = await ds.reader.readRows({
+    bbox,
+    maxLevel,
+    maxRows: VIEWPORT_MAX_ROWS,
+    maxRowWkbBytes: VIEWPORT_MAX_ROW_WKB_BYTES,
+  });
 
   const features: Feature[] = [];
   const skip = new Set<string>([geomColumn]);

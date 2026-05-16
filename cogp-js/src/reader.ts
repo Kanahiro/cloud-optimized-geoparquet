@@ -35,7 +35,7 @@ export interface OpenOptions {
   cacheMaxRows?: number;
 }
 
-const DEFAULT_CACHE_MAX_ROWS = 500_000;
+const DEFAULT_CACHE_MAX_ROWS = 100_000;
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
@@ -74,20 +74,25 @@ export interface ReadOptions {
    * Output cap: stop streaming once this many rows have survived bbox
    * filtering. Applied to the post-filter row count, so when a `bbox` is
    * provided the value reflects rows actually returned to the caller, not
-   * the pre-filter row-group size. Row groups are consumed in level/file
-   * order; the row group whose rows push the count past the cap is still
-   * fully filtered, so the returned count may exceed `maxRows` by less than
-   * one row group's worth of survivors.
+   * the pre-filter row-group size. The check fires per surviving row, so
+   * the returned count never exceeds `maxRows`. Already-dispatched row
+   * group fetches (runs coalesced upstream) still complete, but later runs
+   * are skipped entirely.
    */
   maxRows?: number;
   /**
-   * Fetch budget: cap on cumulative `total_byte_size` (uncompressed) of
-   * selected row groups, in bytes. Row groups are picked in level/file
-   * order (post-bbox-prune); selection stops once adding the next group
-   * would push the cumulative byte count over this limit. A row group is
-   * never partially loaded.
+   * Output cap on cumulative WKB byte size of surviving rows' geometry
+   * columns. Measured on the raw on-disk bytes before WKB → GeoJSON decode,
+   * so a single huge polygon is caught even when row counts are tiny. The
+   * check fires per surviving row and is strict: a row whose geometry bytes
+   * would push the cumulative total over the cap is rejected (not decoded,
+   * not returned) and streaming stops. This means a single polygon bigger
+   * than the cap yields zero rows for that read — by design, since the
+   * point of the cap is to prevent shipping that polygon downstream. Only
+   * WKB geometry columns contribute; other heavy columns (long strings,
+   * etc.) are not measured.
    */
-  maxBytes?: number;
+  maxRowWkbBytes?: number;
 }
 
 export class CogpReader {
@@ -211,8 +216,10 @@ export class CogpReader {
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLevel, bbox, opts.maxBytes);
+    const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
+    const maxRowWkbBytes = opts.maxRowWkbBytes;
+    let wkbBytes = 0;
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
@@ -225,17 +232,46 @@ export class CogpReader {
     const out: Record<string, unknown>[] = [];
     const paths = bbox ? this.bboxPaths : null;
     const geomCols = this.geomColumns;
-    const decodeGeoms = (row: Record<string, unknown>) => {
-      for (const col of geomCols) {
-        const v = row[col];
-        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
+    // Returns true once a cap has been reached, signalling callers to stop
+    // iterating the current row group (and the outer stream) immediately
+    // rather than draining the rest of the batch. The geometry-byte check
+    // runs BEFORE WKB → GeoJSON decode so a single huge polygon doesn't
+    // sneak past the cap (decoded GeoJSON can be many MB even when the
+    // caller asked for a small output budget — that's what crashes the
+    // downstream renderer).
+    //
+    // The returned row is a shallow clone so decoding doesn't mutate the
+    // cached row. Without the clone, a second read of the same row group
+    // would see already-decoded geometries, `byteLength` would report 0
+    // for those columns, and the cap would silently expand on every
+    // repeat read.
+    const acceptRow = (row: Record<string, unknown>): boolean => {
+      if (maxRowWkbBytes !== undefined) {
+        let rowWkbBytes = 0;
+        for (const col of geomCols) {
+          const v = row[col];
+          if (v instanceof Uint8Array) rowWkbBytes += v.byteLength;
+        }
+        if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
+        wkbBytes += rowWkbBytes;
       }
+      const outRow: Record<string, unknown> = { ...row };
+      for (const col of geomCols) {
+        const v = outRow[col];
+        if (v instanceof Uint8Array) outRow[col] = decodeWkb(v);
+      }
+      out.push(outRow);
+      if (maxRows !== undefined && out.length >= maxRows) return true;
+      return false;
     };
+    let stopped = false;
     for await (const batch of this.streamRowGroups(rgs, columns)) {
       if (!paths) {
         for (const row of batch) {
-          decodeGeoms(row);
-          out.push(row);
+          if (acceptRow(row)) {
+            stopped = true;
+            break;
+          }
         }
       } else {
         for (const row of batch) {
@@ -250,12 +286,14 @@ export class CogpReader {
               bbox!,
             )
           ) {
-            decodeGeoms(row);
-            out.push(row);
+            if (acceptRow(row)) {
+              stopped = true;
+              break;
+            }
           }
         }
       }
-      if (maxRows !== undefined && out.length >= maxRows) break;
+      if (stopped) break;
     }
     return out;
   }
@@ -267,20 +305,16 @@ export class CogpReader {
     return rowGroupBbox(rg, this.bboxColIdx);
   }
 
-  private candidateRowGroups(maxLevel: number, bbox?: Bbox, maxBytes?: number): number[] {
+  private candidateRowGroups(maxLevel: number, bbox?: Bbox): number[] {
     if (maxLevel < 0 || maxLevel >= this.levels.length) {
       throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
     }
     const end = this.levels[maxLevel]!.row_group_end;
     const out: number[] = [];
-    let bytesAcc = 0;
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
       if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
-      const b = Number(rg.total_byte_size ?? 0);
-      if (maxBytes !== undefined && bytesAcc + b > maxBytes) break;
       out.push(i);
-      bytesAcc += b;
     }
     return out;
   }
