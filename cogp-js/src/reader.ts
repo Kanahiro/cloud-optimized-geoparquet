@@ -35,7 +35,7 @@ export interface OpenOptions {
   cacheMaxRows?: number;
 }
 
-const DEFAULT_CACHE_MAX_ROWS = 500_000;
+const DEFAULT_CACHE_MAX_ROWS = 100_000;
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
