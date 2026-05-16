@@ -1,14 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::{Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, Float64Array, LargeBinaryArray, RecordBatch, StructArray,
+    UInt32Array,
+};
 use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::file::metadata::KeyValue;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
+use parquet::file::metadata::KeyValue;
+use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -33,20 +36,20 @@ pub struct ConvertArgs {
     /// Comma-separated GSD list, meters, coarse to fine (e.g. 1000,500,100,50).
     /// Projection-agnostic: each value is the ground sample distance in meters
     /// at which a level becomes meaningful. If omitted, GSDs are auto-derived
-    /// from --minzoom..=--maxzoom assuming a Web Mercator tile pyramid
-    /// (see --minzoom/--maxzoom/--base-resolution). Pass --gsd directly if
-    /// you target a non-Web-Mercator renderer.
-    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["minzoom", "maxzoom"])]
+    /// from --webmerc-minzoom..=--webmerc-maxzoom assuming a Web Mercator tile
+    /// pyramid (see --webmerc-minzoom/--webmerc-maxzoom/--webmerc-resolution).
+    /// Pass --gsd directly if you target a non-Web-Mercator renderer.
+    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["webmerc_minzoom", "webmerc_maxzoom"])]
     pub gsd: Vec<f64>,
     /// Coarsest Web Mercator zoom level for GSD auto-derivation. Used only
     /// when --gsd is omitted. Assumes the consumer renders on a Web Mercator
     /// (EPSG:3857) tile pyramid; for other projections, supply --gsd.
     #[arg(long, default_value_t = 0)]
-    pub minzoom: u32,
+    pub webmerc_minzoom: u32,
     /// Finest Web Mercator zoom level for GSD auto-derivation. Used only
-    /// when --gsd is omitted. Same Web Mercator assumption as --minzoom.
+    /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
-    pub maxzoom: u32,
+    pub webmerc_maxzoom: u32,
     /// Parquet row group size in rows
     #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
@@ -60,17 +63,17 @@ pub struct ConvertArgs {
     pub geometry_column: Option<String>,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
     /// derive the level thinning grid when auto-deriving GSDs from
-    /// --minzoom/--maxzoom. The level-i GSD is the ground distance covered by
-    /// one base unit at zoom i, computed as `40_075_016 / (base · 2^i)`
-    /// meters at the equator — i.e. it bakes in the Web Mercator equatorial
-    /// circumference and the standard `2^z` tile pyramid. This controls
-    /// *thinning* granularity, not output coordinate precision. The default
-    /// of 1024 keeps the thinning grid at ~4× the typical 256-pixel tile
-    /// resolution, so features collapsing within a few subpixels are
-    /// dropped. Ignored when --gsd is given (in that case the GSDs are
-    /// taken verbatim and no projection is assumed).
+    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i GSD is the ground
+    /// distance covered by one base unit at zoom i, computed as
+    /// `40_075_016 / (base · 2^i)` meters at the equator — i.e. it bakes in
+    /// the Web Mercator equatorial circumference and the standard `2^z` tile
+    /// pyramid. This controls *thinning* granularity, not output coordinate
+    /// precision. The default of 1024 keeps the thinning grid at ~4× the
+    /// typical 256-pixel tile resolution, so features collapsing within a
+    /// few subpixels are dropped. Ignored when --gsd is given (in that case
+    /// the GSDs are taken verbatim and no projection is assumed).
     #[arg(long, default_value_t = 1024)]
-    pub base_resolution: u32,
+    pub webmerc_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times coarser than `prec` per axis, yielding ~factor² fewer
     /// points per level than polygons. Compensates for the fact that polygons
@@ -86,6 +89,29 @@ pub struct ConvertArgs {
     /// lines still span many cells along their length. Set to `1` to disable.
     #[arg(long, default_value_t = 2)]
     pub line_thinning_factor: u32,
+    /// Polygon-like features (WKB Polygon / MultiPolygon) use a thinning grid
+    /// this many times coarser than `prec` per axis. Polygons span area so
+    /// `1` (the default) already looks well-covered; raise to thin further.
+    #[arg(long, default_value_t = 1)]
+    pub polygon_thinning_factor: u32,
+    /// Line visibility threshold multiplier applied to `prec` when deciding
+    /// the coarsest level at which a LineString first becomes independently
+    /// meaningful. A line is eligible from level `i` once its bbox diagonal
+    /// reaches `factor · prec[i]`. Lines are 1D so a diagonal equal to `prec`
+    /// is only a hairline; the default of `2` defers such short lines to a
+    /// finer level. Distinct from `--line-thinning-factor` (which controls grid
+    /// cell pitch, not eligibility). Set to `1` to disable.
+    #[arg(long, default_value_t = 2)]
+    pub line_visibility_factor: u32,
+    /// Polygon visibility threshold multiplier applied to `prec` when deciding
+    /// the coarsest level at which a Polygon first becomes independently
+    /// meaningful. A polygon is eligible from level `i` once its bbox diagonal
+    /// reaches `factor · prec[i]`. Default of `4` defers polygons whose
+    /// diagonal is under ~4 grid cells to a finer level, so coarse levels aren't
+    /// crowded by tiny polygons. Distinct from `--polygon-thinning-factor`.
+    /// Set to `1` to disable.
+    #[arg(long, default_value_t = 4)]
+    pub polygon_visibility_factor: u32,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -131,16 +157,20 @@ fn detect_input_units(input_geo: Option<&GeoMeta>, geom_col: &str) -> InputUnits
 const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_488;
 
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
-/// into `base_resolution` units per side. The default of 1024 yields ~39136 m
-/// per unit at zoom 0 — the smallest distance the thinning grid distinguishes
-/// at the coarsest level.
-fn base_unit_gsd_z0(base_resolution: u32) -> f64 {
-    WEB_MERCATOR_CIRCUMFERENCE_M / (base_resolution as f64)
+/// into `webmerc_resolution` units per side. The default of 1024 yields
+/// ~39136 m per unit at zoom 0 — the smallest distance the thinning grid
+/// distinguishes at the coarsest level.
+fn base_unit_gsd_z0(webmerc_resolution: u32) -> f64 {
+    WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
 }
 
-fn web_mercator_gsds(minzoom: u32, maxzoom: u32, base_resolution: u32) -> Vec<f64> {
-    let z0 = base_unit_gsd_z0(base_resolution);
-    (minzoom..=maxzoom)
+fn web_mercator_gsds(
+    webmerc_minzoom: u32,
+    webmerc_maxzoom: u32,
+    webmerc_resolution: u32,
+) -> Vec<f64> {
+    let z0 = base_unit_gsd_z0(webmerc_resolution);
+    (webmerc_minzoom..=webmerc_maxzoom)
         .map(|z| z0 / (1u64 << z) as f64)
         .collect()
 }
@@ -149,29 +179,36 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let gsds: Vec<f64> = if !args.gsd.is_empty() {
         args.gsd.clone()
     } else {
-        if args.minzoom > args.maxzoom {
+        if args.webmerc_minzoom > args.webmerc_maxzoom {
             bail!(
-                "--minzoom ({}) must be <= --maxzoom ({})",
-                args.minzoom,
-                args.maxzoom
+                "--webmerc-minzoom ({}) must be <= --webmerc-maxzoom ({})",
+                args.webmerc_minzoom,
+                args.webmerc_maxzoom
             );
         }
-        if args.maxzoom > 30 {
-            bail!("--maxzoom must be <= 30 (got {})", args.maxzoom);
-        }
-        if args.base_resolution == 0 {
+        if args.webmerc_maxzoom > 30 {
             bail!(
-                "--base-resolution must be > 0 (got {})",
-                args.base_resolution
+                "--webmerc-maxzoom must be <= 30 (got {})",
+                args.webmerc_maxzoom
             );
         }
-        let derived = web_mercator_gsds(args.minzoom, args.maxzoom, args.base_resolution);
+        if args.webmerc_resolution == 0 {
+            bail!(
+                "--webmerc-resolution must be > 0 (got {})",
+                args.webmerc_resolution
+            );
+        }
+        let derived = web_mercator_gsds(
+            args.webmerc_minzoom,
+            args.webmerc_maxzoom,
+            args.webmerc_resolution,
+        );
         eprintln!(
-            "      auto-derived {} level(s) from Web Mercator z{}..=z{} (base resolution {})",
+            "      auto-derived {} level(s) from Web Mercator z{}..=z{} (resolution {})",
             derived.len(),
-            args.minzoom,
-            args.maxzoom,
-            args.base_resolution,
+            args.webmerc_minzoom,
+            args.webmerc_maxzoom,
+            args.webmerc_resolution,
         );
         derived
     };
@@ -197,10 +234,28 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             args.line_thinning_factor
         );
     }
+    if args.polygon_thinning_factor == 0 {
+        bail!(
+            "--polygon-thinning-factor must be >= 1 (got {})",
+            args.polygon_thinning_factor
+        );
+    }
+    if args.line_visibility_factor == 0 {
+        bail!(
+            "--line-visibility-factor must be >= 1 (got {})",
+            args.line_visibility_factor
+        );
+    }
+    if args.polygon_visibility_factor == 0 {
+        bail!(
+            "--polygon-visibility-factor must be >= 1 (got {})",
+            args.polygon_visibility_factor
+        );
+    }
 
     eprintln!("[1/4] Reading input: {}", args.input.display());
-    let file = File::open(&args.input)
-        .with_context(|| format!("opening {}", args.input.display()))?;
+    let file =
+        File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
 
     let input_schema = builder.schema().clone();
@@ -221,8 +276,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     } else if let Some(g) = &input_geo {
         g.primary_column.clone()
     } else {
-        guess_geometry_column(&input_schema)
-            .ok_or_else(|| anyhow!("could not auto-detect geometry column; pass --geometry-column"))?
+        guess_geometry_column(&input_schema).ok_or_else(|| {
+            anyhow!("could not auto-detect geometry column; pass --geometry-column")
+        })?
     };
     let geom_col_idx = input_schema
         .index_of(&geom_col_name)
@@ -285,8 +341,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         &kinds,
         &gsds,
         input_units,
-        args.point_thinning_factor,
-        args.line_thinning_factor,
+        ThinningFactors {
+            point: args.point_thinning_factor,
+            line: args.line_thinning_factor,
+            polygon: args.polygon_thinning_factor,
+        },
+        VisibilityFactors {
+            line: args.line_visibility_factor,
+            polygon: args.polygon_visibility_factor,
+        },
     )?;
     let mut per_level_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
     for (idx, level_i) in assignment.iter().enumerate() {
@@ -329,7 +392,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
         if drop_names.contains(&f.name().as_str()) {
-            eprintln!("      note: dropping input column `{}` (will be overwritten)", f.name());
+            eprintln!(
+                "      note: dropping input column `{}` (will be overwritten)",
+                f.name()
+            );
             continue;
         }
         output_fields.push(f.clone());
@@ -383,8 +449,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         for (level_i, rows) in producer_per_level.iter().enumerate() {
             for chunk in rows.chunks(producer_row_group_size) {
                 let indices = UInt32Array::from(chunk.to_vec());
-                let mut cols: Vec<ArrayRef> =
-                    Vec::with_capacity(producer_schema.fields().len());
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(producer_schema.fields().len());
                 for ki in &producer_keep {
                     cols.push(take(producer_table.column(*ki).as_ref(), &indices, None)?);
                 }
@@ -440,18 +505,20 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             columns.insert(geom_col_name.clone(), c);
         }
     }
-    columns.entry(geom_col_name.clone()).or_insert_with(|| GeoColumn {
-        encoding: "WKB".to_string(),
-        geometry_types: Vec::new(),
-        covering: Some(default_covering()),
-        bbox: Some(vec![
-            dataset_bbox.xmin,
-            dataset_bbox.ymin,
-            dataset_bbox.xmax,
-            dataset_bbox.ymax,
-        ]),
-        crs: None,
-    });
+    columns
+        .entry(geom_col_name.clone())
+        .or_insert_with(|| GeoColumn {
+            encoding: "WKB".to_string(),
+            geometry_types: Vec::new(),
+            covering: Some(default_covering()),
+            bbox: Some(vec![
+                dataset_bbox.xmin,
+                dataset_bbox.ymin,
+                dataset_bbox.xmax,
+                dataset_bbox.ymax,
+            ]),
+            crs: None,
+        });
     let geo_meta = GeoMeta {
         version: GEOPARQUET_VERSION.to_string(),
         primary_column: geom_col_name.clone(),
@@ -710,6 +777,23 @@ fn compute_kinds(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<GeomKin
     }
 }
 
+/// Per-kind multipliers on `prec` for the level thinning grid pitch.
+#[derive(Clone, Copy)]
+struct ThinningFactors {
+    point: u32,
+    line: u32,
+    polygon: u32,
+}
+
+/// Per-kind multipliers on `prec` for the visibility (eligibility) threshold.
+/// Points are excluded — they have no extent, so they are always eligible
+/// from level 0 regardless of any factor.
+#[derive(Clone, Copy)]
+struct VisibilityFactors {
+    line: u32,
+    polygon: u32,
+}
+
 /// Grid-based density thinning. Returns an assignment of each row to a level index.
 ///
 /// For each level (coarse → fine), bucket remaining features into grid cells of side
@@ -724,8 +808,8 @@ fn assign_levels(
     kinds: &[GeomKind],
     gsds: &[f64],
     units: InputUnits,
-    point_thinning_factor: u32,
-    line_thinning_factor: u32,
+    thinning: ThinningFactors,
+    visibility: VisibilityFactors,
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
@@ -748,12 +832,25 @@ fn assign_levels(
     // Kind-specific grid coarsening. Polygons span area so 1-pick-per-prec-cell
     // overlaps visually; points are 0D and lines are 1D in the cross-axis, so
     // their picks look saturated at the same density — coarsen each accordingly.
-    let point_mul = point_thinning_factor as f64;
-    let line_mul = line_thinning_factor as f64;
+    let point_thin_mul = thinning.point as f64;
+    let line_thin_mul = thinning.line as f64;
+    let polygon_thin_mul = thinning.polygon as f64;
+    let line_vis_mul = visibility.line as f64;
+    let polygon_vis_mul = visibility.polygon as f64;
 
-    // Coarsest level at which each feature is independently meaningful (its bbox
-    // size ≥ that level's prec). Points have no extent so are always eligible
-    // from level 0; the point grid coarsening above keeps them from over-saturating.
+    // Coarsest level at which each feature is independently meaningful: its bbox
+    // diagonal ≥ `vis_factor · prec` for the feature's kind. Diagonal — rather
+    // than max(w, h) — so a 45° line is rated by its actual length, not its
+    // axis-aligned shadow. Compared in squared form to avoid a per-row sqrt.
+    // Points have no extent so are always eligible from level 0.
+    let sq_line_vis: Vec<f64> = precs
+        .iter()
+        .map(|p| (p * line_vis_mul) * (p * line_vis_mul))
+        .collect();
+    let sq_polygon_vis: Vec<f64> = precs
+        .iter()
+        .map(|p| (p * polygon_vis_mul) * (p * polygon_vis_mul))
+        .collect();
     let min_visible: Vec<u16> = bboxes
         .par_iter()
         .zip(kinds.par_iter())
@@ -761,12 +858,17 @@ fn assign_levels(
             if *k == GeomKind::Point {
                 return 0u16;
             }
-            let size = b.width().max(b.height());
-            if size <= 0.0 {
+            let sq_diag = b.width().powi(2) + b.height().powi(2);
+            if sq_diag <= 0.0 {
                 return 0u16;
             }
-            for (i, prec) in precs.iter().enumerate() {
-                if size >= *prec {
+            let thresholds = match k {
+                GeomKind::Line => &sq_line_vis,
+                GeomKind::Polygon => &sq_polygon_vis,
+                GeomKind::Point => unreachable!(),
+            };
+            for (i, sp) in thresholds.iter().enumerate() {
+                if sq_diag >= *sp {
                     return i as u16;
                 }
             }
@@ -789,9 +891,9 @@ fn assign_levels(
                 let b = bboxes[row as usize];
                 let k = kinds[row as usize];
                 let eff_prec = match k {
-                    GeomKind::Point => prec * point_mul,
-                    GeomKind::Line => prec * line_mul,
-                    GeomKind::Polygon => *prec,
+                    GeomKind::Point => prec * point_thin_mul,
+                    GeomKind::Line => prec * line_thin_mul,
+                    GeomKind::Polygon => prec * polygon_thin_mul,
                 };
                 let key = (
                     k as u8,
@@ -855,23 +957,26 @@ fn assign_levels(
     Ok(out)
 }
 
-/// Primary order: bbox Manhattan extent `width + height` (bits — gives a total
-/// order over f64 including NaN guard). Used as a kind-agnostic "size" proxy:
-/// for polygons it favors the larger/more-elongated feature; for axis-aligned
-/// lines it equals the actual length so longer lines win; for points it is 0
-/// so ties fall through to the hashed secondary. Secondary: hashed row index
-/// for a deterministic tie-break.
+/// Primary order: bbox diagonal `w² + h²` (squared, monotonic in the real
+/// diagonal, bits give a total order over f64 including NaN guard). Used as
+/// a kind-agnostic, orientation-independent "size" proxy: a 45° line scores
+/// the same as an axis-aligned line of equal true length, and a square
+/// polygon scores the same as a 90°-rotated one. For points it is 0 so ties
+/// fall through to the hashed secondary. Secondary: hashed row index for a
+/// deterministic tie-break.
 fn priority(b: &Bbox, row: u32) -> (u64, u64) {
-    let extent = b.width().max(0.0) + b.height().max(0.0);
-    let extent_bits = if extent.is_finite() && extent >= 0.0 {
-        extent.to_bits()
+    let w = b.width().max(0.0);
+    let h = b.height().max(0.0);
+    let sq_diag = w * w + h * h;
+    let sq_bits = if sq_diag.is_finite() && sq_diag >= 0.0 {
+        sq_diag.to_bits()
     } else {
         0
     };
-    let mut h = row as u64;
-    h = h.wrapping_mul(0x9E3779B97F4A7C15);
-    h ^= h >> 30;
-    (extent_bits, h)
+    let mut hash = row as u64;
+    hash = hash.wrapping_mul(0x9E3779B97F4A7C15);
+    hash ^= hash >> 30;
+    (sq_bits, hash)
 }
 
 /// Sort-Tile-Recursive packing: divide into ~sqrt(N/M) strips by center-x, then sort by
