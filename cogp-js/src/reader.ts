@@ -43,16 +43,21 @@ export interface ReadOptions {
   /** Subset of columns to materialize. */
   columns?: string[];
   /**
-   * Fetch budget: cap on cumulative `num_rows` of selected row groups. Row
-   * groups are picked in level/file order (post-bbox-prune); selection stops
-   * once adding the next group would push the cumulative count over this
-   * limit. A row group is never partially loaded, so the returned row count
-   * may be less than `maxRows` (especially after per-row bbox filtering).
+   * Output cap: stop streaming once this many rows have survived bbox
+   * filtering. Applied to the post-filter row count, so when a `bbox` is
+   * provided the value reflects rows actually returned to the caller, not
+   * the pre-filter row-group size. Row groups are consumed in level/file
+   * order; the row group whose rows push the count past the cap is still
+   * fully filtered, so the returned count may exceed `maxRows` by less than
+   * one row group's worth of survivors.
    */
   maxRows?: number;
   /**
    * Fetch budget: cap on cumulative `total_byte_size` (uncompressed) of
-   * selected row groups, in bytes. Same selection semantics as `maxRows`.
+   * selected row groups, in bytes. Row groups are picked in level/file
+   * order (post-bbox-prune); selection stops once adding the next group
+   * would push the cumulative byte count over this limit. A row group is
+   * never partially loaded.
    */
   maxBytes?: number;
 }
@@ -169,7 +174,8 @@ export class CogpReader {
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLevel, bbox, opts.maxRows, opts.maxBytes);
+    const rgs = this.candidateRowGroups(maxLevel, bbox, opts.maxBytes);
+    const maxRows = opts.maxRows;
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
@@ -179,27 +185,31 @@ export class CogpReader {
       const top = this.bboxPaths.xmin[0]!;
       if (!columns.includes(top)) columns = [...columns, top];
     }
-    const rows = await this.readRowGroupsAsRows(rgs, columns);
-    if (!bbox) return rows;
-    return this.filterRowsByBbox(rows, bbox);
-  }
-
-  private filterRowsByBbox(
-    rows: Record<string, unknown>[],
-    query: Bbox,
-  ): Record<string, unknown>[] {
-    const paths = this.bboxPaths;
-    return rows.filter((row) =>
-      bboxesIntersect(
-        {
-          minX: readNum(row, paths.xmin),
-          minY: readNum(row, paths.ymin),
-          maxX: readNum(row, paths.xmax),
-          maxY: readNum(row, paths.ymax),
-        },
-        query,
-      ),
-    );
+    const out: Record<string, unknown>[] = [];
+    const paths = bbox ? this.bboxPaths : null;
+    for await (const batch of this.streamRowGroups(rgs, columns)) {
+      if (!paths) {
+        for (const row of batch) out.push(row);
+      } else {
+        for (const row of batch) {
+          if (
+            bboxesIntersect(
+              {
+                minX: readNum(row, paths.xmin),
+                minY: readNum(row, paths.ymin),
+                maxX: readNum(row, paths.xmax),
+                maxY: readNum(row, paths.ymax),
+              },
+              bbox!,
+            )
+          ) {
+            out.push(row);
+          }
+        }
+      }
+      if (maxRows !== undefined && out.length >= maxRows) break;
+    }
+    return out;
   }
 
   /** Bbox of a single row group as derived from covering column statistics. */
@@ -209,28 +219,19 @@ export class CogpReader {
     return rowGroupBbox(rg, this.bboxColIdx);
   }
 
-  private candidateRowGroups(
-    maxLevel: number,
-    bbox?: Bbox,
-    maxRows?: number,
-    maxBytes?: number,
-  ): number[] {
+  private candidateRowGroups(maxLevel: number, bbox?: Bbox, maxBytes?: number): number[] {
     if (maxLevel < 0 || maxLevel >= this.levels.length) {
       throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
     }
     const end = this.levels[maxLevel]!.row_group_end;
     const out: number[] = [];
-    let rowsAcc = 0;
     let bytesAcc = 0;
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
       if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
-      const n = Number(rg.num_rows ?? 0);
       const b = Number(rg.total_byte_size ?? 0);
-      if (maxRows !== undefined && rowsAcc + n > maxRows) break;
       if (maxBytes !== undefined && bytesAcc + b > maxBytes) break;
       out.push(i);
-      rowsAcc += n;
       bytesAcc += b;
     }
     return out;
@@ -241,11 +242,18 @@ export class CogpReader {
     this.rowGroupCache.clear();
   }
 
-  private async readRowGroupsAsRows(
+  /**
+   * Materialize the requested row groups and yield one row group's rows per
+   * iteration, in the order given. Callers that filter per-row (e.g. bbox)
+   * can keep only the survivors and let each batch be GC'd, so peak memory
+   * is bounded by `(largest pending fetch) + (accumulated survivors)` rather
+   * than the sum of every selected row group's full row count.
+   */
+  private async *streamRowGroups(
     rgIndices: number[],
     columns: string[] | undefined,
-  ): Promise<Record<string, unknown>[]> {
-    if (rgIndices.length === 0) return [];
+  ): AsyncGenerator<Record<string, unknown>[]> {
+    if (rgIndices.length === 0) return;
 
     // Different `columns` selections produce structurally different rows, so
     // they get distinct cache entries. `*` marks "no projection".
@@ -304,14 +312,10 @@ export class CogpReader {
       }
     }
 
-    // Phase 3: await each row group's promise in the requested order and
-    // concatenate.
-    const allRows: Record<string, unknown>[] = [];
+    // Phase 3: yield each row group's rows in the requested order.
     for (const rg of rgIndices) {
-      const slice = await promises.get(rg)!;
-      for (const r of slice) allRows.push(r);
+      yield await promises.get(rg)!;
     }
-    return allRows;
   }
 
   private sumRowsInRange(start: number, end: number): number {
