@@ -129,15 +129,22 @@ async function buildCogpTile(
     maxLevel,
     maxRows: TILE_MAX_ROWS,
     maxBytes: TILE_MAX_BYTES,
-    columns: [geomColumn],
   });
 
-  const { data, featureCount } = encodeTileRows(rows, geomColumn, tile);
+  const { data, featureCount } = encodeTileRows(rows, geomColumn, tile, {
+    excludeColumns: bboxTopColumn(ds.reader, geomColumn),
+  });
   ds.servedTiles += 1;
   return {
     data,
     status: `Served ${ds.servedTiles} vector tiles. Last: ${featureCount} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}).`,
   };
+}
+
+function bboxTopColumn(reader: CogpReader, geomColumn: string): string[] {
+  const path = reader.geo.columns[geomColumn]?.covering?.bbox?.xmin;
+  const top = path?.[0];
+  return top ? [top] : [];
 }
 
 function tileBbox(z: number, x: number, y: number) {

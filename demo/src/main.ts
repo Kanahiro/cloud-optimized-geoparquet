@@ -42,6 +42,54 @@ const map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl({}), 'top-right');
 map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
+const COGP_INTERACTIVE_LAYERS = ['cogp-fill', 'cogp-line', 'cogp-point'];
+
+map.on('click', (e) => {
+  const features = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS });
+  const feature = features[0];
+  if (!feature) return;
+  new maplibregl.Popup({ maxWidth: '360px' })
+    .setLngLat(e.lngLat)
+    .setHTML(renderPropertiesHtml(feature.properties))
+    .addTo(map);
+});
+
+for (const layerId of COGP_INTERACTIVE_LAYERS) {
+  map.on('mouseenter', layerId, () => {
+    map.getCanvas().style.cursor = 'pointer';
+  });
+  map.on('mouseleave', layerId, () => {
+    map.getCanvas().style.cursor = '';
+  });
+}
+
+function renderPropertiesHtml(properties: Record<string, unknown> | null | undefined): string {
+  const entries = properties ? Object.entries(properties) : [];
+  if (entries.length === 0) {
+    return '<div class="cogp-popup"><em>No properties</em></div>';
+  }
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  const rows = entries
+    .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(formatValue(v))}</td></tr>`)
+    .join('');
+  return `<div class="cogp-popup"><table>${rows}</table></div>`;
+}
+
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  return String(value);
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 map.on('load', () => {
   if (active) replaceCogpSource(active.url);
 });

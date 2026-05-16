@@ -12,12 +12,18 @@ export interface EncodeResult {
   featureCount: number;
 }
 
+export interface EncodeOptions {
+  excludeColumns?: ReadonlyArray<string>;
+}
+
 export function encodeTileRows(
   rows: ReadonlyArray<Record<string, unknown>>,
   geomColumn: string,
   tile: { z: number; x: number; y: number },
+  options: EncodeOptions = {},
 ): EncodeResult {
-  const fc = rowsToFeatureCollection(rows, geomColumn);
+  const exclude = new Set<string>([geomColumn, ...(options.excludeColumns ?? [])]);
+  const fc = rowsToFeatureCollection(rows, geomColumn, exclude);
   return {
     data: encodeMvt(fc, tile),
     featureCount: fc.features.length,
@@ -31,14 +37,47 @@ export function emptyTile(): ArrayBuffer {
 function rowsToFeatureCollection(
   rows: ReadonlyArray<Record<string, unknown>>,
   geomColumn: string,
+  excludeColumns: ReadonlySet<string>,
 ): FeatureCollection {
   const features: Feature[] = [];
   for (const row of rows) {
     const geometry = row[geomColumn] as Geometry | null | undefined;
     if (!geometry) continue;
-    features.push({ type: 'Feature', geometry, properties: {} });
+    features.push({
+      type: 'Feature',
+      geometry,
+      properties: buildProperties(row, excludeColumns),
+    });
   }
   return { type: 'FeatureCollection', features };
+}
+
+function buildProperties(
+  row: Record<string, unknown>,
+  excludeColumns: ReadonlySet<string>,
+): Record<string, string | number | boolean | null> {
+  const props: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (excludeColumns.has(key)) continue;
+    props[key] = coerceMvtValue(value);
+  }
+  return props;
+}
+
+function coerceMvtValue(value: unknown): string | number | boolean | null {
+  if (value === null || value === undefined) return null;
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') {
+    return value as string | number | boolean;
+  }
+  if (t === 'bigint') return (value as bigint).toString();
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
+  try {
+    return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+  } catch {
+    return String(value);
+  }
 }
 
 function encodeMvt(fc: FeatureCollection, tile?: { z: number; x: number; y: number }): ArrayBuffer {
