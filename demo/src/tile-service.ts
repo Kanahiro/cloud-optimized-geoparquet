@@ -1,16 +1,7 @@
 import { CogpReader } from 'cogp';
+import type { Feature, FeatureCollection, Geometry } from 'geojson';
 
-import { emptyTile, encodeTileRows } from './tile-encoder';
-
-const TILE_MAX_ROWS = 50000;
-const TILE_MAX_BYTES = Infinity;
-
-export interface CogpTileRequest {
-  url: string;
-  z: number;
-  x: number;
-  y: number;
-}
+const VIEWPORT_MAX_ROWS = 50_000;
 
 export interface MetadataSummary {
   primary_column: string;
@@ -28,17 +19,17 @@ export interface OpenResult {
   dataBbox: [[number, number], [number, number]] | null;
 }
 
-export interface TileResult {
-  data: ArrayBuffer;
-  status?: string;
+export interface ViewportResult {
+  data: FeatureCollection;
+  status: string;
 }
 
 interface ActiveDataset {
   url: string;
   reader: CogpReader;
   dataBbox: [[number, number], [number, number]] | null;
-  tileCache: Map<string, Promise<TileResult>>;
-  servedTiles: number;
+  bboxStructTop: string | null;
+  servedViewports: number;
 }
 
 let active: ActiveDataset | null = null;
@@ -54,8 +45,8 @@ export async function openDataset(url: string): Promise<OpenResult> {
     url,
     reader,
     dataBbox,
-    tileCache: new Map(),
-    servedTiles: 0,
+    bboxStructTop: bboxStructTopColumn(reader),
+    servedViewports: 0,
   };
 
   return {
@@ -64,23 +55,47 @@ export async function openDataset(url: string): Promise<OpenResult> {
   };
 }
 
-export async function readTile(
-  tile: CogpTileRequest,
+/**
+ * Read every feature whose covering bbox intersects `bbox`, at the level
+ * appropriate for `targetGsd`. Returns a GeoJSON FeatureCollection ready to
+ * hand to a MapLibre `geojson` source. Properties carry every non-geometry
+ * column except the bbox covering struct.
+ */
+export async function readViewport(
+  url: string,
+  bbox: { minX: number; minY: number; maxX: number; maxY: number },
   targetGsd: number,
-): Promise<TileResult> {
+): Promise<ViewportResult> {
   const ds = active;
-  if (!ds || ds.url !== tile.url) return { data: emptyTile() };
-
-  const key = `${tile.z}/${tile.x}/${tile.y}/${targetGsd}`;
-  let promise = ds.tileCache.get(key);
-  if (!promise) {
-    promise = buildCogpTile(ds, tile, targetGsd).catch((err) => {
-      ds.tileCache.delete(key);
-      throw err;
-    });
-    ds.tileCache.set(key, promise);
+  if (!ds || ds.url !== url) {
+    return { data: emptyFC(), status: '' };
   }
-  return promise;
+  const geomColumn = ds.reader.primaryGeometryColumn;
+  const maxLevel = ds.reader.selectLevel(targetGsd);
+  const rows = await ds.reader.readRows({
+    bbox,
+    maxLevel,
+    maxRows: VIEWPORT_MAX_ROWS,
+  });
+
+  const features: Feature[] = [];
+  const skip = new Set<string>([geomColumn]);
+  if (ds.bboxStructTop) skip.add(ds.bboxStructTop);
+  for (const row of rows) {
+    const geometry = row[geomColumn] as Geometry | null | undefined;
+    if (!geometry) continue;
+    const properties: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (skip.has(key)) continue;
+      properties[key] = coerceForGeoJson(value);
+    }
+    features.push({ type: 'Feature', geometry, properties });
+  }
+  ds.servedViewports += 1;
+  return {
+    data: { type: 'FeatureCollection', features },
+    status: `Loaded ${features.length} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
+  };
 }
 
 function metadataSummary(reader: CogpReader): MetadataSummary {
@@ -94,6 +109,11 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
     })),
     crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
   };
+}
+
+function bboxStructTopColumn(reader: CogpReader): string | null {
+  const path = reader.geo.columns[reader.primaryGeometryColumn]?.covering?.bbox?.xmin;
+  return path?.[0] ?? null;
 }
 
 function computeDataBbox(reader: CogpReader): [[number, number], [number, number]] | null {
@@ -116,53 +136,20 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
   ];
 }
 
-async function buildCogpTile(
-  ds: ActiveDataset,
-  tile: CogpTileRequest,
-  targetGsd: number,
-): Promise<TileResult> {
-  const bbox = tileBbox(tile.z, tile.x, tile.y);
-  const maxLevel = ds.reader.selectLevel(targetGsd);
-  const geomColumn = ds.reader.primaryGeometryColumn;
-  const rows = await ds.reader.readRows({
-    bbox,
-    maxLevel,
-    maxRows: TILE_MAX_ROWS,
-    maxBytes: TILE_MAX_BYTES,
-  });
-
-  const { data, featureCount } = encodeTileRows(rows, geomColumn, tile, {
-    excludeColumns: bboxTopColumn(ds.reader, geomColumn),
-  });
-  ds.servedTiles += 1;
-  return {
-    data,
-    status: `Served ${ds.servedTiles} vector tiles. Last: ${featureCount} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}).`,
-  };
+function emptyFC(): FeatureCollection {
+  return { type: 'FeatureCollection', features: [] };
 }
 
-function bboxTopColumn(reader: CogpReader, geomColumn: string): string[] {
-  const path = reader.geo.columns[geomColumn]?.covering?.bbox?.xmin;
-  const top = path?.[0];
-  return top ? [top] : [];
-}
-
-function tileBbox(z: number, x: number, y: number) {
-  return {
-    minX: tileXToLng(x, z),
-    minY: tileYToLat(y + 1, z),
-    maxX: tileXToLng(x + 1, z),
-    maxY: tileYToLat(y, z),
-  };
-}
-
-function tileXToLng(x: number, z: number): number {
-  return (x / 2 ** z) * 360 - 180;
-}
-
-function tileYToLat(y: number, z: number): number {
-  const n = Math.PI - (2 * Math.PI * y) / 2 ** z;
-  return (180 / Math.PI) * Math.atan(Math.sinh(n));
+// MapLibre serializes GeoJSON properties through JSON.stringify when shipping
+// data to its worker, which can't handle bigint or Uint8Array. Coerce both
+// here so the GeoJSON source accepts the FeatureCollection.
+function coerceForGeoJson(value: unknown): unknown {
+  if (typeof value === 'bigint') {
+    const n = Number(value);
+    return Number.isSafeInteger(n) ? n : value.toString();
+  }
+  if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
+  return value;
 }
 
 function formatGsd(gsdMeters: number): string {
