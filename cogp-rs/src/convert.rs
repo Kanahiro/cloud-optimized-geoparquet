@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::meta::{
-    default_generator, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Lod,
+    default_generator, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level,
     COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
@@ -32,7 +32,7 @@ pub struct ConvertArgs {
     pub output: PathBuf,
     /// Comma-separated GSD list, meters, coarse to fine (e.g. 1000,500,100,50).
     /// Projection-agnostic: each value is the ground sample distance in meters
-    /// at which a LoD becomes meaningful. If omitted, GSDs are auto-derived
+    /// at which a level becomes meaningful. If omitted, GSDs are auto-derived
     /// from --minzoom..=--maxzoom assuming a Web Mercator tile pyramid
     /// (see --minzoom/--maxzoom/--base-resolution). Pass --gsd directly if
     /// you target a non-Web-Mercator renderer.
@@ -59,8 +59,8 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub geometry_column: Option<String>,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
-    /// derive the LoD thinning grid when auto-deriving GSDs from
-    /// --minzoom/--maxzoom. The LoD-i GSD is the ground distance covered by
+    /// derive the level thinning grid when auto-deriving GSDs from
+    /// --minzoom/--maxzoom. The level-i GSD is the ground distance covered by
     /// one base unit at zoom i, computed as `40_075_016 / (base · 2^i)`
     /// meters at the equator — i.e. it bakes in the Web Mercator equatorial
     /// circumference and the standard `2^z` tile pyramid. This controls
@@ -73,7 +73,7 @@ pub struct ConvertArgs {
     pub base_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times coarser than `prec` per axis, yielding ~factor² fewer
-    /// points per LoD than polygons. Compensates for the fact that polygons
+    /// points per level than polygons. Compensates for the fact that polygons
     /// span multiple cells visually while points occupy one, so equal grid
     /// density looks too dense for points. Set to `1` to disable.
     #[arg(long, default_value_t = 4)]
@@ -133,7 +133,7 @@ const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_488;
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
 /// into `base_resolution` units per side. The default of 1024 yields ~39136 m
 /// per unit at zoom 0 — the smallest distance the thinning grid distinguishes
-/// at the coarsest LoD.
+/// at the coarsest level.
 fn base_unit_gsd_z0(base_resolution: u32) -> f64 {
     WEB_MERCATOR_CIRCUMFERENCE_M / (base_resolution as f64)
 }
@@ -167,7 +167,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         }
         let derived = web_mercator_gsds(args.minzoom, args.maxzoom, args.base_resolution);
         eprintln!(
-            "      auto-derived {} LoD(s) from Web Mercator z{}..=z{} (base resolution {})",
+            "      auto-derived {} level(s) from Web Mercator z{}..=z{} (base resolution {})",
             derived.len(),
             args.minzoom,
             args.maxzoom,
@@ -279,8 +279,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             }
         };
 
-    eprintln!("[3/4] Assigning features to {} LoD(s)", gsds.len());
-    let assignment = assign_lods(
+    eprintln!("[3/4] Assigning features to {} level(s)", gsds.len());
+    let assignment = assign_levels(
         &bboxes,
         &kinds,
         &gsds,
@@ -288,34 +288,34 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         args.point_thinning_factor,
         args.line_thinning_factor,
     )?;
-    let mut per_lod_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
-    for (idx, lod_i) in assignment.iter().enumerate() {
-        per_lod_full[*lod_i as usize].push(idx as u32);
+    let mut per_level_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
+    for (idx, level_i) in assignment.iter().enumerate() {
+        per_level_full[*level_i as usize].push(idx as u32);
     }
-    // SPEC §5.3 requires each LoD entry to have a real row group end, so a LoD
-    // with zero features cannot be represented. Drop those and keep the GSDs
-    // that survive.
-    let dropped = per_lod_full.iter().filter(|r| r.is_empty()).count();
-    let (mut per_lod, gsds): (Vec<Vec<u32>>, Vec<f64>) = per_lod_full
+    // SPEC §5.3 requires each level entry to have a real row group end, so a
+    // level with zero features cannot be represented. Drop those and keep the
+    // GSDs that survive.
+    let dropped = per_level_full.iter().filter(|r| r.is_empty()).count();
+    let (mut per_level, gsds): (Vec<Vec<u32>>, Vec<f64>) = per_level_full
         .into_iter()
         .zip(gsds.iter().copied())
         .filter(|(rows, _)| !rows.is_empty())
         .unzip();
-    if per_lod.is_empty() {
-        bail!("no LoDs received any features; check input data and GSD selection");
+    if per_level.is_empty() {
+        bail!("no levels received any features; check input data and GSD selection");
     }
     if dropped > 0 {
-        eprintln!("      note: dropped {dropped} empty LoD(s)");
+        eprintln!("      note: dropped {dropped} empty level(s)");
     }
-    for (i, rows) in per_lod.iter().enumerate() {
+    for (i, rows) in per_level.iter().enumerate() {
         eprintln!(
-            "      LoD {i} (gsd={:>10.2} m): {:>9} features",
+            "      level {i} (gsd={:>10.2} m): {:>9} features",
             gsds[i],
             rows.len()
         );
     }
 
-    for rows in per_lod.iter_mut() {
+    for rows in per_level.iter_mut() {
         str_pack(rows, &bboxes, args.row_group_size);
     }
 
@@ -377,10 +377,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_table = Arc::new(table);
     let producer_bbox = Arc::new(bbox_struct);
     let producer_keep = keep_col_indices.clone();
-    let producer_per_lod = per_lod.clone();
+    let producer_per_level = per_level.clone();
     let producer_row_group_size = args.row_group_size;
     let producer = thread::spawn(move || -> Result<()> {
-        for (lod_i, rows) in producer_per_lod.iter().enumerate() {
+        for (level_i, rows) in producer_per_level.iter().enumerate() {
             for chunk in rows.chunks(producer_row_group_size) {
                 let indices = UInt32Array::from(chunk.to_vec());
                 let mut cols: Vec<ArrayRef> =
@@ -391,7 +391,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 let bbox_arr: ArrayRef = Arc::new((*producer_bbox).clone());
                 cols.push(take(bbox_arr.as_ref(), &indices, None)?);
                 let batch = RecordBatch::try_new(producer_schema.clone(), cols)?;
-                if tx.send((lod_i, batch)).is_err() {
+                if tx.send((level_i, batch)).is_err() {
                     return Ok(());
                 }
             }
@@ -400,12 +400,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     });
 
     let mut current_rg: i64 = -1;
-    let mut last_lod: Option<usize> = None;
-    let mut lods_meta: Vec<Lod> = Vec::with_capacity(gsds.len());
-    while let Ok((lod_i, batch)) = rx.recv() {
-        if let Some(prev) = last_lod {
-            if prev != lod_i {
-                lods_meta.push(Lod {
+    let mut last_level: Option<usize> = None;
+    let mut levels_meta: Vec<Level> = Vec::with_capacity(gsds.len());
+    while let Ok((level_i, batch)) = rx.recv() {
+        if let Some(prev) = last_level {
+            if prev != level_i {
+                levels_meta.push(Level {
                     row_group_end: current_rg,
                     gsd: gsds[prev],
                 });
@@ -414,10 +414,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         writer.write(&batch)?;
         writer.flush()?;
         current_rg += 1;
-        last_lod = Some(lod_i);
+        last_level = Some(level_i);
     }
-    if let Some(prev) = last_lod {
-        lods_meta.push(Lod {
+    if let Some(prev) = last_level {
+        levels_meta.push(Level {
             row_group_end: current_rg,
             gsd: gsds[prev],
         });
@@ -459,7 +459,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     };
     let cogp_meta = CogpMeta {
         version: COGP_VERSION.to_string(),
-        lods: lods_meta,
+        levels: levels_meta,
         generator: Some(default_generator()),
     };
 
@@ -474,9 +474,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let _ = writer.close()?;
 
     eprintln!(
-        "      wrote {} row group(s) across {} LoD(s)",
+        "      wrote {} row group(s) across {} level(s)",
         current_rg + 1,
-        cogp_meta.lods.len()
+        cogp_meta.levels.len()
     );
     Ok(())
 }
@@ -710,16 +710,16 @@ fn compute_kinds(table: &RecordBatch, geom_col_idx: usize) -> Result<Vec<GeomKin
     }
 }
 
-/// Grid-based density thinning. Returns an assignment of each row to a LoD index.
+/// Grid-based density thinning. Returns an assignment of each row to a level index.
 ///
-/// For each LoD (coarse → fine), bucket remaining features into grid cells of side
-/// `prec` (the LoD's GSD in input CRS units). Within each cell, pick the highest-
-/// priority feature to assign to this LoD; the rest fall through to the next LoD.
+/// For each level (coarse → fine), bucket remaining features into grid cells of side
+/// `prec` (the level's GSD in input CRS units). Within each cell, pick the highest-
+/// priority feature to assign to this level; the rest fall through to the next level.
 ///
-/// Features whose bbox is smaller than `prec` are deferred to a finer LoD where they
+/// Features whose bbox is smaller than `prec` are deferred to a finer level where they
 /// become independently meaningful — except Point-kind features which are always
-/// eligible from the coarsest LoD (they have no extent of their own).
-fn assign_lods(
+/// eligible from the coarsest level (they have no extent of their own).
+fn assign_levels(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
     gsds: &[f64],
@@ -734,14 +734,14 @@ fn assign_lods(
     let n = bboxes.len();
     let mut assigned: Vec<i32> = vec![-1; n];
     let mut remaining: Vec<u32> = (0..n as u32).collect();
-    let last_lod = (gsds.len() - 1) as u16;
+    let last_level = (gsds.len() - 1) as u16;
 
     let precs: Vec<f64> = gsds
         .iter()
         .map(|g| match units {
             InputUnits::Degrees => g / METERS_PER_DEGREE,
             InputUnits::Meters => *g,
-            InputUnits::Auto => unreachable!("Auto must be resolved before assign_lods"),
+            InputUnits::Auto => unreachable!("Auto must be resolved before assign_levels"),
         })
         .collect();
 
@@ -751,9 +751,9 @@ fn assign_lods(
     let point_mul = point_thinning_factor as f64;
     let line_mul = line_thinning_factor as f64;
 
-    // Coarsest LoD at which each feature is independently meaningful (its bbox
-    // size ≥ that LoD's prec). Points have no extent so are always eligible
-    // from LoD 0; the point grid coarsening above keeps them from over-saturating.
+    // Coarsest level at which each feature is independently meaningful (its bbox
+    // size ≥ that level's prec). Points have no extent so are always eligible
+    // from level 0; the point grid coarsening above keeps them from over-saturating.
     let min_visible: Vec<u16> = bboxes
         .par_iter()
         .zip(kinds.par_iter())
@@ -770,11 +770,11 @@ fn assign_lods(
                     return i as u16;
                 }
             }
-            last_lod
+            last_level
         })
         .collect();
 
-    for (lod_i, prec) in precs.iter().enumerate() {
+    for (level_i, prec) in precs.iter().enumerate() {
         // Per-cell winner map built in parallel: each thread folds into a local
         // HashMap, then reduce merges them keeping the higher-priority row on
         // collision. The key is `(kind, ix, iy)` — kind-tagged because each
@@ -783,7 +783,7 @@ fn assign_lods(
         let best: HashMap<(u8, i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
-                if min_visible[row as usize] as usize > lod_i {
+                if min_visible[row as usize] as usize > level_i {
                     return local;
                 }
                 let b = bboxes[row as usize];
@@ -834,7 +834,7 @@ fn assign_lods(
             });
         let picked: Vec<u32> = best.values().copied().collect();
         for r in &picked {
-            assigned[*r as usize] = lod_i as i32;
+            assigned[*r as usize] = level_i as i32;
         }
         let picked_set: std::collections::HashSet<u32> = picked.iter().copied().collect();
         remaining.retain(|r| !picked_set.contains(r));
@@ -843,7 +843,7 @@ fn assign_lods(
         }
     }
     for r in remaining {
-        assigned[r as usize] = last_lod as i32;
+        assigned[r as usize] = last_level as i32;
     }
     let mut out: Vec<u16> = Vec::with_capacity(n);
     for (i, a) in assigned.iter().enumerate() {

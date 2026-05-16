@@ -9,13 +9,13 @@ pub const GEOPARQUET_VERSION: &str = "1.1.0";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CogpMeta {
     pub version: String,
-    pub lods: Vec<Lod>,
+    pub levels: Vec<Level>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generator: Option<Generator>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Lod {
+pub struct Level {
     pub row_group_end: i64,
     pub gsd: f64,
 }

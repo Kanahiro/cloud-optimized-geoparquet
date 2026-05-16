@@ -12,3 +12,5 @@ target/
 .vscode/
 .idea/
 *.swp
+
+*.parquet
