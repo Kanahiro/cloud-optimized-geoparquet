@@ -1,7 +1,7 @@
 export const COGP_METADATA_KEY = 'cogp';
 export const GEO_METADATA_KEY = 'geo';
 
-export interface Lod {
+export interface Level {
   row_group_end: number;
   gsd: number;
 }
@@ -13,7 +13,7 @@ export interface CogpGenerator {
 
 export interface CogpMeta {
   version: string;
-  lods: Lod[];
+  levels: Level[];
   generator?: CogpGenerator;
   [extra: string]: unknown;
 }
@@ -50,8 +50,8 @@ export function parseCogpMeta(json: string): CogpMeta {
   if (typeof parsed.version !== 'string') {
     throw new Error('cogp metadata: missing `version`');
   }
-  if (!Array.isArray(parsed.lods) || parsed.lods.length === 0) {
-    throw new Error('cogp metadata: `lods` must be a non-empty array');
+  if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
+    throw new Error('cogp metadata: `levels` must be a non-empty array');
   }
   const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
   if (major !== 0) {

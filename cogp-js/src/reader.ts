@@ -11,7 +11,7 @@ import {
   rowGroupIntersects,
 } from './bbox.js';
 import { LruCache } from './cache.js';
-import { selectLodByGsd } from './lod.js';
+import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
@@ -36,15 +36,15 @@ export interface OpenOptions {
 const DEFAULT_CACHE_MAX_ROWS = 1_000_000;
 
 export interface ReadOptions {
-  /** Inclusive LoD index; defaults to the finest LoD (all row groups). */
-  maxLod?: number;
+  /** Inclusive level index; defaults to the finest level (all row groups). */
+  maxLevel?: number;
   /** Spatial filter; row groups whose covering envelope misses this bbox are skipped. */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];
   /**
    * Fetch budget: cap on cumulative `num_rows` of selected row groups. Row
-   * groups are picked in LoD/file order (post-bbox-prune); selection stops
+   * groups are picked in level/file order (post-bbox-prune); selection stops
    * once adding the next group would push the cumulative count over this
    * limit. A row group is never partially loaded, so the returned row count
    * may be less than `maxRows` (especially after per-row bbox filtering).
@@ -134,8 +134,8 @@ export class CogpReader {
     this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
   }
 
-  get lods() {
-    return this.cogp.lods;
+  get levels() {
+    return this.cogp.levels;
   }
 
   get numRowGroups(): number {
@@ -147,18 +147,18 @@ export class CogpReader {
   }
 
   /**
-   * Select an LoD index per SPEC §7. Pass a target ground-sample distance in
-   * meters; the reader returns the last LoD whose `gsd >= targetGsd`. If
-   * `targetGsd` is omitted (or coarser than the coarsest LoD), the finest /
-   * coarsest LoD is returned respectively.
+   * Select a level index per SPEC §7. Pass a target ground-sample distance in
+   * meters; the reader returns the last level whose `gsd >= targetGsd`. If
+   * `targetGsd` is omitted (or coarser than the coarsest level), the finest /
+   * coarsest level is returned respectively.
    */
-  selectLod(targetGsd?: number): number {
-    if (targetGsd === undefined) return this.lods.length - 1;
-    return selectLodByGsd(this.lods, targetGsd);
+  selectLevel(targetGsd?: number): number {
+    if (targetGsd === undefined) return this.levels.length - 1;
+    return selectLevelByGsd(this.levels, targetGsd);
   }
 
   /**
-   * Read a contiguous LoD prefix, optionally bbox-pruned, as plain row
+   * Read a contiguous level prefix, optionally bbox-pruned, as plain row
    * records. The geometry column carries a GeoJSON Geometry object (decoded
    * by hyparquet from the on-disk WKB).
    *
@@ -167,9 +167,9 @@ export class CogpReader {
    * are filtered row-by-row against each row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
-    const maxLod = opts.maxLod ?? this.lods.length - 1;
+    const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const bbox = normalizeBbox(opts.bbox);
-    const rgs = this.candidateRowGroups(maxLod, bbox, opts.maxRows, opts.maxBytes);
+    const rgs = this.candidateRowGroups(maxLevel, bbox, opts.maxRows, opts.maxBytes);
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
@@ -210,15 +210,15 @@ export class CogpReader {
   }
 
   private candidateRowGroups(
-    maxLod: number,
+    maxLevel: number,
     bbox?: Bbox,
     maxRows?: number,
     maxBytes?: number,
   ): number[] {
-    if (maxLod < 0 || maxLod >= this.lods.length) {
-      throw new Error(`maxLod ${maxLod} out of range [0, ${this.lods.length})`);
+    if (maxLevel < 0 || maxLevel >= this.levels.length) {
+      throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
     }
-    const end = this.lods[maxLod]!.row_group_end;
+    const end = this.levels[maxLevel]!.row_group_end;
     const out: number[] = [];
     let rowsAcc = 0;
     let bytesAcc = 0;

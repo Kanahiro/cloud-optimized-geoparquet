@@ -15,8 +15,8 @@ A COGP file is:
 
 1. a valid GeoParquet 1.1 file;
 2. physically ordered from coarse to fine rendering detail;
-3. organized so that each level of detail ends at a Parquet row group boundary;
-4. annotated with minimal metadata describing those level-of-detail boundaries.
+3. organized so that each level ends at a Parquet row group boundary;
+4. annotated with minimal metadata describing those level boundaries.
 
 COGP is feature-level: it reorders features across row groups; it does not simplify, aggregate, or duplicate them.
 
@@ -38,13 +38,13 @@ The core idea is:
 
 > Earlier row groups contain features that are independently meaningful at coarse display resolutions. Later row groups add features that are only independently meaningful at finer display resolutions.
 
-COGP is a **feature-level progressive subset**, not a geometry-detail level of detail scheme:
+COGP is a **feature-level progressive subset**, not a geometry-decimation scheme:
 
 * each source feature is placed, in full, in exactly one row group;
 * a feature's geometry is preserved verbatim — vertices, bends, and detail within a feature are never removed or simplified by this profile;
-* features are assigned to the coarsest LoD at which they become independently renderable as whole features.
+* features are assigned to the coarsest level at which they become independently renderable as whole features.
 
-Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels of detail, and does not produce simplified geometries.
+Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels, and does not produce simplified geometries.
 
 A reader can choose how many leading row groups to load based on its target rendering resolution.
 
@@ -56,23 +56,23 @@ For example:
 
 ## 4. Terminology
 
-### 4.1 Level of Detail, LoD
+### 4.1 Level
 
 A logical rendering detail level.
 
-LoDs are represented by metadata and row group boundaries. This profile does not require a `lod`, `zoom`, or `zoomlevel` column in the data.
+Levels are represented by metadata and row group boundaries. This profile does not require a `level`, `zoom`, or `zoomlevel` column in the data.
 
 ### 4.2 Ground sample distance (GSD)
 
-`gsd` is the approximate smallest ground distance represented as an independently meaningful unit at this LoD.
+`gsd` is the approximate smallest ground distance represented as an independently meaningful unit at this level.
 
-The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features are not represented as independently meaningful at this LoD.
+The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features are not represented as independently meaningful at this level.
 
 The value is always expressed in meters of ground distance at the geographic location of the features, independent of the CRS or units used by the underlying data. For example, a file in EPSG:4326 (degrees) still expresses this value in meters.
 
-For example, a LoD with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later LoDs.
+For example, a level with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later levels.
 
-Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse LoD retains its full geometry, including fine internal detail.
+Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse level retains its full geometry, including fine internal detail.
 
 This may apply to deferring features such as:
 
@@ -113,40 +113,40 @@ Later row groups MUST add features that are independently meaningful only at fin
 
 Every source feature MUST appear in exactly one row group. Feature geometry and attributes MUST NOT be simplified or aggregated.
 
-LoD ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
+Level ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
 
-Within each LoD, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective. This profile does not prescribe a specific clustering algorithm.
+Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective. This profile does not prescribe a specific clustering algorithm.
 
-### 5.3 LoD boundaries
+### 5.3 Level boundaries
 
-Each LoD MUST end at a Parquet row group boundary.
+Each level MUST end at a Parquet row group boundary.
 
-The file-level metadata MUST contain a non-empty ordered list of LoD entries.
+The file-level metadata MUST contain a non-empty ordered list of level entries.
 
-Each LoD entry MUST contain:
+Each level entry MUST contain:
 
 * `row_group_end`
 * `gsd`
 
 `row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
 
-`row_group_end` values MUST be strictly monotonically increasing across the `lods` array.
+`row_group_end` values MUST be strictly monotonically increasing across the `levels` array.
 
-The first LoD entry covers row groups from row group `0` through its `row_group_end`, inclusive.
+The first level entry covers row groups from row group `0` through its `row_group_end`, inclusive.
 
-The row groups belonging to the second and later LoDs are the row groups after the previous LoD entry's `row_group_end` through the current LoD entry's `row_group_end`, inclusive.
+The row groups belonging to the second and later levels are the row groups after the previous level entry's `row_group_end` through the current level entry's `row_group_end`, inclusive.
 
-The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the LoDs collectively cover every row group in the file.
+The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the levels collectively cover every row group in the file.
 
 `gsd` MUST be a positive JSON number.
 
-`gsd` values MUST be strictly monotonically decreasing from coarse to fine LoDs.
+`gsd` values MUST be strictly monotonically decreasing from coarse to fine levels.
 
 ### 5.4 Progressive access layout
 
-Producers SHOULD choose row group sizes so that each LoD prefix can be fetched and rendered with bounded latency over HTTP range requests or object storage.
+Producers SHOULD choose row group sizes so that each level prefix can be fetched and rendered with bounded latency over HTTP range requests or object storage.
 
-Producers SHOULD avoid placing so many bytes or features in an early row group that the first LoD is no longer useful as a coarse overview.
+Producers SHOULD avoid placing so many bytes or features in an early row group that the first level is no longer useful as a coarse overview.
 
 This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
 
@@ -176,7 +176,7 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 ```json
 {
   "version": "0.1.0",
-  "lods": [
+  "levels": [
     {
       "row_group_end": 0,
       "gsd": 1000
@@ -198,7 +198,7 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 ```json
 {
   "version": "0.1.0",
-  "lods": [
+  "levels": [
     {
       "row_group_end": 0,
       "gsd": 1000
@@ -224,16 +224,16 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | Field                  | Required | Description                                                                                                       |
 | ---------------------- | -------: | ----------------------------------------------------------------------------------------------------------------- |
 | `version`              |      Yes | Profile metadata version.                                                                                         |
-| `lods`                 |      Yes | Ordered LoD entries from coarse to fine.                                                                          |
-| `lods[].row_group_end` |      Yes | Inclusive row group index ending this LoD.                                                                        |
-| `lods[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this LoD, in meters.                  |
+| `levels`                 |      Yes | Ordered level entries from coarse to fine.                                                                        |
+| `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
+| `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
 | `generator`            |       No | Producer tool metadata.                                                                                           |
 
-## 7. LoD selection (non-normative)
+## 7. Level selection (non-normative)
 
-COGP metadata describes available LoDs, but it does not prescribe how a reader chooses one. A renderer can base the choice on zoom level, scale denominator, screen-space error, feature budget, byte budget, latency budget, or any other application-specific policy.
+COGP metadata describes available levels, but it does not prescribe how a reader chooses one. A renderer can base the choice on zoom level, scale denominator, screen-space error, feature budget, byte budget, latency budget, or any other application-specific policy.
 
-One common strategy is to estimate the ground distance represented by one display pixel and select the finest LoD that is still appropriate for that display resolution. Given a scale denominator and an assumed display pixel size in meters, such a target ground sample distance can be derived as:
+One common strategy is to estimate the ground distance represented by one display pixel and select the finest level that is still appropriate for that display resolution. Given a scale denominator and an assumed display pixel size in meters, such a target ground sample distance can be derived as:
 
 ```text
 target_gsd = scale_denominator * display_pixel_size_m
@@ -241,23 +241,23 @@ target_gsd = scale_denominator * display_pixel_size_m
 
 Readers MAY use any other definition of `display_pixel_size_m` — device pixel, CSS pixel, or library-specific virtual pixel — provided it is consistent with how they interpret `scale_denominator`. COGP does not mandate a specific definition.
 
-Because `lods` are ordered from coarse to fine and `gsd` values strictly decrease, a reader can select the last LoD in the `lods` array whose `gsd` is greater than or equal to `target_gsd`:
+Because `levels` are ordered from coarse to fine and `gsd` values strictly decrease, a reader can select the last level in the `levels` array whose `gsd` is greater than or equal to `target_gsd`:
 
 ```text
 gsd >= target_gsd
 ```
 
-If no LoD satisfies this condition, the target display resolution is coarser than the coarsest LoD described by the file, and the reader can select the first LoD.
+If no level satisfies this condition, the target display resolution is coarser than the coarsest level described by the file, and the reader can select the first level.
 
-After selecting a target LoD, the reader reads row groups from `0` through that LoD's `row_group_end`, inclusive. Because each feature appears in exactly one LoD, rendering a finer LoD normally requires reading the preceding coarser LoDs as a prefix.
+After selecting a target level, the reader reads row groups from `0` through that level's `row_group_end`, inclusive. Because each feature appears in exactly one level, rendering a finer level normally requires reading the preceding coarser levels as a prefix.
 
 ## 8. Validation
 
 A validator verifies that the file meets all requirements stated in Section 5.
 
-The semantic correctness of coarse-to-fine ordering — whether the features placed in earlier row groups are genuinely meaningful at coarser display resolutions — is not fully machine-verifiable. Validators can only check structural and metadata conformance. Achieving meaningful LoD semantics is a producer responsibility.
+The semantic correctness of coarse-to-fine ordering — whether the features placed in earlier row groups are genuinely meaningful at coarser display resolutions — is not fully machine-verifiable. Validators can only check structural and metadata conformance. Achieving meaningful level semantics is a producer responsibility.
 
-A validator MAY also compute non-conformance quality metrics such as row group touch count for sample bbox queries, prefix rendering latency, spatial spread of coarse LoDs, or spatial clustering quality within each LoD.
+A validator MAY also compute non-conformance quality metrics such as row group touch count for sample bbox queries, prefix rendering latency, spatial spread of coarse levels, or spatial clustering quality within each level.
 
 ## 9. Non-goals
 

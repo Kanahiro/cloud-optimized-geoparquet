@@ -3,8 +3,8 @@
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](../SPEC.md).
 
 `convert` reorders the features of a GeoParquet file across row groups using
-grid-based density thinning per LoD and Sort-Tile-Recursive (STR) bbox packing
-inside each LoD. `validate` checks the structural rules in SPEC §5.
+grid-based density thinning per level and Sort-Tile-Recursive (STR) bbox packing
+inside each level. `validate` checks the structural rules in SPEC §5.
 
 ## Install
 
@@ -25,7 +25,7 @@ cogp convert input.parquet output.cogp.parquet
 cogp validate output.cogp.parquet
 ```
 
-The defaults auto-derive 17 LoDs from Web Mercator z0..=z16 and work on any
+The defaults auto-derive 17 levels from Web Mercator z0..=z16 and work on any
 GeoParquet 1.x file with a WKB geometry column.
 
 ## convert
@@ -50,13 +50,13 @@ cogp convert points.parquet points.cogp.parquet \
     --input-units meters --point-thinning-factor 8
 ```
 
-LoD selection (mutually exclusive):
+Level selection (mutually exclusive):
 
 - `--gsd 1000,500,100,50` — explicit ground sample distances in **meters**,
   strictly decreasing. Use this for non-Web-Mercator renderers.
 - `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `16`) — derive
   GSDs from a Web Mercator tile pyramid:
-  `GSD(z) = 40_075_016 / (webmerc_resolution · 2^z)` m. Empty LoDs (no
+  `GSD(z) = 40_075_016 / (webmerc_resolution · 2^z)` m. Empty levels (no
   features assigned) are dropped automatically.
 - `--webmerc-resolution` (default `1024`) — units per tile side used in the
   Web Mercator GSD formula above. `1024` keeps the thinning grid at ~4× the
@@ -67,7 +67,7 @@ LoD selection (mutually exclusive):
 Other options:
 
 - `--row-group-size` (default `10000`) — max Parquet row group size in rows.
-  Row group boundaries always align with LoD boundaries.
+  Row group boundaries always align with level boundaries.
 - `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
   PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
   per OGC:CRS84). Override with `degrees` or `meters` explicitly.
@@ -88,8 +88,8 @@ The output file:
   `bbox` is also dropped;
 - writes a canonical `bbox` struct column (`xmin/ymin/xmax/ymax: f64`) and
   points GeoParquet 1.1 `covering.bbox` at it;
-- emits one or more row groups per LoD, written in coarse-to-fine order;
-- writes `cogp` metadata listing the `row_group_end` and `gsd` of each LoD.
+- emits one or more row groups per level, written in coarse-to-fine order;
+- writes `cogp` metadata listing the `row_group_end` and `gsd` of each level.
 
 ## validate
 
@@ -101,7 +101,7 @@ Checks SPEC §5:
 
 - `geo` metadata is present (GeoParquet 1.x) with a `covering.bbox`;
 - each covering bbox column has Parquet row group min/max statistics;
-- `cogp` metadata is present with a non-empty `lods` array;
+- `cogp` metadata is present with a non-empty `levels` array;
 - `row_group_end` values are strictly increasing and end at `num_row_groups - 1`;
 - `gsd` values are positive and strictly decreasing.
 

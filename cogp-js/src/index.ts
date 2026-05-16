@@ -20,9 +20,9 @@ export type {
   Covering,
   GeoColumn,
   GeoMeta,
-  Lod,
+  Level,
 } from './meta.js';
 
-export { selectLodByGsd } from './lod.js';
+export { selectLevelByGsd } from './level.js';
 
 export type { Bbox } from './bbox.js';

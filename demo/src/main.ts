@@ -126,7 +126,7 @@ async function loadDataset(url: string): Promise<void> {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     setStatus(
-      `Opened. ${reader.numRowGroups} row groups across ${reader.lods.length} LoDs.`,
+      `Opened. ${reader.numRowGroups} row groups across ${reader.levels.length} levels.`,
     );
     await refreshViewport();
   } catch (err) {
@@ -142,7 +142,7 @@ function renderMetadata(reader: CogpReader): void {
   const summary = {
     primary_column: reader.primaryGeometryColumn,
     num_row_groups: reader.numRowGroups,
-    lods: reader.lods.map((l, i) => ({
+    levels: reader.levels.map((l, i) => ({
       i,
       gsd: l.gsd,
       row_group_end: l.row_group_end,
@@ -188,16 +188,16 @@ async function refreshViewport(): Promise<void> {
   };
   const gsd = gsdForViewport();
   const gsdLabel = formatGsd(gsd);
-  const maxLod = ds.reader.selectLod(gsd);
+  const maxLevel = ds.reader.selectLevel(gsd);
   const myLoadId = ++ds.loadId;
-  setStatus(`Reading at ${gsdLabel}/px (lod ≤ ${maxLod}) …`);
+  setStatus(`Reading at ${gsdLabel}/px (level ≤ ${maxLevel}) …`);
   try {
-    const rows = await ds.reader.readRows({ bbox, maxLod, maxRows: 100_000 });
+    const rows = await ds.reader.readRows({ bbox, maxLevel, maxRows: 100_000 });
     if (myLoadId !== ds.loadId) return; // a newer viewport superseded us
     const fc = rowsToFeatureCollection(rows, ds.reader.primaryGeometryColumn);
     const src = map.getSource('cogp') as maplibregl.GeoJSONSource | undefined;
     src?.setData(fc);
-    setStatus(`Rendered ${fc.features.length} features at ${gsdLabel}/px (lod ≤ ${maxLod}).`);
+    setStatus(`Rendered ${fc.features.length} features at ${gsdLabel}/px (level ≤ ${maxLevel}).`);
   } catch (err) {
     console.warn('read failed', err);
     setStatus(`Read error: ${(err as Error).message}`);

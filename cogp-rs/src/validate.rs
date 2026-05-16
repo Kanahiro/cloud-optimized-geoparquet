@@ -92,8 +92,8 @@ pub fn run(path: &Path) -> Result<()> {
     if major != 0 {
         errors.push(format!("unsupported cogp major version `{}`; this validator implements 0.x", cogp.version));
     }
-    if cogp.lods.is_empty() {
-        errors.push("`cogp.lods` must be non-empty".into());
+    if cogp.levels.is_empty() {
+        errors.push("`cogp.levels` must be non-empty".into());
     }
 
     let num_rgs = metadata.num_row_groups();
@@ -103,39 +103,39 @@ pub fn run(path: &Path) -> Result<()> {
 
     let mut prev_rge: Option<i64> = None;
     let mut prev_gsd: Option<f64> = None;
-    for (i, lod) in cogp.lods.iter().enumerate() {
-        if lod.row_group_end < 0 || (lod.row_group_end as usize) >= num_rgs {
+    for (i, level) in cogp.levels.iter().enumerate() {
+        if level.row_group_end < 0 || (level.row_group_end as usize) >= num_rgs {
             errors.push(format!(
-                "lods[{i}].row_group_end={} out of range [0, {})",
-                lod.row_group_end, num_rgs
+                "levels[{i}].row_group_end={} out of range [0, {})",
+                level.row_group_end, num_rgs
             ));
         }
         if let Some(p) = prev_rge {
-            if lod.row_group_end <= p {
+            if level.row_group_end <= p {
                 errors.push(format!(
-                    "lods[{i}].row_group_end={} must be strictly greater than previous ({})",
-                    lod.row_group_end, p
+                    "levels[{i}].row_group_end={} must be strictly greater than previous ({})",
+                    level.row_group_end, p
                 ));
             }
         }
-        prev_rge = Some(lod.row_group_end);
-        if !(lod.gsd > 0.0) {
-            errors.push(format!("lods[{i}].gsd={} must be positive", lod.gsd));
+        prev_rge = Some(level.row_group_end);
+        if !(level.gsd > 0.0) {
+            errors.push(format!("levels[{i}].gsd={} must be positive", level.gsd));
         }
         if let Some(p) = prev_gsd {
-            if !(lod.gsd < p) {
+            if !(level.gsd < p) {
                 errors.push(format!(
-                    "lods[{i}].gsd={} must be strictly less than previous ({})",
-                    lod.gsd, p
+                    "levels[{i}].gsd={} must be strictly less than previous ({})",
+                    level.gsd, p
                 ));
             }
         }
-        prev_gsd = Some(lod.gsd);
+        prev_gsd = Some(level.gsd);
     }
-    if let Some(last) = cogp.lods.last() {
+    if let Some(last) = cogp.levels.last() {
         if num_rgs > 0 && last.row_group_end != (num_rgs as i64) - 1 {
             errors.push(format!(
-                "final lods[].row_group_end={} must equal num_row_groups-1={}",
+                "final levels[].row_group_end={} must equal num_row_groups-1={}",
                 last.row_group_end,
                 num_rgs - 1
             ));
