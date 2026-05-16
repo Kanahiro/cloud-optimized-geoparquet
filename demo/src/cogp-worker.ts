@@ -52,7 +52,7 @@ async function readViewport(
   }
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetGsd);
-  const rows = await ds.reader.readRows({ bbox, maxLevel, maxRows: VIEWPORT_MAX_ROWS, maxBytes: 100000000 });
+  const rows = await ds.reader.readRows({ bbox, maxLevel, maxRows: VIEWPORT_MAX_ROWS });
 
   const features: Feature[] = [];
   const skip = new Set<string>([geomColumn]);
