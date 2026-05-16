@@ -121,3 +121,33 @@ body {
   overflow-x: auto;
   max-height: 220px;
 }
+
+.cogp-popup {
+  max-height: 320px;
+  overflow: auto;
+  font-size: 12px;
+}
+
+.cogp-popup table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.cogp-popup th,
+.cogp-popup td {
+  text-align: left;
+  vertical-align: top;
+  padding: 3px 6px;
+  border-bottom: 1px solid #eef0f5;
+  word-break: break-word;
+}
+
+.cogp-popup th {
+  color: #555;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.cogp-popup td {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

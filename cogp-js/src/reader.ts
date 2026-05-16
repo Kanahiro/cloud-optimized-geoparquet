@@ -35,6 +35,11 @@ export interface OpenOptions {
 
 const DEFAULT_CACHE_MAX_ROWS = 1_000_000;
 
+// Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
+// is read by one `parquetReadObjects` call that materializes every row in
+// the run as one array, so peak in-flight memory scales with this value.
+const RUN_MAX_ROWS = 50_000;
+
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
@@ -270,23 +275,45 @@ export class CogpReader {
       else missing.push(rg);
     }
 
-    // Phase 2: build runs of consecutive missing indices so hyparquet can
-    // pull their column chunks together, then dispatch each run as a single
-    // fetch. Each row group's slice promise is registered in the cache
-    // immediately so a second caller arriving while the run is mid-flight
-    // reuses the same Promise (single-flight) instead of issuing a duplicate.
-    const runs: Array<{ startRg: number; endRg: number }> = [];
+    // Phase 2: group consecutive missing indices into runs so hyparquet can
+    // pull their column chunks together. A run is also capped by cumulative
+    // num_rows: a single `parquetReadObjects` call materializes the entire
+    // run's rows in one array, so an unbounded run is the worst case for
+    // peak memory. The first row group in a run is always included even if
+    // it alone exceeds the cap (we can't fetch partial row groups).
+    const runs: Array<number[]> = [];
     {
       let i = 0;
       while (i < missing.length) {
-        let j = i;
-        while (j + 1 < missing.length && missing[j + 1]! === missing[j]! + 1) j++;
-        runs.push({ startRg: missing[i]!, endRg: missing[j]! });
-        i = j + 1;
+        const run: number[] = [missing[i]!];
+        let acc = Number(this.metadata.row_groups[missing[i]!]?.num_rows ?? 0);
+        let j = i + 1;
+        while (
+          j < missing.length &&
+          missing[j]! === missing[j - 1]! + 1 &&
+          acc < RUN_MAX_ROWS
+        ) {
+          run.push(missing[j]!);
+          acc += Number(this.metadata.row_groups[missing[j]!]?.num_rows ?? 0);
+          j++;
+        }
+        runs.push(run);
+        i = j;
       }
     }
+    const rgToRun = new Map<number, number[]>();
+    for (const run of runs) for (const rg of run) rgToRun.set(rg, run);
+    const dispatched = new WeakSet<number[]>();
 
-    for (const { startRg, endRg } of runs) {
+    // Each row group's slice promise is registered in the cache the moment
+    // its run is dispatched, so a second caller arriving while the run is
+    // mid-flight reuses the same Promise (single-flight) instead of issuing
+    // a duplicate.
+    const dispatchRun = (run: number[]) => {
+      if (dispatched.has(run)) return;
+      dispatched.add(run);
+      const startRg = run[0]!;
+      const endRg = run[run.length - 1]!;
       const rowStart = this.rowOffsets[startRg]!;
       const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
       const readArgs: Record<string, unknown> = {
@@ -301,7 +328,7 @@ export class CogpReader {
         Record<string, unknown>[]
       >;
       let offset = 0;
-      for (let r = startRg; r <= endRg; r++) {
+      for (const r of run) {
         const start = offset;
         const n = Number(this.metadata.row_groups[r]?.num_rows ?? 0);
         offset += n;
@@ -310,11 +337,22 @@ export class CogpReader {
         this.rowGroupCache.set(cacheKey(r), slicePromise, n);
         promises.set(r, slicePromise);
       }
-    }
+    };
 
-    // Phase 3: yield each row group's rows in the requested order.
+    // Phase 3: dispatch each run only when iteration first reaches one of
+    // its row groups, then yield the row group's slice. If the caller breaks
+    // early (e.g. post-filter `maxRows` reached), later runs are never
+    // fetched.
     for (const rg of rgIndices) {
-      yield await promises.get(rg)!;
+      let p = promises.get(rg);
+      if (!p) {
+        const run = rgToRun.get(rg);
+        if (run) {
+          dispatchRun(run);
+          p = promises.get(rg);
+        }
+      }
+      yield await p!;
     }
   }
 
