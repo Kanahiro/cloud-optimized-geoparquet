@@ -1,21 +1,13 @@
-import maplibregl, { addProtocol, type LngLatBoundsLike } from 'maplibre-gl';
+import maplibregl, { type LngLatBoundsLike } from 'maplibre-gl';
+import type { FeatureCollection } from 'geojson';
 
 import {
   openDataset as openCogpDataset,
-  readTile,
-  type CogpTileRequest,
+  readViewport,
   type MetadataSummary,
-} from './tile-service';
+} from './dataset-service';
 
 const COGP_SOURCE_ID = 'cogp';
-const COGP_LAYER_NAME = 'cogp';
-
-addProtocol('cogp', async (params, abortController) => {
-  const tile = parseCogpTileUrl(params.url);
-  if (!tile) throw new Error(`Invalid COGP tile URL: ${params.url}`);
-  if (abortController.signal.aborted) throw new DOMException('Aborted', 'AbortError');
-  return { data: await requestTile(tile, abortController.signal) };
-});
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -31,9 +23,7 @@ const map = new maplibregl.Map({
         maxzoom: 19,
       },
     },
-    layers: [
-      { id: 'osm', type: 'raster', source: 'osm' },
-    ],
+    layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
   },
   center: [0, 20],
   zoom: 2,
@@ -78,7 +68,16 @@ function renderPropertiesHtml(properties: Record<string, unknown> | null | undef
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '';
   if (typeof value === 'string') return value;
-  return String(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
+  try {
+    return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+  } catch {
+    return String(value);
+  }
 }
 
 function escapeHtml(input: string): string {
@@ -91,24 +90,25 @@ function escapeHtml(input: string): string {
 }
 
 map.on('load', () => {
-  if (active) replaceCogpSource(active.url);
+  if (active) installCogpSource();
 });
 
-function replaceCogpSource(url: string): void {
+map.on('moveend', () => {
+  if (active) void refreshViewport();
+});
+
+function installCogpSource(): void {
   if (!map.isStyleLoaded()) return;
   removeCogpLayersAndSource();
 
   map.addSource(COGP_SOURCE_ID, {
-    type: 'vector',
-    tiles: [`cogp://${encodeURIComponent(url)}/{z}/{x}/{y}.pbf`],
-    minzoom: 0,
-    maxzoom: 22,
+    type: 'geojson',
+    data: emptyFC(),
   });
   map.addLayer({
     id: 'cogp-fill',
     type: 'fill',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_LAYER_NAME,
     filter: ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
     paint: {
       'fill-color': '#4a6cf7',
@@ -120,7 +120,6 @@ function replaceCogpSource(url: string): void {
     id: 'cogp-line',
     type: 'line',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_LAYER_NAME,
     filter: ['any', ['==', ['geometry-type'], 'LineString'], ['==', ['geometry-type'], 'MultiLineString']],
     paint: {
       'line-color': '#1f3aa8',
@@ -131,7 +130,6 @@ function replaceCogpSource(url: string): void {
     id: 'cogp-point',
     type: 'circle',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_LAYER_NAME,
     filter: ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
     paint: {
       'circle-radius': 3,
@@ -140,6 +138,8 @@ function replaceCogpSource(url: string): void {
       'circle-stroke-width': 1,
     },
   });
+
+  void refreshViewport();
 }
 
 function removeCogpLayersAndSource(): void {
@@ -147,6 +147,37 @@ function removeCogpLayersAndSource(): void {
     if (map.getLayer(layerId)) map.removeLayer(layerId);
   }
   if (map.getSource(COGP_SOURCE_ID)) map.removeSource(COGP_SOURCE_ID);
+}
+
+function emptyFC(): FeatureCollection {
+  return { type: 'FeatureCollection', features: [] };
+}
+
+let viewportToken = 0;
+
+async function refreshViewport(): Promise<void> {
+  const ds = active;
+  if (!ds) return;
+  const source = map.getSource(COGP_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  if (!source) return;
+  const myToken = ++viewportToken;
+  const b = map.getBounds();
+  const bbox = {
+    minX: b.getWest(),
+    minY: b.getSouth(),
+    maxX: b.getEast(),
+    maxY: b.getNorth(),
+  };
+  try {
+    const { data, status } = await readViewport(ds.url, bbox, metersPerCssPixel());
+    if (myToken !== viewportToken || active?.url !== ds.url) return;
+    source.setData(data);
+    if (status) setStatus(status);
+  } catch (err) {
+    if (myToken !== viewportToken) return;
+    console.error(err);
+    setStatus(`Viewport read failed: ${(err as Error).message}`);
+  }
 }
 
 const urlInput = document.getElementById('url') as HTMLInputElement;
@@ -208,9 +239,9 @@ async function loadDataset(url: string): Promise<void> {
     if (dataBbox) {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
-    replaceCogpSource(active.url);
+    installCogpSource();
     setStatus(
-      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels. Vector tiles load on demand.`,
+      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels.`,
     );
   } catch (err) {
     if (latestUrl !== url) return;
@@ -227,29 +258,10 @@ function renderMetadata(summary: MetadataSummary): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
 }
 
-async function requestTile(tile: CogpTileRequest, signal: AbortSignal): Promise<ArrayBuffer> {
-  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-  const result = await readTile(tile, metersPerCssPixel());
-  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-  if (result.status && active?.url === tile.url) setStatus(result.status);
-  return result.data;
-}
-
 function metersPerCssPixel(): number {
   const sampleWidth = 100;
   const y = map.getContainer().clientHeight / 2;
   const left = map.unproject([0, y]);
   const right = map.unproject([sampleWidth, y]);
   return left.distanceTo(right) / sampleWidth;
-}
-
-function parseCogpTileUrl(url: string): CogpTileRequest | null {
-  const match = /^cogp:\/\/([^/]+)\/(\d+)\/(\d+)\/(\d+)(?:\.pbf)?(?:[?#].*)?$/.exec(url);
-  if (!match) return null;
-  return {
-    url: decodeURIComponent(match[1]!),
-    z: Number(match[2]),
-    x: Number(match[3]),
-    y: Number(match[4]),
-  };
 }

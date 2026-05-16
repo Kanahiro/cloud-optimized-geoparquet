@@ -1,5 +1,7 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
 import { compressors } from 'hyparquet-compressors';
+import { DEFAULT_PARSERS } from 'hyparquet/src/convert.js';
+import { wkbToGeojson } from 'hyparquet/src/wkb.js';
 
 import {
   type Bbox,
@@ -33,12 +35,33 @@ export interface OpenOptions {
   cacheMaxRows?: number;
 }
 
-const DEFAULT_CACHE_MAX_ROWS = 1_000_000;
+const DEFAULT_CACHE_MAX_ROWS = 500_000;
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
 // the run as one array, so peak in-flight memory scales with this value.
 const RUN_MAX_ROWS = 50_000;
+
+// Custom parsers handed to hyparquet so it returns raw WKB bytes for
+// GEOMETRY/GEOGRAPHY columns instead of eagerly building nested-array
+// GeoJSON Geometry objects for every row. We decode WKB ourselves in
+// `readRows` only for rows that survive the bbox filter, which cuts peak
+// memory dramatically for small tile bboxes against dense files. The
+// other (timestamp/date/string/uuid) parsers fall through to hyparquet's
+// defaults — supplying `parsers` replaces the whole table, so we must
+// re-export the rest.
+const LAZY_GEO_PARSERS = {
+  ...DEFAULT_PARSERS,
+  geometryFromBytes: (bytes: Uint8Array | undefined) => bytes,
+  geographyFromBytes: (bytes: Uint8Array | undefined) => bytes,
+};
+
+function decodeWkb(bytes: Uint8Array): unknown {
+  return wkbToGeojson({
+    view: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    offset: 0,
+  });
+}
 
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
@@ -99,6 +122,8 @@ export class CogpReader {
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
   private readonly bboxPaths: BboxCovering;
+  /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
+  private readonly geomColumns: readonly string[];
   /**
    * Row-group → in-flight or resolved row records, keyed by
    * `${rgIndex}|${columnsKey}`. Storing a Promise (not the resolved value)
@@ -142,6 +167,12 @@ export class CogpReader {
       throw new Error('cogp file has no row groups');
     }
     this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
+
+    const geomCols: string[] = [];
+    for (const [name, col] of Object.entries(this.geo.columns)) {
+      if (col?.encoding === 'WKB') geomCols.push(name);
+    }
+    this.geomColumns = geomCols;
   }
 
   get levels() {
@@ -169,8 +200,9 @@ export class CogpReader {
 
   /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
-   * records. The geometry column carries a GeoJSON Geometry object (decoded
-   * by hyparquet from the on-disk WKB).
+   * records. The geometry column carries a GeoJSON Geometry object decoded
+   * from the on-disk WKB; decoding happens lazily after bbox filtering so
+   * rows that miss the query never pay for it.
    *
    * Bbox pruning runs at two levels: row groups whose covering envelope
    * misses the query are skipped entirely (no I/O), then surviving groups
@@ -192,9 +224,19 @@ export class CogpReader {
     }
     const out: Record<string, unknown>[] = [];
     const paths = bbox ? this.bboxPaths : null;
+    const geomCols = this.geomColumns;
+    const decodeGeoms = (row: Record<string, unknown>) => {
+      for (const col of geomCols) {
+        const v = row[col];
+        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
+      }
+    };
     for await (const batch of this.streamRowGroups(rgs, columns)) {
       if (!paths) {
-        for (const row of batch) out.push(row);
+        for (const row of batch) {
+          decodeGeoms(row);
+          out.push(row);
+        }
       } else {
         for (const row of batch) {
           if (
@@ -208,6 +250,7 @@ export class CogpReader {
               bbox!,
             )
           ) {
+            decodeGeoms(row);
             out.push(row);
           }
         }
@@ -322,6 +365,7 @@ export class CogpReader {
         rowStart,
         rowEnd,
         compressors,
+        parsers: LAZY_GEO_PARSERS,
       };
       if (columns) readArgs['columns'] = columns;
       const runPromise = parquetReadObjects(readArgs as never) as Promise<
