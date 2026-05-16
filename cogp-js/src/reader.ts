@@ -12,6 +12,7 @@ import {
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
+import { LruCache } from './cache.js';
 import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
@@ -26,7 +27,17 @@ export type BboxInput = Bbox | readonly [number, number, number, number];
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
+  /**
+   * Maximum total rows held in the per-row-group LRU cache. The cache keys
+   * by row-group index + projected columns, so repeat reads of the same
+   * area skip parquet decode. When a read would push the cache past this,
+   * the least-recently-used row groups are evicted. Defaults to 100,000;
+   * set to 0 to disable caching entirely.
+   */
+  cacheMaxRows?: number;
 }
+
+const DEFAULT_CACHE_MAX_ROWS = 100_000;
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
@@ -107,7 +118,7 @@ export class CogpReader {
     opts: OpenOptions = {},
   ): Promise<CogpReader> {
     const metadata = (await parquetMetadataAsync(file as never)) as unknown as FullFileMetadata;
-    return new CogpReader(file, metadata, url);
+    return new CogpReader(file, metadata, url, opts.cacheMaxRows ?? DEFAULT_CACHE_MAX_ROWS);
   }
 
   readonly cogp: CogpMeta;
@@ -120,12 +131,20 @@ export class CogpReader {
   private readonly bboxPaths: BboxCovering;
   /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
   private readonly geomColumns: readonly string[];
+  /**
+   * Row-group → resolved row records, keyed by `${rgIndex}|${columnsKey}`.
+   * Promise-valued so concurrent reads of the same row group share one
+   * underlying fetch (single-flight).
+   */
+  private readonly rowGroupCache: LruCache<Promise<Record<string, unknown>[]>>;
 
   private constructor(
     private readonly file: unknown,
     readonly metadata: FullFileMetadata,
     readonly url: string,
+    cacheMaxRows: number,
   ) {
+    this.rowGroupCache = new LruCache(cacheMaxRows);
     const doc = extractCogpDocument(metadata.key_value_metadata);
     this.cogp = doc.cogp;
     this.geo = doc.geo;
@@ -221,6 +240,12 @@ export class CogpReader {
     // sneak past the cap (decoded GeoJSON can be many MB even when the
     // caller asked for a small output budget — that's what crashes the
     // downstream renderer).
+    //
+    // The returned row is a shallow clone so decoding doesn't mutate the
+    // cached row. Without the clone, a second read of the same row group
+    // would see already-decoded geometries, `byteLength` would report 0
+    // for those columns, and the cap would silently expand on every
+    // repeat read.
     const acceptRow = (row: Record<string, unknown>): boolean => {
       if (maxRowWkbBytes !== undefined) {
         let rowWkbBytes = 0;
@@ -231,11 +256,12 @@ export class CogpReader {
         if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
         wkbBytes += rowWkbBytes;
       }
+      const outRow: Record<string, unknown> = { ...row };
       for (const col of geomCols) {
-        const v = row[col];
-        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
+        const v = outRow[col];
+        if (v instanceof Uint8Array) outRow[col] = decodeWkb(v);
       }
-      out.push(row);
+      out.push(outRow);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
@@ -294,6 +320,11 @@ export class CogpReader {
     return out;
   }
 
+  /** Drop all cached row-group data; subsequent reads will re-fetch. */
+  clearCache(): void {
+    this.rowGroupCache.clear();
+  }
+
   /**
    * Materialize the requested row groups and yield one row group's rows per
    * iteration, in the order given. Callers that filter per-row (e.g. bbox)
@@ -301,13 +332,13 @@ export class CogpReader {
    * is bounded by `(largest pending fetch) + (accumulated survivors)` rather
    * than the sum of every selected row group's full row count.
    *
-   * Consecutive indices are coalesced into runs so hyparquet can fetch
-   * their column chunks together. A run is capped by cumulative `num_rows`
-   * (`RUN_MAX_ROWS`): one `parquetReadObjects` call materializes the entire
-   * run's rows in one array, so an unbounded run is the worst case for
-   * peak in-flight memory. Every run is dispatched upfront so their fetches
-   * fly in parallel; an early break from the consumer (e.g. `maxRows`
-   * reached) leaves the in-flight fetches running to completion.
+   * Cache hits skip the fetch entirely. Misses are grouped into consecutive
+   * runs so hyparquet can pull their column chunks together (one
+   * `parquetReadObjects` call per run, capped at `RUN_MAX_ROWS` cumulative
+   * rows). All runs are dispatched upfront so their fetches fly in
+   * parallel; each row group's slice promise is registered in the cache
+   * the moment its run is dispatched, so concurrent reads share the same
+   * in-flight fetch.
    */
   private async *streamRowGroups(
     rgIndices: number[],
@@ -315,20 +346,33 @@ export class CogpReader {
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
+    // Different `columns` selections produce structurally different rows, so
+    // they get distinct cache entries. `*` marks "no projection".
+    const columnsKey = columns ? columns.slice().sort().join(',') : '*';
+    const cacheKey = (rg: number) => `${rg}|${columnsKey}`;
+
+    const promises = new Map<number, Promise<Record<string, unknown>[]>>();
+    const missing: number[] = [];
+    for (const rg of rgIndices) {
+      const p = this.rowGroupCache.get(cacheKey(rg));
+      if (p) promises.set(rg, p);
+      else missing.push(rg);
+    }
+
     const runs: Array<number[]> = [];
     {
       let i = 0;
-      while (i < rgIndices.length) {
-        const run: number[] = [rgIndices[i]!];
-        let acc = Number(this.metadata.row_groups[rgIndices[i]!]?.num_rows ?? 0);
+      while (i < missing.length) {
+        const run: number[] = [missing[i]!];
+        let acc = Number(this.metadata.row_groups[missing[i]!]?.num_rows ?? 0);
         let j = i + 1;
         while (
-          j < rgIndices.length &&
-          rgIndices[j]! === rgIndices[j - 1]! + 1 &&
+          j < missing.length &&
+          missing[j]! === missing[j - 1]! + 1 &&
           acc < RUN_MAX_ROWS
         ) {
-          run.push(rgIndices[j]!);
-          acc += Number(this.metadata.row_groups[rgIndices[j]!]?.num_rows ?? 0);
+          run.push(missing[j]!);
+          acc += Number(this.metadata.row_groups[missing[j]!]?.num_rows ?? 0);
           j++;
         }
         runs.push(run);
@@ -336,7 +380,6 @@ export class CogpReader {
       }
     }
 
-    const promises = new Map<number, Promise<Record<string, unknown>[]>>();
     for (const run of runs) {
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
@@ -360,7 +403,9 @@ export class CogpReader {
         const n = Number(this.metadata.row_groups[r]?.num_rows ?? 0);
         offset += n;
         const end = offset;
-        promises.set(r, runPromise.then((rows) => rows.slice(start, end)));
+        const slicePromise = runPromise.then((rows) => rows.slice(start, end));
+        this.rowGroupCache.set(cacheKey(r), slicePromise, n);
+        promises.set(r, slicePromise);
       }
     }
 
