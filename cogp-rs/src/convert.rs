@@ -126,7 +126,10 @@ pub enum InputUnits {
     Meters,
 }
 
-const ROW_GROUP_BYTE_CHECK_ROWS: usize = 1024;
+/// Upper bound on slice size between byte-limit checks. A fixed cap alone
+/// can't enforce `max_bytes` when per-row payload is large — see the probe
+/// logic in `write_batch_with_row_group_limits`.
+const ROW_GROUP_BYTE_CHECK_MAX_ROWS: usize = 1024;
 
 fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
     let count = writer.flushed_row_groups().len();
@@ -150,10 +153,27 @@ fn write_batch_with_row_group_limits<W: Write + Send>(
     let mut offset = 0;
     while offset < batch.num_rows() {
         let buffered_rows = writer.in_progress_rows();
+        let buffered_bytes = writer.in_progress_size();
         let rows_until_row_limit = max_rows.saturating_sub(buffered_rows).max(1);
+
+        // Predict how many more rows fit in the remaining byte budget by
+        // extrapolating buffered bytes/row. Without a sample (fresh row group)
+        // probe a single row first, so a dataset where one row already exceeds
+        // `max_bytes` (e.g. dense MultiPolygons) cannot inflate the row group
+        // by ~1024× before the next size check.
+        let rows_until_byte_limit = if buffered_rows == 0 {
+            1
+        } else if buffered_bytes >= max_bytes {
+            1
+        } else {
+            let bytes_per_row = buffered_bytes.div_ceil(buffered_rows).max(1);
+            ((max_bytes - buffered_bytes) / bytes_per_row).max(1)
+        };
+
         let rows = (batch.num_rows() - offset)
             .min(rows_until_row_limit)
-            .min(ROW_GROUP_BYTE_CHECK_ROWS);
+            .min(rows_until_byte_limit)
+            .min(ROW_GROUP_BYTE_CHECK_MAX_ROWS);
         writer.write(&batch.slice(offset, rows))?;
         offset += rows;
 
