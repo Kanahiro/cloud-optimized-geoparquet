@@ -54,9 +54,8 @@ pub struct ConvertArgs {
     /// Parquet row group size in rows
     #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
-    /// Maximum estimated encoded Parquet row group size in bytes.
-    /// Accepts optional K/M/G/T, KB/MB/GB/TB, or KiB/MiB/GiB/TiB suffixes.
-    #[arg(long, value_parser = parse_byte_size)]
+    /// Maximum estimated encoded Parquet row group size in bytes
+    #[arg(long)]
     pub row_group_max_bytes: Option<usize>,
     /// Coordinate units in the input file. `auto` (default) inspects the GeoParquet
     /// `crs` PROJJSON: `ProjectedCRS` → meters, otherwise degrees. Override with
@@ -128,47 +127,6 @@ pub enum InputUnits {
 }
 
 const ROW_GROUP_BYTE_CHECK_ROWS: usize = 1024;
-
-fn parse_byte_size(value: &str) -> std::result::Result<usize, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("byte size must not be empty".to_string());
-    }
-
-    let split_at = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (digits, suffix) = trimmed.split_at(split_at);
-    if digits.is_empty() {
-        return Err(format!("byte size `{value}` must start with a number"));
-    }
-    let number = digits
-        .parse::<usize>()
-        .map_err(|_| format!("byte size `{value}` is not a valid positive integer"))?;
-    if number == 0 {
-        return Err("byte size must be > 0".to_string());
-    }
-
-    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1usize,
-        "k" | "kb" => 1_000usize,
-        "m" | "mb" => 1_000_000usize,
-        "g" | "gb" => 1_000_000_000usize,
-        "t" | "tb" => 1_000_000_000_000usize,
-        "ki" | "kib" => 1024usize,
-        "mi" | "mib" => 1024usize.pow(2),
-        "gi" | "gib" => 1024usize.pow(3),
-        "ti" | "tib" => 1024usize.pow(4),
-        _ => {
-            return Err(format!(
-                "unsupported byte size suffix `{suffix}`; use bytes, K/M/G/T, KB/MB/GB/TB, or KiB/MiB/GiB/TiB"
-            ));
-        }
-    };
-    number
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("byte size `{value}` is too large"))
-}
 
 fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
     let count = writer.flushed_row_groups().len();

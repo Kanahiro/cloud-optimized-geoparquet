@@ -69,8 +69,8 @@ Other options:
 - `--row-group-size` (default `10000`) — max Parquet row group size in rows.
   Row group boundaries always align with level boundaries.
 - `--row-group-max-bytes` — max estimated encoded Parquet row group size in
-  bytes. Accepts suffixes such as `128MB` or `128MiB`. This is enforced using
-  the Parquet writer's in-progress encoded-size estimate, checked at batch
+  bytes. This must be a numeric byte count, without suffixes. It is enforced
+  using the Parquet writer's in-progress encoded-size estimate, checked at batch
   granularity, so an individual row group can exceed the target slightly.
 - `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
   PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
