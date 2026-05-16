@@ -11,7 +11,7 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-const VIEWPORT_MAX_ROWS = 100_000;
+const VIEWPORT_MAX_ROWS = 50_000;
 const VIEWPORT_MAX_ROW_WKB_BYTES = 20_000_000;
 
 interface ActiveDataset {
