@@ -40,6 +40,7 @@ const map = new maplibregl.Map({
 });
 
 map.addControl(new maplibregl.NavigationControl({}), 'top-right');
+map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
 map.on('load', () => {
   if (active) replaceCogpSource(active.url);
@@ -180,10 +181,18 @@ function renderMetadata(summary: MetadataSummary): void {
 
 async function requestTile(tile: CogpTileRequest, signal: AbortSignal): Promise<ArrayBuffer> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-  const result = await readTile(tile, window.devicePixelRatio || 1);
+  const result = await readTile(tile, metersPerCssPixel());
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   if (result.status && active?.url === tile.url) setStatus(result.status);
   return result.data;
+}
+
+function metersPerCssPixel(): number {
+  const sampleWidth = 100;
+  const y = map.getContainer().clientHeight / 2;
+  const left = map.unproject([0, y]);
+  const right = map.unproject([sampleWidth, y]);
+  return left.distanceTo(right) / sampleWidth;
 }
 
 function parseCogpTileUrl(url: string): CogpTileRequest | null {

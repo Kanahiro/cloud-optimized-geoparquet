@@ -115,7 +115,9 @@ Every source feature MUST appear in exactly one row group. Feature geometry and 
 
 Level ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
 
-Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective. This profile does not prescribe a specific clustering algorithm.
+Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective.
+
+Producers SHOULD spatially sort or pack features within each level before forming row groups. Suitable approaches include, but are not limited to, ordering features by a spatial filling curve such as a Hilbert curve, ordering features by Quadkey or another quadtree-derived key, or using a packed spatial index layout such as STR packing.
 
 ### 5.3 Level boundaries
 

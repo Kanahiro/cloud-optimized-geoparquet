@@ -2,8 +2,8 @@ import { CogpReader } from 'cogp';
 
 import { emptyTile, encodeTileRows } from './tile-encoder';
 
-const TILE_MAX_ROWS = Infinity;
-const TILE_MAX_BYTES = Infinity;
+const TILE_MAX_ROWS = 100000;
+const TILE_MAX_BYTES = 20000000;
 
 export interface CogpTileRequest {
   url: string;
@@ -66,15 +66,15 @@ export async function openDataset(url: string): Promise<OpenResult> {
 
 export async function readTile(
   tile: CogpTileRequest,
-  devicePixelRatio: number,
+  targetGsd: number,
 ): Promise<TileResult> {
   const ds = active;
   if (!ds || ds.url !== tile.url) return { data: emptyTile() };
 
-  const key = `${tile.z}/${tile.x}/${tile.y}/${devicePixelRatio}`;
+  const key = `${tile.z}/${tile.x}/${tile.y}/${targetGsd}`;
   let promise = ds.tileCache.get(key);
   if (!promise) {
-    promise = buildCogpTile(ds, tile, devicePixelRatio).catch((err) => {
+    promise = buildCogpTile(ds, tile, targetGsd).catch((err) => {
       ds.tileCache.delete(key);
       throw err;
     });
@@ -119,11 +119,10 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
 async function buildCogpTile(
   ds: ActiveDataset,
   tile: CogpTileRequest,
-  devicePixelRatio: number,
+  targetGsd: number,
 ): Promise<TileResult> {
   const bbox = tileBbox(tile.z, tile.x, tile.y);
-  const gsd = gsdForTile(tile.z, tile.y, devicePixelRatio);
-  const maxLevel = ds.reader.selectLevel(gsd);
+  const maxLevel = ds.reader.selectLevel(targetGsd);
   const geomColumn = ds.reader.primaryGeometryColumn;
   const rows = await ds.reader.readRows({
     bbox,
@@ -137,7 +136,7 @@ async function buildCogpTile(
   ds.servedTiles += 1;
   return {
     data,
-    status: `Served ${ds.servedTiles} vector tiles. Last: ${featureCount} features at ${formatGsd(gsd)}/px (level <= ${maxLevel}).`,
+    status: `Served ${ds.servedTiles} vector tiles. Last: ${featureCount} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}).`,
   };
 }
 
@@ -157,13 +156,6 @@ function tileXToLng(x: number, z: number): number {
 function tileYToLat(y: number, z: number): number {
   const n = Math.PI - (2 * Math.PI * y) / 2 ** z;
   return (180 / Math.PI) * Math.atan(Math.sinh(n));
-}
-
-function gsdForTile(z: number, y: number, devicePixelRatio: number): number {
-  const bbox = tileBbox(z, 0, y);
-  const latRad = ((bbox.minY + bbox.maxY) / 2) * (Math.PI / 180);
-  const metersPerCssPixel = (40_075_016.68557849 * Math.max(Math.cos(latRad), 0.01)) / (512 * 2 ** z);
-  return metersPerCssPixel / devicePixelRatio;
 }
 
 function formatGsd(gsdMeters: number): string {
