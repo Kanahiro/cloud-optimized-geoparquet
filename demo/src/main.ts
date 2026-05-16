@@ -5,7 +5,7 @@ import {
   openDataset as openCogpDataset,
   readViewport,
   type MetadataSummary,
-} from './tile-service';
+} from './dataset-service';
 
 const COGP_SOURCE_ID = 'cogp';
 

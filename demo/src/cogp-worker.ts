@@ -1,28 +1,17 @@
+/// <reference lib="webworker" />
 import { CogpReader } from 'cogp';
-import type { Feature, FeatureCollection, Geometry } from 'geojson';
+import type { Feature, Geometry } from 'geojson';
+
+import type {
+  MetadataSummary,
+  OpenResult,
+  ViewportBbox,
+  ViewportResult,
+  WorkerEnvelope,
+  WorkerResponse,
+} from './cogp-types';
 
 const VIEWPORT_MAX_ROWS = 50_000;
-
-export interface MetadataSummary {
-  primary_column: string;
-  num_row_groups: number;
-  levels: Array<{
-    i: number;
-    gsd: number;
-    row_group_end: number;
-  }>;
-  crs: unknown;
-}
-
-export interface OpenResult {
-  summary: MetadataSummary;
-  dataBbox: [[number, number], [number, number]] | null;
-}
-
-export interface ViewportResult {
-  data: FeatureCollection;
-  status: string;
-}
 
 interface ActiveDataset {
   url: string;
@@ -35,7 +24,7 @@ interface ActiveDataset {
 let active: ActiveDataset | null = null;
 let latestUrl = '';
 
-export async function openDataset(url: string): Promise<OpenResult> {
+async function openDataset(url: string): Promise<OpenResult> {
   latestUrl = url;
   const reader = await CogpReader.open(url);
   if (latestUrl !== url) throw new Error('Dataset open was superseded');
@@ -49,34 +38,21 @@ export async function openDataset(url: string): Promise<OpenResult> {
     servedViewports: 0,
   };
 
-  return {
-    summary: metadataSummary(reader),
-    dataBbox,
-  };
+  return { summary: metadataSummary(reader), dataBbox };
 }
 
-/**
- * Read every feature whose covering bbox intersects `bbox`, at the level
- * appropriate for `targetGsd`. Returns a GeoJSON FeatureCollection ready to
- * hand to a MapLibre `geojson` source. Properties carry every non-geometry
- * column except the bbox covering struct.
- */
-export async function readViewport(
+async function readViewport(
   url: string,
-  bbox: { minX: number; minY: number; maxX: number; maxY: number },
+  bbox: ViewportBbox,
   targetGsd: number,
 ): Promise<ViewportResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
-    return { data: emptyFC(), status: '' };
+    return { data: { type: 'FeatureCollection', features: [] }, status: '' };
   }
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetGsd);
-  const rows = await ds.reader.readRows({
-    bbox,
-    maxLevel,
-    maxRows: VIEWPORT_MAX_ROWS,
-  });
+  const rows = await ds.reader.readRows({ bbox, maxLevel, maxRows: VIEWPORT_MAX_ROWS, maxBytes: 100000000 });
 
   const features: Feature[] = [];
   const skip = new Set<string>([geomColumn]);
@@ -136,10 +112,6 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
   ];
 }
 
-function emptyFC(): FeatureCollection {
-  return { type: 'FeatureCollection', features: [] };
-}
-
 // MapLibre serializes GeoJSON properties through JSON.stringify when shipping
 // data to its worker, which can't handle bigint or Uint8Array. Coerce both
 // here so the GeoJSON source accepts the FeatureCollection.
@@ -157,3 +129,20 @@ function formatGsd(gsdMeters: number): string {
   if (gsdMeters >= 1) return `${gsdMeters.toFixed(1)} m`;
   return `${(gsdMeters * 100).toFixed(1)} cm`;
 }
+
+self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
+  const { id, payload } = e.data;
+  try {
+    let result: OpenResult | ViewportResult;
+    if (payload.type === 'open') {
+      result = await openDataset(payload.url);
+    } else {
+      result = await readViewport(payload.url, payload.bbox, payload.targetGsd);
+    }
+    const response: WorkerResponse = { id, ok: true, result };
+    self.postMessage(response);
+  } catch (err) {
+    const response: WorkerResponse = { id, ok: false, error: (err as Error).message };
+    self.postMessage(response);
+  }
+};
