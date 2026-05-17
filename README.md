@@ -32,7 +32,7 @@ See [`SPEC.md`](./SPEC.md) for the normative specification.
 
 ## Roadmap
 
-- [ ] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout.
+- [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. https://github.com/Kanahiro/cogp-rs
 - [ ] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
 - [ ] Benchmarking: file size, read performance...
 
