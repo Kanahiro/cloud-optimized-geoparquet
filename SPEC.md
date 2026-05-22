@@ -195,33 +195,7 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 }
 ```
 
-### 6.3 Recommended example
-
-```json
-{
-  "version": "0.1.0",
-  "levels": [
-    {
-      "row_group_end": 0,
-      "gsd": 1000
-    },
-    {
-      "row_group_end": 3,
-      "gsd": 500
-    },
-    {
-      "row_group_end": 12,
-      "gsd": 100
-    }
-  ],
-  "generator": {
-    "name": "yosegi",
-    "version": "0.8.0"
-  }
-}
-```
-
-### 6.4 Field definitions
+### 6.3 Field definitions
 
 | Field                  | Required | Description                                                                                                       |
 | ---------------------- | -------: | ----------------------------------------------------------------------------------------------------------------- |
@@ -229,7 +203,6 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | `levels`                 |      Yes | Ordered level entries from coarse to fine.                                                                        |
 | `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
 | `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
-| `generator`            |       No | Producer tool metadata.                                                                                           |
 
 ## 7. Level selection (non-normative)
 
