@@ -32,8 +32,11 @@ See [`SPEC.md`](./SPEC.md) for the normative specification.
 
 ## Roadmap
 
-- [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. https://github.com/Kanahiro/cogp-rs
-- [ ] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
+- [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+
+> https://github.com/Kanahiro/cogp-rs
+
 - [ ] Benchmarking: file size, read performance...
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
