@@ -34,7 +34,7 @@ COGP is a small, conservative layout convention that enables this without changi
 
 ### Example: loading OvertureMaps buildings on QGIS 4.0
 
-#### ordinary GeoParuqet (spatially sorted)
+#### ordinary GeoParquet (spatially sorted)
 
 https://github.com/user-attachments/assets/10d0390c-95ab-45e5-8503-6cbdbb015c93
 
@@ -62,8 +62,6 @@ See [`SPEC.md`](./SPEC.md) for the normative specification.
 - [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
 
 > https://github.com/Kanahiro/cogp-rs
-
-- [ ] Benchmarking: file size, read performance...
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
 
