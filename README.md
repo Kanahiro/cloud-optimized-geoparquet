@@ -32,6 +32,16 @@ COGP is a small, conservative layout convention that enables this without changi
 - **Efficient AoI-based spatial queries, even for non-COGP-aware software.** The layout preserves GeoParquet 1.1 semantics and row group statistics, so existing engines can still prune by bounding box and answer area-of-interest queries efficiently.
 - **Minimal, resolution-targeted streaming for COGP-aware software.** A COGP-aware reader can consult the level metadata and fetch only the leading row groups required for its target geographic resolution, enabling fast progressive streaming with the smallest possible byte footprint.
 
+### Example: loading OvertureMaps buildings on QGIS 4.0
+
+#### ordinary GeoParuqet (spatially sorted)
+
+https://github.com/user-attachments/assets/10d0390c-95ab-45e5-8503-6cbdbb015c93
+
+#### COGP
+
+https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
+
 ## Specification
 
 See [`SPEC.md`](./SPEC.md) for the normative specification.
