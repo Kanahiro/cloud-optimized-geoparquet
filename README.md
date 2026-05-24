@@ -26,6 +26,12 @@ GeoParquet is well suited for analytics and cloud storage, but ordinary GeoParqu
 
 COGP is a small, conservative layout convention that enables this without changing GeoParquet's data model.
 
+## Benefits
+
+- **Faster overview rendering, even for non-COGP-aware software.** Because coarse-detail features are physically placed at the front of the file, any GeoParquet 1.1 reader that streams row groups in order will see a usable overview almost immediately, without needing to understand the `cogp` metadata.
+- **Efficient AoI-based spatial queries, even for non-COGP-aware software.** The layout preserves GeoParquet 1.1 semantics and row group statistics, so existing engines can still prune by bounding box and answer area-of-interest queries efficiently.
+- **Minimal, resolution-targeted streaming for COGP-aware software.** A COGP-aware reader can consult the level metadata and fetch only the leading row groups required for its target geographic resolution, enabling fast progressive streaming with the smallest possible byte footprint.
+
 ## Specification
 
 See [`SPEC.md`](./SPEC.md) for the normative specification.
