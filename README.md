@@ -46,6 +46,12 @@ https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
 
 https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
+## When COGP works well
+
+COGP is particularly well suited to datasets of many small, well-distributed features — such as POIs or building footprints — where dropping later row groups still yields a meaningful overview.
+
+Because COGP does not simplify geometries, datasets dominated by large, complex geometries (coastlines, rivers, road networks, administrative boundaries) cannot avoid transferring heavy per-feature payloads, making them less suitable for progressive streaming. Other COGP benefits — GeoParquet 1.1 compatibility, fast overview rendering, and efficient AoI-based queries — still apply.
+
 ## Specification
 
 See [`SPEC.md`](./SPEC.md) for the normative specification.
