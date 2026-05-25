@@ -204,27 +204,39 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
 | `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
 
-## 7. Level selection (non-normative)
+## 7. Reader guidance (non-normative)
 
-COGP metadata describes available levels, but it does not prescribe how a reader chooses one. A renderer can base the choice on zoom level, scale denominator, screen-space error, feature budget, byte budget, latency budget, or any other application-specific policy.
+COGP metadata describes available levels but does not prescribe how a reader uses them. This section sketches typical patterns.
 
-One common strategy is to estimate the ground distance represented by one display pixel and select the finest level that is still appropriate for that display resolution. Given a scale denominator and an assumed display pixel size in meters, such a target ground sample distance can be derived as:
+### 7.1 Level selection
 
-```text
-target_gsd = scale_denominator * display_pixel_size_m
-```
+A renderer can base the choice of level on zoom level, map scale, screen-space error, or any application-specific budget for bytes, features, or latency.
 
-Readers MAY use any other definition of `display_pixel_size_m` — device pixel, CSS pixel, or library-specific virtual pixel — provided it is consistent with how they interpret `scale_denominator`. COGP does not mandate a specific definition.
-
-Because `levels` are ordered from coarse to fine and `gsd` values strictly decrease, a reader can select the last level in the `levels` array whose `gsd` is greater than or equal to `target_gsd`:
+One common strategy is to derive a target ground sample distance from the current display scale and select the finest level whose `gsd` is still coarser than or equal to that target. Because `levels` are ordered from coarse to fine and `gsd` values strictly decrease, this is the last level satisfying:
 
 ```text
 gsd >= target_gsd
 ```
 
-If no level satisfies this condition, the target display resolution is coarser than the coarsest level described by the file, and the reader can select the first level.
+If no level satisfies this condition, the target resolution is coarser than the coarsest level in the file, and the reader can select the first level.
 
-After selecting a target level, the reader reads row groups from `0` through that level's `row_group_end`, inclusive. Because each feature appears in exactly one level, rendering a finer level normally requires reading the preceding coarser levels as a prefix.
+### 7.2 Reading the selected prefix
+
+The prefix of row groups from `0` through the selected level's `row_group_end` is the minimal set of features needed to produce a meaningful render at the target display scale. Features that would not be visually meaningful at that scale are deferred to later levels and are not fetched. The prefix is the data appropriate for the chosen scale, not a preview to be replaced.
+
+Two reading styles are both valid:
+
+* **Bounded read.** Fetch exactly the selected prefix and stop. Total transfer volume is bounded by the selected scale, which suits bandwidth-sensitive clients such as WebGIS applications.
+* **Progressive render.** Render features incrementally as row groups arrive, drawing coarser row groups first. This suits interactive viewers that want first paint as early as possible.
+
+Implementations typically fetch the Parquet footer to obtain `cogp` metadata and per-row-group statistics, then issue HTTP range requests for the row groups in `0..row_group_end` — in parallel or in order, with rendering either streamed or deferred to completion.
+
+For viewport-driven applications, two complementary spatial filters apply within the selected prefix:
+
+* **Row group pruning.** Using per-row-group min/max statistics of the bbox covering columns (Section 5.1), row groups whose bbox does not intersect the viewport can be skipped, avoiding the range request entirely.
+* **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
+
+If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
 
 ## 8. Validation
 
