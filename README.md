@@ -46,6 +46,12 @@ https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
 
 https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
+## Sample data
+
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/buildings.cogp.parquet) (OvertureMaps)
+
 ## When COGP works well
 
 COGP is particularly well suited to datasets of many small, well-distributed features — such as POIs or building footprints — where dropping later row groups still yields a meaningful overview.
