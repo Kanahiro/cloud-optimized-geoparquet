@@ -418,13 +418,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         SharedNodes::default()
     });
     let min_levels = if geometry_supports_lods {
-        scan_min_levels(
-            &args.input,
-            &arrow_meta,
-            geom_col_idx,
-            &kinds,
-            &tolerances,
-        )?
+        scan_min_levels(&args.input, &arrow_meta, geom_col_idx, &kinds, &tolerances)?
     } else {
         vec![0; n_rows]
     };
