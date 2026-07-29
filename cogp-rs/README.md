@@ -103,8 +103,10 @@ Other options:
   (`resolution` for meter coordinates, `resolution / 111,320` for degree coordinates).
   Junctions and shared-arc endpoints are detected from vertex adjacency and
   retained, following Tippecanoe's shared-node approach. Identical shared arcs
-  are therefore simplified consistently without quantizing coordinates. A
-  feature is deferred until simplification can still construct its geometry;
+  are therefore simplified consistently without quantizing coordinates. Level
+  eligibility is tested without those topology anchors, so a shared node cannot
+  keep a sub-resolution feature in a coarse level. A feature is deferred until
+  unconstrained simplification can still construct its geometry;
   Point and MultiPoint always use the primary WKB and do not get rendering
   sidecar values. Point-only files omit `geometry_lods` entirely.
 - `--sort-key` — attribute column that decides which point feature wins when several

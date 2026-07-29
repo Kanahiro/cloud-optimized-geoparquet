@@ -424,7 +424,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             geom_col_idx,
             &kinds,
             &tolerances,
-            &shared_nodes,
         )?
     } else {
         vec![0; n_rows]
@@ -1103,16 +1102,16 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
         .collect()
 }
 
-/// Re-read only WKB after shared nodes are known. Eligibility depends on the
-/// constrained simplifier, so calculating it during the first scan would
-/// either miss topology constraints or require retaining every WKB in memory.
+/// Re-read only WKB to determine the first resolution at which each feature
+/// survives simplification. Eligibility deliberately ignores shared-node
+/// constraints: topology anchors affect the shape written to a rendering LOD,
+/// but must not make a sub-resolution feature eligible for a coarser level.
 fn scan_min_levels(
     input: &Path,
     meta: &ArrowReaderMetadata,
     geom_col_idx: usize,
     kinds: &[GeomKind],
     tolerances: &[f64],
-    shared_nodes: &SharedNodes,
 ) -> Result<Vec<u16>> {
     let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
     let mask = ProjectionMask::roots(
@@ -1130,9 +1129,9 @@ fn scan_min_levels(
         let geom = batch.column(0).as_ref();
         let batch_kinds = &kinds[row_base..row_base + batch.num_rows()];
         let levels = if let Some(array) = geom.as_any().downcast_ref::<BinaryArray>() {
-            min_levels_for_wkb_rows(array, batch_kinds, tolerances, shared_nodes)?
+            min_levels_for_wkb_rows(array, batch_kinds, tolerances)?
         } else if let Some(array) = geom.as_any().downcast_ref::<LargeBinaryArray>() {
-            min_levels_for_wkb_rows(array, batch_kinds, tolerances, shared_nodes)?
+            min_levels_for_wkb_rows(array, batch_kinds, tolerances)?
         } else {
             bail!(
                 "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
@@ -1149,8 +1148,8 @@ fn min_levels_for_wkb_rows<O: OffsetSizeTrait>(
     array: &GenericBinaryArray<O>,
     kinds: &[GeomKind],
     tolerances: &[f64],
-    shared_nodes: &SharedNodes,
 ) -> Result<Vec<u16>> {
+    let no_shared_nodes = SharedNodes::default();
     (0..array.len())
         .into_par_iter()
         .map(|row| {
@@ -1159,7 +1158,7 @@ fn min_levels_for_wkb_rows<O: OffsetSizeTrait>(
             }
             let wkb = array.value(row);
             for (level_i, tolerance) in tolerances.iter().enumerate() {
-                if simplify_wkb(wkb, *tolerance, shared_nodes)?.is_some() {
+                if simplify_wkb(wkb, *tolerance, &no_shared_nodes)?.is_some() {
                     return Ok(level_i as u16);
                 }
             }
@@ -1939,6 +1938,30 @@ mod tests {
         let resolutions = vec![10.0, 0.5];
         let out = assign_levels(&bboxes, &kinds, &resolutions, &[1], 1, &[0]).unwrap();
         assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn polygon_level_eligibility_defers_when_coarse_simplification_collapses_ring() {
+        let mut polygon = vec![1];
+        polygon.extend_from_slice(&3u32.to_le_bytes());
+        polygon.extend_from_slice(&1u32.to_le_bytes());
+        polygon.extend_from_slice(&5u32.to_le_bytes());
+        for (x, y) in [
+            (0.0f64, 0.0f64),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ] {
+            polygon.extend_from_slice(&x.to_le_bytes());
+            polygon.extend_from_slice(&y.to_le_bytes());
+        }
+        let geometry = BinaryArray::from(vec![polygon.as_slice()]);
+
+        let levels =
+            min_levels_for_wkb_rows(&geometry, &[GeomKind::Polygon], &[100.0, 1.0]).unwrap();
+
+        assert_eq!(levels, vec![1]);
     }
 
     #[test]
