@@ -42,7 +42,10 @@ use parquet::arrow::async_reader::{
 #[cfg(feature = "object_store")]
 pub use parquet::arrow::async_reader::ParquetObjectReader;
 
-use crate::meta::{lod_level_index, CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY};
+use crate::meta::{
+    lod_level_index, parse_cogp_version, CogpMeta, GeoMeta, Level, COGP_METADATA_KEY,
+    GEO_METADATA_KEY,
+};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
 /// Cheap to clone (the underlying `ArrowReaderMetadata` is `Arc`-backed) and
@@ -311,14 +314,10 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
         .ok_or_else(|| anyhow!("missing `cogp` key-value metadata"))?;
     let cogp_meta: CogpMeta = serde_json::from_str(cogp_str)
         .map_err(|e| anyhow!("`cogp` metadata is not valid JSON: {e}"))?;
-    let major = cogp_meta
-        .version
-        .split('.')
-        .next()
-        .and_then(|value| value.parse::<u32>().ok());
-    if major != Some(1) {
+    let version = parse_cogp_version(&cogp_meta.version);
+    if !matches!(version, Some((0, _, _))) {
         return Err(anyhow!(
-            "unsupported cogp version `{}`; this reader implements 1.x",
+            "unsupported cogp version `{}`; expected MAJOR.MINOR.PATCH with major 0",
             cogp_meta.version
         ));
     }
