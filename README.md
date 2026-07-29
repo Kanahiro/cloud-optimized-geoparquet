@@ -67,7 +67,7 @@ https://github.com/user-attachments/assets/10d0390c-95ab-45e5-8503-6cbdbb015c93
 
 https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
 
-### Example: streaming from Cloudflare R2 to browser [demo page](https://kanahiro.github.io/cogp-js/)
+### Example: streaming from Cloudflare R2 to browser [demo page](https://kanahiro.github.io/cloud-optimized-geoparquet/)
 
 https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 

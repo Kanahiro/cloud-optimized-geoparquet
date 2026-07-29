@@ -6,6 +6,8 @@ It reads COGP metadata and Parquet row-group statistics, selects the row-group p
 a target ground resolution, and resolves an exact or nearest-finer rendering LOD when one
 is available.
 
+[Open the browser demo](https://kanahiro.github.io/cloud-optimized-geoparquet/).
+
 ## Development
 
 ```sh
