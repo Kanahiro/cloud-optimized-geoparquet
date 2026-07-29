@@ -1,0 +1,5 @@
+*.parquet
+.DS_Store
+target
+
+__pycache__
