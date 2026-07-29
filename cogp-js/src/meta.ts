@@ -55,10 +55,10 @@ export function parseCogpMeta(json: string): CogpMeta {
   if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
     throw new Error('cogp metadata: `levels` must be a non-empty array');
   }
-  const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
-  if (major !== 1) {
+  const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(parsed.version);
+  if (!version || Number(version[1]) !== 0) {
     throw new Error(
-      `cogp metadata: unsupported major version \`${parsed.version}\` (this reader implements 1.x)`,
+      `cogp metadata: unsupported version \`${parsed.version}\` (expected MAJOR.MINOR.PATCH with major 0)`,
     );
   }
   if (

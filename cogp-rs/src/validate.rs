@@ -5,7 +5,7 @@ use parquet::file::statistics::Statistics;
 use std::fs::File;
 use std::path::Path;
 
-use crate::meta::lod_level_index;
+use crate::meta::{lod_level_index, parse_cogp_version};
 
 use crate::meta::{CogpMeta, GeoMeta, COGP_METADATA_KEY, GEO_METADATA_KEY};
 
@@ -53,7 +53,7 @@ pub fn run(path: &Path) -> Result<()> {
     };
     if !geo.version.starts_with("1.") {
         warnings.push(format!(
-            "GeoParquet version is `{}`; COGP v1.0 targets 1.1.x",
+            "GeoParquet version is `{}`; COGP v0.1 targets 1.1.x",
             geo.version
         ));
     }
@@ -98,15 +98,9 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
 
-    let major: u32 = cogp
-        .version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if major != 1 {
+    if !matches!(parse_cogp_version(&cogp.version), Some((0, _, _))) {
         errors.push(format!(
-            "unsupported cogp major version `{}`; this validator implements 1.x",
+            "unsupported cogp version `{}`; expected MAJOR.MINOR.PATCH with major 0",
             cogp.version
         ));
     }
@@ -297,7 +291,7 @@ pub fn run(path: &Path) -> Result<()> {
 
 fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     if errors.is_empty() {
-        println!("OK: {} conforms to COGP v1.0", path.display());
+        println!("OK: {} conforms to COGP v0.1", path.display());
     } else {
         println!("FAIL: {} ({} error(s))", path.display(), errors.len());
     }

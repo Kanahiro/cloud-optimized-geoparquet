@@ -137,7 +137,7 @@ The output file:
   selected by `--lod-interval`;
 - omits the sidecar for Point/MultiPoint-only files, whose readers use the
   primary geometry WKB;
-- writes `cogp` v1.0 metadata listing `row_group_end`, `resolution`, and
+- writes `cogp` v0.1 metadata listing `row_group_end`, `resolution`, and
   `lods_column` when a sidecar is present.
 
 `lods_column` is optional for every geometry type. This converter emits it when

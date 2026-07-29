@@ -3,8 +3,22 @@ use std::collections::BTreeMap;
 
 pub const COGP_METADATA_KEY: &str = "cogp";
 pub const GEO_METADATA_KEY: &str = "geo";
-pub const COGP_VERSION: &str = "1.0.0";
+pub const COGP_VERSION: &str = "0.1.0";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
+
+/// Parse the profile's required `MAJOR.MINOR.PATCH` version shape.
+///
+/// Keeping this strict avoids accidentally accepting values such as `0.1`
+/// or `0.x.0` when checking reader compatibility.
+pub(crate) fn parse_cogp_version(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    (parts.next().is_none()).then_some(parsed)
+}
 
 /// Parse the COGP rendering-sidecar child naming contract.
 ///
@@ -167,9 +181,10 @@ mod tests {
         assert_eq!(GEOPARQUET_VERSION, "1.1.0");
         assert_eq!(COGP_METADATA_KEY, "cogp");
         assert_eq!(GEO_METADATA_KEY, "geo");
-        // COGP_VERSION must be SemVer-like; major must parse.
-        let major: u32 = COGP_VERSION.split('.').next().unwrap().parse().unwrap();
-        assert_eq!(major, 1);
+        assert_eq!(COGP_VERSION, "0.1.0");
+        assert_eq!(parse_cogp_version(COGP_VERSION), Some((0, 1, 0)));
+        assert_eq!(parse_cogp_version("0.1"), None);
+        assert_eq!(parse_cogp_version("0.x.0"), None);
     }
 
     #[test]

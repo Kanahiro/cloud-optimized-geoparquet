@@ -6,10 +6,10 @@ import { parquetWriteBuffer } from 'hyparquet-writer';
 
 import { CogpReader, parseCogpMeta, selectLevelByResolution } from '../dist/index.js';
 
-test('COGP 1 metadata and resolution selection', () => {
+test('COGP 0.1 metadata and resolution selection', () => {
   const metadata = parseCogpMeta(
     JSON.stringify({
-      version: '1.0.0',
+      version: '0.1.0',
       lods_column: 'geometry_lods',
       levels: [
         { row_group_end: 0, resolution: 1000 },
@@ -21,8 +21,18 @@ test('COGP 1 metadata and resolution selection', () => {
   assert.equal(selectLevelByResolution(metadata.levels, 500), 0);
   assert.equal(selectLevelByResolution(metadata.levels, 50), 1);
   assert.throws(
-    () => parseCogpMeta('{"version":"0.1.0","levels":[{"row_group_end":0,"gsd":1}]}'),
-    /unsupported major version/,
+    () =>
+      parseCogpMeta(
+        '{"version":"1.0.0","levels":[{"row_group_end":0,"resolution":1}]}',
+      ),
+    /unsupported version/,
+  );
+  assert.throws(
+    () =>
+      parseCogpMeta(
+        '{"version":"0.x.0","levels":[{"row_group_end":0,"resolution":1}]}',
+      ),
+    /unsupported version/,
   );
 });
 
@@ -127,7 +137,7 @@ function makeCogp({ storedLodLevels = [0, 2] } = {}) {
     },
   };
   const cogp = {
-    version: '1.0.0',
+    version: '0.1.0',
     lods_column: 'geometry_lods',
     levels: [
       { row_group_end: 0, resolution: 1000 },
