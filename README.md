@@ -97,7 +97,10 @@ See [`SPEC.md`](./SPEC.md) for the normative specification.
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
 - [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
 
-The reference implementation and CLI live in [`cogp-rs/`](./cogp-rs/).
+Reference implementations live in this repository:
+
+- [`cogp-rs/`](./cogp-rs/) — Rust producer, reader, validator, and CLI;
+- [`cogp-js/`](./cogp-js/) — TypeScript reader and browser demo.
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
 
