@@ -110,4 +110,9 @@ COGP v0.1 is a draft. Feedback, issues, and discussion are welcome via GitHub Is
 
 ## License
 
-This specification is licensed under [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). See [`LICENSE`](./LICENSE) for details.
+- The COGP specification is licensed under [Creative Commons Attribution 4.0
+  International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+  See [`LICENSE`](./LICENSE).
+- The Rust and TypeScript libraries are licensed under the MIT License. See
+  [`cogp-rs/LICENSE`](./cogp-rs/LICENSE) and
+  [`cogp-js/LICENSE`](./cogp-js/LICENSE).
