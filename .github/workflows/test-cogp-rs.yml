@@ -1,0 +1,42 @@
+name: Test cogp-rs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cogp-rs/**"
+      - "SPEC.md"
+      - ".github/workflows/test-cogp-rs.yml"
+  pull_request:
+    paths:
+      - "cogp-rs/**"
+      - "SPEC.md"
+      - ".github/workflows/test-cogp-rs.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: cogp-rs
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cogp-rs -> target
+      - name: cargo clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --all-features

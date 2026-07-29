@@ -1,0 +1,55 @@
+name: Deploy cogp-js demo to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cogp-js/**"
+      - ".github/workflows/deploy-cogp-js-demo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            cogp-js/package-lock.json
+            cogp-js/demo/package-lock.json
+      - name: Build cogp-js
+        working-directory: cogp-js
+        run: |
+          npm ci
+          npm run build
+      - name: Build demo
+        working-directory: cogp-js/demo
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: cogp-js/demo/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

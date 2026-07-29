@@ -1,0 +1,44 @@
+name: Test cogp-js
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cogp-js/**"
+      - "SPEC.md"
+      - ".github/workflows/test-cogp-js.yml"
+  pull_request:
+    paths:
+      - "cogp-js/**"
+      - "SPEC.md"
+      - ".github/workflows/test-cogp-js.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: cogp-js
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            cogp-js/package-lock.json
+            cogp-js/demo/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Test
+        run: npm test
+      - name: Install demo dependencies
+        working-directory: cogp-js/demo
+        run: npm ci
+      - name: Build demo
+        working-directory: cogp-js/demo
+        run: npm run build
