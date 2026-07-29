@@ -24,3 +24,7 @@ npm run build
 ```
 
 Generated `dist/` directories, `node_modules/`, and local Parquet files are not tracked.
+
+## License
+
+Licensed under the [MIT License](./LICENSE).

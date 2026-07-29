@@ -327,3 +327,7 @@ tools/bench_cogp.py \
 
 Use `--reuse-outputs` with `--baseline-output` / `--candidate-output` to
 reanalyze existing converted files without rerunning `convert`.
+
+## License
+
+Licensed under the [MIT License](./LICENSE).
