@@ -101,6 +101,8 @@ where `<primary_column>` is the value of the GeoParquet `primary_column` field.
 
 Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
 
+For each row group, each of these bounding box columns SHOULD have a Parquet `ColumnIndex` containing page-level min/max statistics and a corresponding `OffsetIndex`, so that readers can perform spatial pruning at page granularity.
+
 For COGP v0.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
 
 ### 5.2 Physical ordering
@@ -231,9 +233,10 @@ Two reading styles are both valid:
 
 Implementations typically fetch the Parquet footer to obtain `cogp` metadata and per-row-group statistics, then issue HTTP range requests for the row groups in `0..row_group_end` — in parallel or in order, with rendering either streamed or deferred to completion.
 
-For viewport-driven applications, two complementary spatial filters apply within the selected prefix:
+For viewport-driven applications, three complementary spatial filters can apply within the selected prefix:
 
 * **Row group pruning.** Using per-row-group min/max statistics of the bbox covering columns (Section 5.1), row groups whose bbox does not intersect the viewport can be skipped, avoiding the range request entirely.
+* **Page pruning.** When the recommended Parquet page indexes described in Section 5.1 are present, readers are encouraged to use them to skip non-intersecting data pages within candidate row groups. Page indexes are an optional optimization for readers; readers must remain correct when they are absent.
 * **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
 
 If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
