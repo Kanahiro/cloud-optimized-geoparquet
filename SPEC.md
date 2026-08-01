@@ -3,6 +3,7 @@ title: Cloud Optimized GeoParquet Profile (COGP)
 version: "0.1.0"
 status: Draft
 scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
+license: CC BY 4.0
 ---
 
 # Cloud Optimized GeoParquet Profile (COGP)
@@ -263,3 +264,9 @@ This profile does not define:
 * topology preservation guarantees;
 * standalone prefix-Parquet semantics;
 * SQL query semantics.
+
+## License
+
+This specification is licensed under [Creative Commons Attribution 4.0
+International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+See [`LICENSE-SPEC`](./LICENSE-SPEC) for the full license text.

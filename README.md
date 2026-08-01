@@ -105,4 +105,8 @@ COGP v0.1 is an early draft. Feedback, issues, and discussion are welcome via Gi
 
 ## License
 
-This specification is licensed under [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). See [`LICENSE`](./LICENSE) for details.
+The contents of [`SPEC.md`](./SPEC.md) are licensed under [Creative Commons
+Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+See [`LICENSE-SPEC`](./LICENSE-SPEC) for details.
+
+The source code in this repository is licensed under the [MIT License](./LICENSE).
