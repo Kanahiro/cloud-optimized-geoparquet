@@ -12,7 +12,6 @@ import {
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
-import { LruCache } from './cache.js';
 import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
@@ -27,17 +26,7 @@ export type BboxInput = Bbox | readonly [number, number, number, number];
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
-  /**
-   * Maximum total rows held in the per-row-group LRU cache. The cache keys
-   * by row-group index + projected columns, so repeat reads of the same
-   * area skip parquet decode. When a read would push the cache past this,
-   * the least-recently-used row groups are evicted. Defaults to 100,000;
-   * set to 0 to disable caching entirely.
-   */
-  cacheMaxRows?: number;
 }
-
-const DEFAULT_CACHE_MAX_ROWS = 100_000;
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
@@ -103,7 +92,7 @@ export class CogpReader {
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     const file = await asyncBufferFromUrl(fetchOpts as { url: string });
-    return CogpReader.fromAsyncBuffer(file, url, opts);
+    return CogpReader.fromAsyncBuffer(file, url);
   }
 
   /**
@@ -115,10 +104,9 @@ export class CogpReader {
   static async fromAsyncBuffer(
     file: { byteLength: number; slice: (start: number, end?: number) => unknown },
     url: string,
-    opts: OpenOptions = {},
   ): Promise<CogpReader> {
     const metadata = (await parquetMetadataAsync(file as never)) as unknown as FullFileMetadata;
-    return new CogpReader(file, metadata, url, opts.cacheMaxRows ?? DEFAULT_CACHE_MAX_ROWS);
+    return new CogpReader(file, metadata, url);
   }
 
   readonly cogp: CogpMeta;
@@ -131,20 +119,12 @@ export class CogpReader {
   private readonly bboxPaths: BboxCovering;
   /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
   private readonly geomColumns: readonly string[];
-  /**
-   * Row-group → resolved row records, keyed by `${rgIndex}|${columnsKey}`.
-   * Promise-valued so concurrent reads of the same row group share one
-   * underlying fetch (single-flight).
-   */
-  private readonly rowGroupCache: LruCache<Promise<Record<string, unknown>[]>>;
 
   private constructor(
     private readonly file: unknown,
     readonly metadata: FullFileMetadata,
     readonly url: string,
-    cacheMaxRows: number,
   ) {
-    this.rowGroupCache = new LruCache(cacheMaxRows);
     const doc = extractCogpDocument(metadata.key_value_metadata);
     this.cogp = doc.cogp;
     this.geo = doc.geo;
@@ -242,11 +222,6 @@ export class CogpReader {
     // caller asked for a small output budget — that's what crashes the
     // downstream renderer).
     //
-    // The returned row is a shallow clone so decoding doesn't mutate the
-    // cached row. Without the clone, a second read of the same row group
-    // would see already-decoded geometries, `byteLength` would report 0
-    // for those columns, and the cap would silently expand on every
-    // repeat read.
     const acceptRow = (row: Record<string, unknown>): boolean => {
       if (maxRowWkbBytes !== undefined) {
         let rowWkbBytes = 0;
@@ -257,17 +232,16 @@ export class CogpReader {
         if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
         wkbBytes += rowWkbBytes;
       }
-      const outRow: Record<string, unknown> = { ...row };
       for (const col of geomCols) {
-        const v = outRow[col];
-        if (v instanceof Uint8Array) outRow[col] = decodeWkb(v);
+        const v = row[col];
+        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
       }
-      out.push(outRow);
+      out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRowGroups(rgs, columns, bbox)) {
+    for await (const batch of this.streamRuns(rgs, columns, bbox)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -321,78 +295,21 @@ export class CogpReader {
     return out;
   }
 
-  /** Drop all cached row-group data; subsequent reads will re-fetch. */
-  clearCache(): void {
-    this.rowGroupCache.clear();
-  }
-
   /**
-   * Materialize the requested row groups and yield one row group's rows per
-   * iteration, in the order given. Callers that filter per-row (e.g. bbox)
-   * can keep only the survivors and let each batch be GC'd, so peak memory
-   * is bounded by `(largest pending fetch) + (accumulated survivors)` rather
-   * than the sum of every selected row group's full row count.
-   *
-   * Cache hits skip the fetch entirely. Misses are grouped into consecutive
-   * runs so hyparquet can pull their column chunks together (one
-   * `parquetReadObjects` call per run, capped at `RUN_MAX_ROWS` cumulative
-   * rows). All runs are dispatched upfront so their fetches fly in
-   * parallel; each row group's slice promise is registered in the cache
-   * the moment its run is dispatched, so concurrent reads share the same
-   * in-flight fetch.
+   * Materialize consecutive row-group runs in order. Each run is capped at
+   * `RUN_MAX_ROWS`, bounding peak memory while allowing hyparquet to combine
+   * adjacent column-chunk reads. Byte-range reuse is delegated to the HTTP
+   * cache instead of retaining decoded row objects in the JS heap.
    */
-  private async *streamRowGroups(
+  private async *streamRuns(
     rgIndices: number[],
     columns: string[] | undefined,
     bbox?: Bbox,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
-    // A bbox filter is query-specific, so it deliberately bypasses the
-    // row-group cache (whose entries are complete, reusable row groups).
-    // hyparquet uses the same predicate for row-group, page-index, and exact
-    // row filtering. Keeping that knowledge in one filter prevents the three
-    // pruning layers from drifting apart.
-    if (bbox) {
-      const filter = bboxFilter(this.bboxPaths, bbox);
-      for (const run of this.coalescedRuns(rgIndices)) {
-        const startRg = run[0]!;
-        const endRg = run[run.length - 1]!;
-        const rowStart = this.rowOffsets[startRg]!;
-        const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
-        const readArgs: Record<string, unknown> = {
-          file: this.file,
-          metadata: this.metadata,
-          rowStart,
-          rowEnd,
-          columns,
-          filter,
-          usePageIndex: true,
-          compressors,
-          parsers: LAZY_GEO_PARSERS,
-        };
-        if (!columns) delete readArgs['columns'];
-        yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
-      }
-      return;
-    }
-
-    // Different `columns` selections produce structurally different rows, so
-    // they get distinct cache entries. `*` marks "no projection".
-    const columnsKey = columns ? columns.slice().sort().join(',') : '*';
-    const cacheKey = (rg: number) => `${rg}|${columnsKey}`;
-
-    const promises = new Map<number, Promise<Record<string, unknown>[]>>();
-    const missing: number[] = [];
-    for (const rg of rgIndices) {
-      const p = this.rowGroupCache.get(cacheKey(rg));
-      if (p) promises.set(rg, p);
-      else missing.push(rg);
-    }
-
-    const runs = this.coalescedRuns(missing);
-
-    for (const run of runs) {
+    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    for (const run of this.coalescedRuns(rgIndices)) {
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
       const rowStart = this.rowOffsets[startRg]!;
@@ -402,6 +319,7 @@ export class CogpReader {
         metadata: this.metadata,
         rowStart,
         rowEnd,
+        filter,
         // Page-index pushdown is opt-in in hyparquet. It is a no-op without
         // a filter and falls back safely when indexes are unavailable.
         usePageIndex: true,
@@ -409,23 +327,8 @@ export class CogpReader {
         parsers: LAZY_GEO_PARSERS,
       };
       if (columns) readArgs['columns'] = columns;
-      const runPromise = parquetReadObjects(readArgs as never) as Promise<
-        Record<string, unknown>[]
-      >;
-      let offset = 0;
-      for (const r of run) {
-        const start = offset;
-        const n = Number(this.metadata.row_groups[r]?.num_rows ?? 0);
-        offset += n;
-        const end = offset;
-        const slicePromise = runPromise.then((rows) => rows.slice(start, end));
-        this.rowGroupCache.set(cacheKey(r), slicePromise, n);
-        promises.set(r, slicePromise);
-      }
-    }
-
-    for (const rg of rgIndices) {
-      yield await promises.get(rg)!;
+      if (!filter) delete readArgs['filter'];
+      yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
     }
   }
 
