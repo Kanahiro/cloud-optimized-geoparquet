@@ -1,0 +1,6 @@
+packages:
+  - cogp-js
+  - cogp-js/demo
+
+allowBuilds:
+  esbuild: true

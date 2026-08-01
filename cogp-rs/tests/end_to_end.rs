@@ -17,6 +17,7 @@ use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
 use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
+use parquet::file::page_index::index::Index;
 
 /// Little-endian WKB encoder for the geometry kinds we use in the fixture.
 mod wkb {
@@ -186,6 +187,29 @@ fn convert_reader_validate_pipeline() {
     }
     let total_rgs = reader.num_row_groups();
     assert_eq!(cogp.levels.last().unwrap().row_group_end as usize + 1, total_rgs);
+
+    // Converter output carries readable page statistics for every column.
+    let metadata = reader.parquet_metadata();
+    let column_indexes = metadata.column_index().expect("column indexes");
+    assert!(metadata.offset_index().is_some(), "offset indexes");
+    assert!(column_indexes.iter().all(|row_group| row_group
+        .iter()
+        .all(|column| !matches!(column, Index::NONE))));
+
+    // In particular, all four covering leaves must be typed Double indexes.
+    let schema = metadata.file_metadata().schema_descr();
+    for child in ["xmin", "ymin", "xmax", "ymax"] {
+        let path = format!("bbox.{child}");
+        let column = (0..schema.num_columns())
+            .find(|&i| schema.column(i).path().string() == path)
+            .unwrap();
+        assert!(
+            column_indexes
+                .iter()
+                .all(|row_group| matches!(row_group[column], Index::DOUBLE(_))),
+            "missing page statistics for {path}"
+        );
+    }
 
     // Selector contracts.
     assert!(reader.row_groups_in_level(reader.levels().len()).is_none());

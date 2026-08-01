@@ -211,8 +211,9 @@ export class CogpReader {
    * rows that miss the query never pay for it.
    *
    * Bbox pruning runs at two levels: row groups whose covering envelope
-   * misses the query are skipped entirely (no I/O), then surviving groups
-   * are filtered row-by-row against each row's per-feature bbox column.
+   * misses the query are skipped entirely (no I/O), then Parquet page indexes
+   * prune page ranges inside surviving groups. The remaining rows are filtered
+   * exactly against each row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
@@ -266,7 +267,7 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRowGroups(rgs, columns)) {
+    for await (const batch of this.streamRowGroups(rgs, columns, bbox)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -343,8 +344,38 @@ export class CogpReader {
   private async *streamRowGroups(
     rgIndices: number[],
     columns: string[] | undefined,
+    bbox?: Bbox,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
+
+    // A bbox filter is query-specific, so it deliberately bypasses the
+    // row-group cache (whose entries are complete, reusable row groups).
+    // hyparquet uses the same predicate for row-group, page-index, and exact
+    // row filtering. Keeping that knowledge in one filter prevents the three
+    // pruning layers from drifting apart.
+    if (bbox) {
+      const filter = bboxFilter(this.bboxPaths, bbox);
+      for (const run of this.coalescedRuns(rgIndices)) {
+        const startRg = run[0]!;
+        const endRg = run[run.length - 1]!;
+        const rowStart = this.rowOffsets[startRg]!;
+        const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
+        const readArgs: Record<string, unknown> = {
+          file: this.file,
+          metadata: this.metadata,
+          rowStart,
+          rowEnd,
+          columns,
+          filter,
+          usePageIndex: true,
+          compressors,
+          parsers: LAZY_GEO_PARSERS,
+        };
+        if (!columns) delete readArgs['columns'];
+        yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+      }
+      return;
+    }
 
     // Different `columns` selections produce structurally different rows, so
     // they get distinct cache entries. `*` marks "no projection".
@@ -359,26 +390,7 @@ export class CogpReader {
       else missing.push(rg);
     }
 
-    const runs: Array<number[]> = [];
-    {
-      let i = 0;
-      while (i < missing.length) {
-        const run: number[] = [missing[i]!];
-        let acc = Number(this.metadata.row_groups[missing[i]!]?.num_rows ?? 0);
-        let j = i + 1;
-        while (
-          j < missing.length &&
-          missing[j]! === missing[j - 1]! + 1 &&
-          acc < RUN_MAX_ROWS
-        ) {
-          run.push(missing[j]!);
-          acc += Number(this.metadata.row_groups[missing[j]!]?.num_rows ?? 0);
-          j++;
-        }
-        runs.push(run);
-        i = j;
-      }
-    }
+    const runs = this.coalescedRuns(missing);
 
     for (const run of runs) {
       const startRg = run[0]!;
@@ -390,6 +402,9 @@ export class CogpReader {
         metadata: this.metadata,
         rowStart,
         rowEnd,
+        // Page-index pushdown is opt-in in hyparquet. It is a no-op without
+        // a filter and falls back safely when indexes are unavailable.
+        usePageIndex: true,
         compressors,
         parsers: LAZY_GEO_PARSERS,
       };
@@ -414,6 +429,24 @@ export class CogpReader {
     }
   }
 
+  private coalescedRuns(indices: number[]): Array<number[]> {
+    const runs: Array<number[]> = [];
+    let i = 0;
+    while (i < indices.length) {
+      const run: number[] = [indices[i]!];
+      let acc = Number(this.metadata.row_groups[indices[i]!]?.num_rows ?? 0);
+      let j = i + 1;
+      while (j < indices.length && indices[j]! === indices[j - 1]! + 1 && acc < RUN_MAX_ROWS) {
+        run.push(indices[j]!);
+        acc += Number(this.metadata.row_groups[indices[j]!]?.num_rows ?? 0);
+        j++;
+      }
+      runs.push(run);
+      i = j;
+    }
+    return runs;
+  }
+
   private sumRowsInRange(start: number, end: number): number {
     let n = 0;
     for (let i = start; i <= end; i++) {
@@ -422,6 +455,17 @@ export class CogpReader {
     return n;
   }
 
+}
+
+function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
+  return {
+    $and: [
+      { [paths.xmin.join('.')]: { $lte: bbox.maxX } },
+      { [paths.ymin.join('.')]: { $lte: bbox.maxY } },
+      { [paths.xmax.join('.')]: { $gte: bbox.minX } },
+      { [paths.ymax.join('.')]: { $gte: bbox.minY } },
+    ],
+  };
 }
 
 function normalizeBbox(input?: BboxInput): Bbox | undefined {
