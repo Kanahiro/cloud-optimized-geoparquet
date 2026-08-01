@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/10d0390c-95ab-45e5-8503-6cbdbb015c93
 
 https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
 
-### Example: streaming from Cloudflare R2 to browser [demo page](https://kanahiro.github.io/cogp-js/)
+### Example: streaming from Cloudflare R2 to browser [demo page](https://kanahiro.github.io/cloud-optimized-geoparquet/)
 
 https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
@@ -62,12 +62,40 @@ Because COGP does not simplify geometries, datasets dominated by large, complex 
 
 See [`SPEC.md`](./SPEC.md) for the normative specification.
 
+## Implementations
+
+This repository is the source of truth for the specification and its reference
+implementations:
+
+- [`cogp-rs`](./cogp-rs): Rust producer, validator, CLI, and reader library.
+- [`cogp-js`](./cogp-js): TypeScript reader and browser demo.
+
+The implementations remain independently publishable. The repository root owns
+shared dependency locks, CI, releases, and development commands so changes to the
+profile can be tested against both implementations together.
+
+## Development
+
+Install JavaScript dependencies once from the repository root:
+
+```sh
+npm ci
+```
+
+Common checks also run from the root:
+
+```sh
+cargo test --workspace --all-features
+npm run typecheck
+npm run build
+```
+
+See each implementation's README for its public API and focused workflows.
+
 ## Roadmap
 
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
 - [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
-
-> https://github.com/Kanahiro/cogp-rs
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
 

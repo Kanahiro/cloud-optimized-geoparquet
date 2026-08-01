@@ -13,4 +13,8 @@ target/
 .idea/
 *.swp
 
+# Python tooling
+__pycache__/
+
+# Local benchmark and demo data
 *.parquet

@@ -1,0 +1,14 @@
+{
+  "name": "cloud-optimized-geoparquet",
+  "private": true,
+  "workspaces": [
+    "cogp-js",
+    "cogp-js/demo"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspace cogp",
+    "test:rust": "cargo test --workspace --all-features",
+    "lint:rust": "cargo clippy --workspace --all-features --all-targets -- -D warnings"
+  }
+}

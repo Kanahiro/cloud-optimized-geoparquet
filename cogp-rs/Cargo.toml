@@ -1,0 +1,35 @@
+[package]
+name = "cogp"
+version = "0.1.0"
+edition = "2021"
+description = "Reference CLI for the Cloud Optimized GeoParquet Profile (COGP)"
+license = "CC-BY-4.0"
+
+[[bin]]
+name = "cogp"
+path = "src/main.rs"
+
+[dev-dependencies]
+bytes = "1"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+arrow = "56"
+arrow-array = "56"
+arrow-buffer = "56"
+arrow-schema = "56"
+parquet = { version = "56", default-features = false, features = ["arrow", "snap", "zstd", "brotli", "lz4"] }
+byteorder = "1"
+rayon = "1"
+
+[features]
+default = []
+# Async reader path: enables `Reader::try_new_async` and `async_batch_stream` on top
+# of `parquet::arrow::async_reader::AsyncFileReader` — bring your own runtime.
+async = ["parquet/async"]
+# Re-exports `parquet::arrow::async_reader::ParquetObjectReader` for using
+# `object_store` (S3, GCS, HTTP, …) as the remote source.
+object_store = ["async", "parquet/object_store"]

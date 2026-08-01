@@ -1,0 +1,4 @@
+[workspace]
+members = ["cogp-rs"]
+default-members = ["cogp-rs"]
+resolver = "2"
