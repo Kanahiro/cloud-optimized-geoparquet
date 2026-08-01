@@ -1,5 +1,6 @@
 # Node
 node_modules/
+.pnpm-store/
 dist/
 
 # Rust

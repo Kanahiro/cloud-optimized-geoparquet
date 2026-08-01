@@ -9,10 +9,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "cogp": "0.1.0",
+    "cogp": "workspace:*",
     "maplibre-gl": "^4.7.0"
   },
   "devDependencies": {
+    "@types/geojson": "^7946.0.16",
     "typescript": "^5.6.0",
     "vite": "^5.4.0"
   }

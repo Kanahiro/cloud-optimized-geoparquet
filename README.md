@@ -79,15 +79,15 @@ profile can be tested against both implementations together.
 Install JavaScript dependencies once from the repository root:
 
 ```sh
-npm ci
+pnpm install --frozen-lockfile
 ```
 
 Common checks also run from the root:
 
 ```sh
 cargo test --workspace --all-features
-npm run typecheck
-npm run build
+pnpm typecheck
+pnpm build
 ```
 
 See each implementation's README for its public API and focused workflows.
