@@ -14,7 +14,6 @@ permissions:
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'cogp-rs-v')
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
