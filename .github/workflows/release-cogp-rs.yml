@@ -1,0 +1,56 @@
+name: Release cogp-rs binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload assets to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'cogp-rs-v')
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --package cogp --target ${{ matrix.target }}
+      - name: Rename binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/cogp" "dist/cogp-${tag}-${{ matrix.target }}"
+      - name: Rename binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event.release.tag_name }}") { "${{ github.event.release.tag_name }}" } else { "${{ inputs.tag }}" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cogp.exe" "dist/cogp-$tag-${{ matrix.target }}.exe"
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          files: dist/*
