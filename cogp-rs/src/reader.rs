@@ -42,6 +42,9 @@ use parquet::arrow::async_reader::{
 #[cfg(feature = "object_store")]
 pub use parquet::arrow::async_reader::ParquetObjectReader;
 
+#[cfg(feature = "async")]
+pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
+
 use crate::meta::{CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
@@ -52,24 +55,60 @@ pub struct Reader {
     arrow_meta: ArrowReaderMetadata,
     geo_meta: GeoMeta,
     cogp_meta: CogpMeta,
+    use_page_index: bool,
+}
+
+/// Controls optional work performed by [`Reader`].
+///
+/// Page indexes are disabled by default because loading them can add remote
+/// range requests and page pruning is not always a latency win. Enabling the
+/// option loads the column and offset indexes at construction and uses them
+/// for bbox reads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReaderOptions {
+    use_page_index: bool,
+}
+
+impl ReaderOptions {
+    pub fn with_page_index(mut self, enabled: bool) -> Self {
+        self.use_page_index = enabled;
+        self
+    }
+
+    pub fn use_page_index(&self) -> bool {
+        self.use_page_index
+    }
 }
 
 impl Reader {
     /// Open a local file, parse the footer once, then drop the file handle.
     /// Per-request reads supply a fresh `File` (or any [`ChunkReader`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, ReaderOptions::default())
+    }
+
+    /// Open a local file with explicit reader options.
+    pub fn open_with_options(path: impl AsRef<Path>, options: ReaderOptions) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        Self::try_new(file)
+        Self::try_new_with_options(file, options)
     }
 
     /// Parse the footer from any [`ChunkReader`] (e.g. `File`, `bytes::Bytes`).
     /// The reader is consumed for the footer read; it is **not** stored — pass
     /// a fresh reader to [`Self::sync_batch_reader`] per request.
     pub fn try_new<R: ChunkReader + 'static>(reader: R) -> Result<Self> {
-        let options = ArrowReaderOptions::new().with_page_index(true);
-        let arrow_meta = ArrowReaderMetadata::load(&reader, options)?;
-        Self::from_arrow_metadata(arrow_meta)
+        Self::try_new_with_options(reader, ReaderOptions::default())
+    }
+
+    /// Parse the footer with explicit reader options.
+    pub fn try_new_with_options<R: ChunkReader + 'static>(
+        reader: R,
+        options: ReaderOptions,
+    ) -> Result<Self> {
+        let arrow_options = ArrowReaderOptions::new().with_page_index(options.use_page_index);
+        let arrow_meta = ArrowReaderMetadata::load(&reader, arrow_options)?;
+        Self::from_arrow_metadata_with_options(arrow_meta, options)
     }
 
     /// Parse the footer from an [`AsyncFileReader`] (e.g. an `object_store`
@@ -79,21 +118,60 @@ impl Reader {
     /// stream consumes the reader by value.
     #[cfg(feature = "async")]
     pub async fn try_new_async<R: AsyncFileReader>(reader: &mut R) -> Result<Self> {
-        let options = ArrowReaderOptions::new().with_page_index(true);
-        let arrow_meta = ArrowReaderMetadata::load_async(reader, options).await?;
-        Self::from_arrow_metadata(arrow_meta)
+        Self::try_new_async_with_options(reader, ReaderOptions::default()).await
+    }
+
+    /// Parse async metadata with explicit reader options.
+    ///
+    /// For [`ParquetObjectReader`], prefer [`Self::try_new_object_store`]: the
+    /// upstream object-store adapter has separate preload switches that must
+    /// be set before metadata is fetched.
+    #[cfg(feature = "async")]
+    pub async fn try_new_async_with_options<R: AsyncFileReader>(
+        reader: &mut R,
+        options: ReaderOptions,
+    ) -> Result<Self> {
+        let arrow_options = ArrowReaderOptions::new().with_page_index(options.use_page_index);
+        let arrow_meta = ArrowReaderMetadata::load_async(reader, arrow_options).await?;
+        Self::from_arrow_metadata_with_options(arrow_meta, options)
+    }
+
+    /// Parse metadata from object storage while applying the Page Index
+    /// option to both the transport preload and bbox page pruning.
+    #[cfg(feature = "object_store")]
+    pub async fn try_new_object_store(
+        reader: ParquetObjectReader,
+        options: ReaderOptions,
+    ) -> Result<Self> {
+        let mut reader = reader
+            .with_preload_column_index(options.use_page_index)
+            .with_preload_offset_index(options.use_page_index);
+        Self::try_new_async_with_options(&mut reader, options).await
     }
 
     /// Build from an already-parsed [`ArrowReaderMetadata`]. Useful when the
     /// caller has its own footer cache (e.g. a CDN / Redis layer in front of
     /// S3) and wants to skip even the initial range request.
     pub fn from_arrow_metadata(arrow_meta: ArrowReaderMetadata) -> Result<Self> {
+        Self::from_arrow_metadata_with_options(arrow_meta, ReaderOptions::default())
+    }
+
+    /// Build from already-parsed metadata with explicit reader options.
+    pub fn from_arrow_metadata_with_options(
+        arrow_meta: ArrowReaderMetadata,
+        options: ReaderOptions,
+    ) -> Result<Self> {
         let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata())?;
         Ok(Self {
             arrow_meta,
             geo_meta,
             cogp_meta,
+            use_page_index: options.use_page_index,
         })
+    }
+
+    pub fn uses_page_index(&self) -> bool {
+        self.use_page_index
     }
 
     pub fn arrow_metadata(&self) -> &ArrowReaderMetadata {
@@ -155,11 +233,7 @@ impl Reader {
     /// resolution (e.g. screen meters/pixel) and want every level that's
     /// still useful at that scale, plus all coarser overviews.
     pub fn row_groups_up_to_gsd(&self, min_gsd: f64) -> Range<usize> {
-        let last = self
-            .cogp_meta
-            .levels
-            .iter()
-            .rposition(|l| l.gsd >= min_gsd);
+        let last = self.cogp_meta.levels.iter().rposition(|l| l.gsd >= min_gsd);
         match last {
             Some(i) => 0..(self.cogp_meta.levels[i].row_group_end + 1) as usize,
             None => 0..0,
@@ -310,7 +384,8 @@ impl Reader {
         selection_from_bitmap(&keep)
     }
 
-    /// Build a sync reader with row-group and page-level bbox pruning.
+    /// Build a sync reader with row-group bbox pruning and, when enabled at
+    /// construction, page-level bbox pruning.
     pub fn sync_batch_reader_with_bbox<R: ChunkReader + 'static>(
         &self,
         reader: R,
@@ -318,13 +393,15 @@ impl Reader {
         bbox: [f64; 4],
     ) -> Result<ParquetRecordBatchReader> {
         let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let selection = self.row_selection_intersecting_bbox(&row_groups, bbox);
         let builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        Ok(builder
-            .with_row_groups(row_groups)
-            .with_row_selection(selection)
-            .build()?)
+        let builder = builder.with_row_groups(row_groups.clone());
+        let builder = if self.use_page_index {
+            builder.with_row_selection(self.row_selection_intersecting_bbox(&row_groups, bbox))
+        } else {
+            builder
+        };
+        Ok(builder.build()?)
     }
 
     /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
@@ -355,7 +432,8 @@ impl Reader {
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
 
-    /// Build an async stream with row-group and page-level bbox pruning.
+    /// Build an async stream with row-group bbox pruning and, when enabled at
+    /// construction, page-level bbox pruning.
     #[cfg(feature = "async")]
     pub fn async_batch_stream_with_bbox<R: AsyncFileReader + Send + 'static>(
         &self,
@@ -364,13 +442,15 @@ impl Reader {
         bbox: [f64; 4],
     ) -> Result<ParquetRecordBatchStream<R>> {
         let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let selection = self.row_selection_intersecting_bbox(&row_groups, bbox);
         let builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        Ok(builder
-            .with_row_groups(row_groups)
-            .with_row_selection(selection)
-            .build()?)
+        let builder = builder.with_row_groups(row_groups.clone());
+        let builder = if self.use_page_index {
+            builder.with_row_selection(self.row_selection_intersecting_bbox(&row_groups, bbox))
+        } else {
+            builder
+        };
+        Ok(builder.build()?)
     }
 
     fn bbox_column_indexes(&self) -> Option<(usize, usize, usize, usize)> {
@@ -663,7 +743,23 @@ mod tests {
         }
 
         let bytes = bytes::Bytes::from(buf);
-        let reader = Reader::try_new(bytes.clone()).unwrap();
+
+        let default_reader = Reader::try_new(bytes.clone()).unwrap();
+        assert!(!default_reader.uses_page_index());
+        assert!(default_reader.parquet_metadata().column_index().is_none());
+        let default_rows = default_reader
+            .sync_batch_reader_with_bbox(bytes.clone(), &[0], [9.0, 9.0, 12.0, 12.0])
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(default_rows, 6);
+
+        let reader = Reader::try_new_with_options(
+            bytes.clone(),
+            ReaderOptions::default().with_page_index(true),
+        )
+        .unwrap();
+        assert!(reader.uses_page_index());
         assert!(reader.parquet_metadata().column_index().is_some());
         let batches: Vec<_> = reader
             .sync_batch_reader_with_bbox(bytes.clone(), &[0], [9.0, 9.0, 12.0, 12.0])
@@ -676,11 +772,7 @@ mod tests {
         );
 
         let outside = reader
-            .sync_batch_reader_with_bbox(
-                bytes,
-                &[0],
-                [100.0, 100.0, 101.0, 101.0],
-            )
+            .sync_batch_reader_with_bbox(bytes, &[0], [100.0, 100.0, 101.0, 101.0])
             .unwrap()
             .map(|batch| batch.unwrap().num_rows())
             .sum::<usize>();

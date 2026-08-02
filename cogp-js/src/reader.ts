@@ -12,6 +12,10 @@ import {
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
+import {
+  coalescingAsyncBuffer,
+  type RangeCoalescingOptions,
+} from './coalescing-buffer.js';
 import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
@@ -26,6 +30,8 @@ export type BboxInput = Bbox | readonly [number, number, number, number];
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
+  /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
+  rangeCoalescing?: RangeCoalescingOptions | false;
 }
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
@@ -84,6 +90,8 @@ export interface ReadOptions {
    * etc.) are not measured.
    */
   maxRowWkbBytes?: number;
+  /** Use Parquet page indexes for bbox pushdown; defaults to false. */
+  usePageIndex?: boolean;
 }
 
 export class CogpReader {
@@ -91,7 +99,10 @@ export class CogpReader {
     const fetchOpts: Record<string, unknown> = { url };
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
-    const file = await asyncBufferFromUrl(fetchOpts as { url: string });
+    const source = await asyncBufferFromUrl(fetchOpts as { url: string });
+    const file = opts.rangeCoalescing === false
+      ? source
+      : coalescingAsyncBuffer(source, opts.rangeCoalescing);
     return CogpReader.fromAsyncBuffer(file, url);
   }
 
@@ -191,9 +202,10 @@ export class CogpReader {
    * rows that miss the query never pay for it.
    *
    * Bbox pruning runs at two levels: row groups whose covering envelope
-   * misses the query are skipped entirely (no I/O), then Parquet page indexes
-   * prune page ranges inside surviving groups. The remaining rows are filtered
-   * exactly against each row's per-feature bbox column.
+   * misses the query are skipped entirely (no I/O). When `usePageIndex` is
+   * enabled, Parquet page indexes additionally prune page ranges inside
+   * surviving groups. The remaining rows are filtered exactly against each
+   * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
@@ -241,7 +253,7 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns, bbox)) {
+    for await (const batch of this.streamRuns(rgs, columns, bbox, opts.usePageIndex ?? false)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -305,6 +317,7 @@ export class CogpReader {
     rgIndices: number[],
     columns: string[] | undefined,
     bbox?: Bbox,
+    usePageIndex = false,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
@@ -322,7 +335,7 @@ export class CogpReader {
         filter,
         // Page-index pushdown is opt-in in hyparquet. It is a no-op without
         // a filter and falls back safely when indexes are unavailable.
-        usePageIndex: true,
+        usePageIndex,
         compressors,
         parsers: LAZY_GEO_PARSERS,
       };

@@ -4,6 +4,7 @@ export type {
   OpenOptions,
   ReadOptions,
 } from './reader.js';
+export type { RangeCoalescingOptions } from './coalescing-buffer.js';
 
 export {
   COGP_METADATA_KEY,
