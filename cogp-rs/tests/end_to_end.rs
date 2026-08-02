@@ -14,7 +14,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
-use cogp::reader::Reader;
+use cogp::reader::{Reader, ReaderOptions};
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
 use parquet::file::page_index::index::Index;
@@ -139,13 +139,12 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
+        page_size: 2,
         row_group_max_bytes: None,
         input_units: InputUnits::Degrees,
         geometry_column: None,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
-        line_thinning_factor: 2,
-        polygon_thinning_factor: 1,
         line_visibility_factor: 2,
         polygon_visibility_factor: 4,
         sort_key: None,
@@ -165,7 +164,16 @@ fn convert_reader_validate_pipeline() {
     // The validator must accept the output.
     cogp::validate::run(&output).unwrap();
 
-    let reader = Reader::open(&output).unwrap();
+    let default_reader = Reader::open(&output).unwrap();
+    assert!(!default_reader.uses_page_index());
+    assert!(default_reader.parquet_metadata().column_index().is_none());
+
+    let reader = Reader::open_with_options(
+        &output,
+        ReaderOptions::default().with_page_index(true),
+    )
+    .unwrap();
+    assert!(reader.uses_page_index());
     assert!(!reader.levels().is_empty(), "must emit at least one level");
     assert_eq!(reader.primary_column(), "geometry");
 
@@ -191,7 +199,7 @@ fn convert_reader_validate_pipeline() {
     // Converter output carries readable page statistics for every column.
     let metadata = reader.parquet_metadata();
     let column_indexes = metadata.column_index().expect("column indexes");
-    assert!(metadata.offset_index().is_some(), "offset indexes");
+    let offset_indexes = metadata.offset_index().expect("offset indexes");
     assert!(column_indexes.iter().all(|row_group| row_group
         .iter()
         .all(|column| !matches!(column, Index::NONE))));
@@ -209,6 +217,22 @@ fn convert_reader_validate_pipeline() {
                 .all(|row_group| matches!(row_group[column], Index::DOUBLE(_))),
             "missing page statistics for {path}"
         );
+        for (rg_i, row_group) in metadata.row_groups().iter().enumerate() {
+            let locations = offset_indexes[rg_i][column].page_locations();
+            assert!(!locations.is_empty(), "missing page offsets for {path}");
+            for (page_i, location) in locations.iter().enumerate() {
+                let start = location.first_row_index as usize;
+                let end = locations
+                    .get(page_i + 1)
+                    .map(|next| next.first_row_index as usize)
+                    .unwrap_or(row_group.num_rows() as usize);
+                assert!(
+                    end - start <= 2,
+                    "{path} page has {} rows, configured maximum is 2",
+                    end - start
+                );
+            }
+        }
     }
 
     // Selector contracts.
@@ -292,6 +316,25 @@ fn convert_rejects_zero_thinning_factor() {
     args.point_thinning_factor = 0;
     let err = cogp::convert::run(args).unwrap_err();
     assert!(format!("{err}").contains("point-thinning-factor"));
+}
+
+#[test]
+fn convert_rejects_invalid_page_layout() {
+    let tmp = TempDir::new("bad-page-layout");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("out.parquet");
+    write_input(&input);
+
+    let mut zero = convert_args(&input, &output);
+    zero.page_size = 0;
+    let err = cogp::convert::run(zero).unwrap_err();
+    assert!(format!("{err}").contains("--page-size must be >= 1"));
+
+    let mut unaligned = convert_args(&input, &output);
+    unaligned.row_group_size = 7;
+    unaligned.page_size = 2;
+    let err = cogp::convert::run(unaligned).unwrap_err();
+    assert!(format!("{err}").contains("integer multiple"));
 }
 
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead
