@@ -7,8 +7,7 @@ use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-    RowSelector,
+    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Compression;
@@ -348,12 +347,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     // Footer parsed once; both streaming passes below reuse it via
-    // `new_with_metadata`, and each pass opens its own file handle. The page
-    // index matters for pass 2: without it a row selection can only skip
-    // whole row groups, so every chunk would decompress all pages of every
-    // row group it touches instead of just the pages holding selected rows.
-    let arrow_meta =
-        ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true))?;
+    // `new_with_metadata`, and each pass opens its own file handle.
+    let arrow_meta = ArrowReaderMetadata::load(&file, Default::default())?;
     drop(file);
 
     let input_schema = arrow_meta.schema().clone();
@@ -536,9 +531,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut props_builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_size(args.row_group_size)
-        // Page statistics produce the column index used for bbox page pruning.
-        // The Parquet writer emits the matching offset index by default.
-        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);

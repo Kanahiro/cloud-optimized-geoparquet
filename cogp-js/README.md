@@ -3,9 +3,9 @@
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
-area and ground sample distance. Bbox reads use covering-column statistics at
-row-group and page-index granularity, then apply an exact per-feature bbox
-filter to the surviving rows.
+area and ground sample distance. Bbox reads use covering-column statistics to
+prune row groups, then apply an exact per-feature bbox filter to the surviving
+rows.
 
 ## Development
 

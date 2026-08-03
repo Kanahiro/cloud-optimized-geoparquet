@@ -170,7 +170,7 @@ use cogp::reader::Reader;
 use geozero::wkb::Wkb;
 use geozero::ToJson;
 
-// Footer and page indexes are parsed here and cached. Hold this in app state.
+// The footer is parsed here and cached. Hold this in app state.
 let reader = Reader::open("data.cogp.parquet")?;
 let primary = reader.primary_column().to_string();
 
@@ -180,14 +180,10 @@ let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
 let by_level = reader.row_groups_up_to_level(8);
 let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
 
-// Per request: page indexes further prune bbox misses inside candidate groups.
-// The result is conservative; test each returned feature bbox for an exact filter.
+// Per request: discard row groups whose bbox misses the query.
+// Test each returned feature bbox for an exact filter.
 let file = File::open("data.cogp.parquet")?;
-let batches = reader.sync_batch_reader_with_bbox(
-    file,
-    &rgs,
-    [139.0, 35.0, 140.0, 36.0],
-)?;
+let batches = reader.sync_batch_reader(file, &rgs)?;
 
 for batch in batches {
     let batch = batch?;
@@ -231,7 +227,7 @@ let store: Arc<dyn ObjectStore> =
 let path = ObjPath::from("layers/admin.cogp.parquet");
 let head = store.head(&path).await?;
 
-// Load and cache the footer plus page indexes for the lifetime of the server.
+// Load and cache the footer for the lifetime of the server.
 let mut footer_reader = ParquetObjectReader::new(store.clone(), head.clone());
 let reader = Reader::try_new_async(&mut footer_reader).await?;
 let primary = reader.primary_column().to_string();
@@ -244,11 +240,7 @@ let rgs: Vec<usize> = {
     by_bbox.into_iter().filter(|i| by_gsd.contains(i)).collect()
 };
 let per_request_reader = ParquetObjectReader::new(store.clone(), head.clone());
-let mut stream = reader.async_batch_stream_with_bbox(
-    per_request_reader,
-    &rgs,
-    [139.0, 35.0, 140.0, 36.0],
-)?;
+let mut stream = reader.async_batch_stream(per_request_reader, &rgs)?;
 
 while let Some(batch) = stream.next().await {
     let _batch = batch?;
@@ -260,7 +252,7 @@ while let Some(batch) = stream.next().await {
 
 ### Reader API at a glance
 
-Construction (parses and caches the footer and available page indexes):
+Construction (parses and caches the footer):
 
 - `Reader::open(path)` — local file.
 - `Reader::try_new(reader)` — any `parquet::file::reader::ChunkReader`.
@@ -278,18 +270,11 @@ Selectors (`&self`, no IO — they only consult the cached footer):
 - `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
   covering-bbox envelope intersects the query, via Parquet column statistics.
-- `row_selection_intersecting_bbox(&row_groups, bbox)` — conservative page-level
-  selection using covering-bbox column and offset indexes.
-
 Per-request reads (hand in a fresh sync / async reader; footer is reused):
 
 - `sync_batch_reader(reader, &row_groups)` — `ParquetRecordBatchReader`.
-- `sync_batch_reader_with_bbox(reader, &row_groups, bbox)` — row-group and page-
-  pruned `ParquetRecordBatchReader` (still requires exact per-row bbox filtering).
 - `async_batch_stream(reader, &row_groups)` — `ParquetRecordBatchStream`
   (`feature = "async"`).
-- `async_batch_stream_with_bbox(reader, &row_groups, bbox)` — async row-group and
-  page-pruned stream (`feature = "async"`; still requires exact row filtering).
 
 ## validate
 
