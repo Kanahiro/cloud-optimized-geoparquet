@@ -12,6 +12,10 @@ import {
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
+import {
+  coalescingAsyncBuffer,
+  type RangeCoalescingOptions,
+} from './coalescing-buffer.js';
 import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 
@@ -26,6 +30,8 @@ export type BboxInput = Bbox | readonly [number, number, number, number];
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
+  /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
+  rangeCoalescing?: RangeCoalescingOptions | false;
 }
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
@@ -91,7 +97,10 @@ export class CogpReader {
     const fetchOpts: Record<string, unknown> = { url };
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
-    const file = await asyncBufferFromUrl(fetchOpts as { url: string });
+    const source = await asyncBufferFromUrl(fetchOpts as { url: string });
+    const file = opts.rangeCoalescing === false
+      ? source
+      : coalescingAsyncBuffer(source, opts.rangeCoalescing);
     return CogpReader.fromAsyncBuffer(file, url);
   }
 

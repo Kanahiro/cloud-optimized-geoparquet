@@ -40,6 +40,9 @@ use parquet::arrow::async_reader::{
 #[cfg(feature = "object_store")]
 pub use parquet::arrow::async_reader::ParquetObjectReader;
 
+#[cfg(feature = "async")]
+pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
+
 use crate::meta::{CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
@@ -151,11 +154,7 @@ impl Reader {
     /// resolution (e.g. screen meters/pixel) and want every level that's
     /// still useful at that scale, plus all coarser overviews.
     pub fn row_groups_up_to_gsd(&self, min_gsd: f64) -> Range<usize> {
-        let last = self
-            .cogp_meta
-            .levels
-            .iter()
-            .rposition(|l| l.gsd >= min_gsd);
+        let last = self.cogp_meta.levels.iter().rposition(|l| l.gsd >= min_gsd);
         match last {
             Some(i) => 0..(self.cogp_meta.levels[i].row_group_end + 1) as usize,
             None => 0..0,
@@ -256,7 +255,6 @@ impl Reader {
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
-
 }
 
 fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)> {

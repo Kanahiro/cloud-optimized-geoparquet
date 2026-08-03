@@ -143,8 +143,6 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         geometry_column: None,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
-        line_thinning_factor: 2,
-        polygon_thinning_factor: 1,
         line_visibility_factor: 2,
         polygon_visibility_factor: 4,
         sort_key: None,
@@ -189,11 +187,15 @@ fn convert_reader_validate_pipeline() {
 
     // The profile relies only on row-group statistics; the converter must not
     // add page-level index structures to the output.
-    assert!(reader.parquet_metadata().row_groups().iter().all(|row_group| {
-        row_group.columns().iter().all(|column| {
-            column.column_index_offset().is_none() && column.offset_index_offset().is_none()
-        })
-    }));
+    assert!(reader
+        .parquet_metadata()
+        .row_groups()
+        .iter()
+        .all(|row_group| {
+            row_group.columns().iter().all(|column| {
+                column.column_index_offset().is_none() && column.offset_index_offset().is_none()
+            })
+        }));
 
     // Selector contracts.
     assert!(reader.row_groups_in_level(reader.levels().len()).is_none());

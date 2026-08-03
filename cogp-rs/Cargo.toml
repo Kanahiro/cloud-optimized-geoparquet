@@ -9,12 +9,11 @@ license = "MIT"
 name = "cogp"
 path = "src/main.rs"
 
-[dev-dependencies]
-bytes = "1"
-
 [dependencies]
 anyhow = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
+futures = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arrow = "56"
@@ -29,7 +28,7 @@ rayon = "1"
 default = []
 # Async reader path: enables `Reader::try_new_async` and `async_batch_stream` on top
 # of `parquet::arrow::async_reader::AsyncFileReader` — bring your own runtime.
-async = ["parquet/async"]
+async = ["parquet/async", "dep:futures"]
 # Re-exports `parquet::arrow::async_reader::ParquetObjectReader` for using
 # `object_store` (S3, GCS, HTTP, …) as the remote source.
 object_store = ["async", "parquet/object_store"]

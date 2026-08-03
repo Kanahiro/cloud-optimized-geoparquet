@@ -3,8 +3,9 @@
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` reorders the features of a GeoParquet file across row groups using
-grid-based density thinning per level and Sort-Tile-Recursive (STR) bbox packing
-inside each level. `validate` checks the structural rules in SPEC §5.
+point-grid density thinning, extent-based line/polygon visibility, and
+Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
+structural rules in SPEC §5.
 
 ## Install
 
@@ -70,10 +71,9 @@ readable by any renderer regardless of which path you pick.
   output is restricted to it. Empty levels (no features assigned) are
   dropped automatically.
 - `--webmerc-resolution` (default `1024`) — units per tile side used in the
-  Web Mercator GSD formula above. `1024` keeps the thinning grid at ~4× the
-  typical 256-pixel tile resolution, so features collapsing within a few
-  subpixels are dropped. Controls thinning granularity only; ignored when
-  `--gsd` is given.
+  Web Mercator GSD formula above. `1024` is ~4× the typical 256-pixel tile
+  resolution, so features collapsing within a few subpixels are deferred to
+  finer levels. Controls level granularity; ignored when `--gsd` is given.
 
 Other options:
 
@@ -91,41 +91,33 @@ Other options:
   rendering-grade, not geodesic.
 - `--point-thinning-factor` (default `4`) — point-like features (WKB
   `Point` / `MultiPoint`) thin on a grid this many times coarser per axis
-  than the level GSD. Points occupy a single cell visually, so equal grid
-  density looks too dense compared to lines/polygons. Set to `1` to disable.
-- `--line-thinning-factor` (default `2`) — line-like features (WKB
-  `LineString` / `MultiLineString`) thin on a grid this many times coarser
-  per axis than the level GSD. Lines are 1D so multiple parallel/near-parallel
-  lines within one cell overlap visually even when their bbox centers fall
-  into distinct cells. Smaller than `--point-thinning-factor` because lines
-  still span many cells along their length. Set to `1` to disable.
-- `--polygon-thinning-factor` (default `1`) — polygon-like features (WKB
-  `Polygon` / `MultiPolygon`) thin on a grid this many times coarser per
-  axis than the level GSD. Polygons span area so the default of `1` already
-  looks well-covered; raise to thin further.
+  than the level GSD, yielding approximately `factor²` fewer points than a
+  factor of `1`. Set to `1` for one winner per GSD-sized cell. Grid thinning
+  applies only to points: lines and
+  polygons are assigned as soon as they meet their visibility threshold,
+  because a bbox center cannot represent an extended geometry's footprint.
 - `--line-visibility-factor` (default `2`) — coarsest level at which a
   LineString is considered independently meaningful: its bbox diagonal must
   reach `factor · GSD` of that level. Lines are 1D so a diagonal equal to
   one GSD is only a hairline. This is a hard cutoff: a line shorter than the
   threshold is excluded from that level and deferred to a finer one, so a
-  coarse-zoom read never fetches sub-resolution lines. Distinct from
-  `--line-thinning-factor` (which controls grid cell pitch). Set to `1` to disable.
+  coarse-zoom read never fetches sub-resolution lines. Set to `1` for the least
+  restrictive supported threshold.
 - `--polygon-visibility-factor` (default `4`) — coarsest level at which a
   Polygon is considered independently meaningful: its bbox diagonal must
   reach `factor · GSD` of that level. A hard cutoff, like
   `--line-visibility-factor`: a polygon below the threshold is excluded from
   that level and deferred to a finer one. The default keeps coarse levels from
-  being crowded by tiny polygons. Distinct from `--polygon-thinning-factor`.
-  Set to `1` to disable.
+  being crowded by tiny polygons. Set to `1` for the least restrictive supported
+  threshold.
 - `--sort-key` — attribute column that decides which feature wins when several
-  contend for the same thinning cell. When set it is the primary criterion: the
+  points contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is
-  kept (e.g. keep the higher-population city, the higher road class). Bbox size
+  kept (e.g. keep the higher-population city). Bbox size
   only breaks ties between equal-valued features — and then a deterministic
-  row-index hash. Works for all geometry kinds; for polygons/lines, whose bbox
-  diagonals practically never tie, this is the only knob that influences *which*
-  feature is kept. The column must be rank-able (numeric, boolean, or string);
-  rows whose value is null always lose the tie.
+  row-index hash. It does not affect line or polygon level assignment. The column
+  must be rank-able (numeric, boolean, or string); rows whose value is null always
+  lose the tie.
 - `--sort-order` (default `desc`) — direction for `--sort-key`: `desc` keeps
   the largest value, `asc` keeps the smallest. Ignored when `--sort-key` is
   unset.
@@ -218,7 +210,9 @@ futures = "0.3"
 ```rust,no_run
 # async fn run() -> anyhow::Result<()> {
 use std::sync::Arc;
-use cogp::reader::{Reader, ParquetObjectReader};
+use cogp::reader::{
+    ParquetObjectReader, RangeCoalescingOptions, RangeCoalescingReader, Reader,
+};
 use futures::StreamExt;
 use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
 
@@ -228,7 +222,8 @@ let path = ObjPath::from("layers/admin.cogp.parquet");
 let head = store.head(&path).await?;
 
 // Load and cache the footer for the lifetime of the server.
-let mut footer_reader = ParquetObjectReader::new(store.clone(), head.clone());
+let mut footer_reader = ParquetObjectReader::new(store.clone(), path.clone())
+    .with_file_size(head.size);
 let reader = Reader::try_new_async(&mut footer_reader).await?;
 let primary = reader.primary_column().to_string();
 
@@ -239,7 +234,12 @@ let rgs: Vec<usize> = {
     let by_gsd = reader.row_groups_up_to_gsd(500.0);
     by_bbox.into_iter().filter(|i| by_gsd.contains(i)).collect()
 };
-let per_request_reader = ParquetObjectReader::new(store.clone(), head.clone());
+let per_request_reader = RangeCoalescingReader::try_new(
+    ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(head.size),
+    RangeCoalescingOptions::default()
+        .with_max_gap_bytes(128 * 1024)
+        .with_max_overfetch_ratio(1.25),
+)?;
 let mut stream = reader.async_batch_stream(per_request_reader, &rgs)?;
 
 while let Some(batch) = stream.next().await {
@@ -261,6 +261,15 @@ Construction (parses and caches the footer):
 - `Reader::from_arrow_metadata(meta)` — bring your own cached
   `ArrowReaderMetadata`.
 
+Remote range coalescing (`feature = "async"):
+
+- `RangeCoalescingReader::new(reader)` — wrap a cloneable `AsyncFileReader`
+  using the defaults: a 128 KiB maximum gap and 1.25 maximum overfetch ratio.
+- `RangeCoalescingReader::try_new(reader, options)` — configure
+  `max_gap_bytes` and `max_overfetch_ratio`. Both constraints must permit a
+  merge; overlapping ranges always merge. This adapter bypasses
+  `object_store`'s fixed one-megabyte `get_ranges` coalescing policy.
+
 Selectors (`&self`, no IO — they only consult the cached footer):
 
 - `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
@@ -270,6 +279,7 @@ Selectors (`&self`, no IO — they only consult the cached footer):
 - `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
   covering-bbox envelope intersects the query, via Parquet column statistics.
+
 Per-request reads (hand in a fresh sync / async reader; footer is reused):
 
 - `sync_batch_reader(reader, &row_groups)` — `ParquetRecordBatchReader`.

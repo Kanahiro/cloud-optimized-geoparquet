@@ -471,6 +471,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "clap",
+ "futures",
  "parquet",
  "rayon",
  "serde",

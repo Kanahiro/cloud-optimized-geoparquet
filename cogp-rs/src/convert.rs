@@ -53,7 +53,7 @@ pub struct ConvertArgs {
     /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
-    /// Parquet row group size in rows
+    /// Parquet row group size in rows.
     #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
     /// Maximum estimated encoded Parquet row group size in bytes
@@ -68,45 +68,31 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub geometry_column: Option<String>,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
-    /// derive the level thinning grid when auto-deriving GSDs from
+    /// derive level visibility thresholds and the point-thinning grid when
+    /// auto-deriving GSDs from
     /// --webmerc-minzoom/--webmerc-maxzoom. The level-i GSD is the ground
     /// distance covered by one base unit at zoom i, computed as
     /// `40_075_016 / (base · 2^i)` meters at the equator — i.e. it bakes in
     /// the Web Mercator equatorial circumference and the standard `2^z` tile
-    /// pyramid. This controls *thinning* granularity, not output coordinate
-    /// precision. The default of 1024 keeps the thinning grid at ~4× the
-    /// typical 256-pixel tile resolution, so features collapsing within a
-    /// few subpixels are dropped. Ignored when --gsd is given (in that case
-    /// the GSDs are taken verbatim and no projection is assumed).
+    /// pyramid. This controls level granularity, not output coordinate
+    /// precision. The default of 1024 is ~4× the typical 256-pixel tile
+    /// resolution, so features collapsing within a few subpixels are deferred
+    /// to finer levels. Ignored when --gsd is given (in that case the GSDs are
+    /// taken verbatim and no projection is assumed).
     #[arg(long, default_value_t = 1024)]
     pub webmerc_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
-    /// many times coarser than `prec` per axis, yielding ~factor² fewer
-    /// points per level than polygons. Compensates for the fact that polygons
-    /// span multiple cells visually while points occupy one, so equal grid
-    /// density looks too dense for points. Set to `1` to disable.
+    /// many times coarser than `prec` per axis, yielding ~factor² fewer points
+    /// per level than a factor of 1. Set to `1` for the finest supported
+    /// thinning grid (one winner per GSD-sized cell).
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
-    /// LineString-like features (WKB LineString / MultiLineString) use a
-    /// thinning grid this many times coarser than `prec` per axis. Lines
-    /// are 1D so multiple parallel/near-parallel lines within `prec` overlap
-    /// visually even when their bbox centers fall into distinct cells; this
-    /// factor compensates. Smaller than `--point-thinning-factor` because
-    /// lines still span many cells along their length. Set to `1` to disable.
-    #[arg(long, default_value_t = 2)]
-    pub line_thinning_factor: u32,
-    /// Polygon-like features (WKB Polygon / MultiPolygon) use a thinning grid
-    /// this many times coarser than `prec` per axis. Polygons span area so
-    /// `1` (the default) already looks well-covered; raise to thin further.
-    #[arg(long, default_value_t = 1)]
-    pub polygon_thinning_factor: u32,
     /// Line visibility threshold multiplier applied to `prec` when deciding
     /// the coarsest level at which a LineString first becomes independently
     /// meaningful. A line is eligible from level `i` once its bbox diagonal
     /// reaches `factor · prec[i]`. Lines are 1D so a diagonal equal to `prec`
     /// is only a hairline; the default of `2` defers such short lines to a
-    /// finer level. Distinct from `--line-thinning-factor` (which controls grid
-    /// cell pitch, not eligibility). Set to `1` to disable.
+    /// finer level. Set to `1` for the least restrictive supported threshold.
     #[arg(long, default_value_t = 2)]
     pub line_visibility_factor: u32,
     /// Polygon visibility threshold multiplier applied to `prec` when deciding
@@ -114,19 +100,19 @@ pub struct ConvertArgs {
     /// meaningful. A polygon is eligible from level `i` once its bbox diagonal
     /// reaches `factor · prec[i]`. Default of `4` defers polygons whose
     /// diagonal is under ~4 grid cells to a finer level, so coarse levels aren't
-    /// crowded by tiny polygons. Distinct from `--polygon-thinning-factor`.
-    /// Set to `1` to disable.
+    /// crowded by tiny polygons. Set to `1` for the least restrictive supported
+    /// threshold.
     #[arg(long, default_value_t = 4)]
     pub polygon_visibility_factor: u32,
     /// Attribute column deciding which feature wins when several contend for the
-    /// same thinning cell. When set it is the primary criterion: the
+    /// same point-thinning cell. When set it is the primary criterion: the
     /// higher-ranked feature survives to coarser levels, so the more important
     /// one is kept instead of an arbitrary one. Bbox size only breaks ties
-    /// between equal-valued features (e.g. same road class → keep the longer
-    /// one), then a deterministic row-index hash. Works for all geometry kinds,
-    /// including points (whose bbox size is always zero). The column must be
-    /// rank-able: numeric, boolean, or string. Rows whose value is null always
-    /// lose the tie.
+    /// between equal-valued features, then a deterministic row-index hash.
+    /// Line and polygon features do not compete in cells, so this option does
+    /// not affect their level. The
+    /// column must be rank-able: numeric, boolean, or string. Rows whose value
+    /// is null always lose the tie.
     #[arg(long)]
     pub sort_key: Option<String>,
     /// Direction for --sort-key: `desc` (default) keeps the feature with the
@@ -243,8 +229,7 @@ const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
 /// into `webmerc_resolution` units per side. The default of 1024 yields
-/// ~39136 m per unit at zoom 0 — the smallest distance the thinning grid
-/// distinguishes at the coarsest level.
+/// ~39136 m per unit at zoom 0 — the coarsest level's base visibility unit.
 fn base_unit_gsd_z0(webmerc_resolution: u32) -> f64 {
     WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
 }
@@ -315,18 +300,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             args.point_thinning_factor
         );
     }
-    if args.line_thinning_factor == 0 {
-        bail!(
-            "--line-thinning-factor must be >= 1 (got {})",
-            args.line_thinning_factor
-        );
-    }
-    if args.polygon_thinning_factor == 0 {
-        bail!(
-            "--polygon-thinning-factor must be >= 1 (got {})",
-            args.polygon_thinning_factor
-        );
-    }
     if args.line_visibility_factor == 0 {
         bail!(
             "--line-visibility-factor must be >= 1 (got {})",
@@ -342,7 +315,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
     }
-
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
@@ -420,7 +392,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // Pass 1: stream only the geometry (+ covering bbox / sort-key) columns.
     // Everything retained per row is O(1)-sized (bbox, kind, rank), so memory
     // stays bounded by the row count, not by the file's attribute payload.
-    let ScanResult { bboxes, kinds, sort_key } = scan_input(
+    let ScanResult {
+        bboxes,
+        kinds,
+        sort_key,
+    } = scan_input(
         &args.input,
         &arrow_meta,
         geom_col_idx,
@@ -451,11 +427,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         &kinds,
         &gsds,
         input_units,
-        ThinningFactors {
-            point: args.point_thinning_factor,
-            line: args.line_thinning_factor,
-            polygon: args.polygon_thinning_factor,
-        },
+        args.point_thinning_factor,
         VisibilityFactors {
             line: args.line_visibility_factor,
             polygon: args.polygon_visibility_factor,
@@ -536,10 +508,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
-        props_builder = props_builder.set_column_dictionary_enabled(
-            path,
-            false,
-        );
+        props_builder = props_builder.set_column_dictionary_enabled(path, false);
     }
     let props = props_builder.build();
     let out_file = File::create(&args.output)
@@ -804,9 +773,7 @@ impl<'a> CoverCols<'a> {
             parent
                 .column_by_name(name)
                 .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-                .ok_or_else(|| {
-                    anyhow!("covering child `{}.{name}` is not Float64", plan.col_name)
-                })
+                .ok_or_else(|| anyhow!("covering child `{}.{name}` is not Float64", plan.col_name))
         };
         Ok(Self {
             parent,
@@ -910,7 +877,11 @@ fn scan_input(
         Some(_) => Some(concat_sort_key(&sort_key_parts)?),
         None => None,
     };
-    Ok(ScanResult { bboxes, kinds, sort_key })
+    Ok(ScanResult {
+        bboxes,
+        kinds,
+        sort_key,
+    })
 }
 
 fn scan_geometry_batch(
@@ -1167,14 +1138,6 @@ fn gather_chunk(
     Ok(out)
 }
 
-/// Per-kind multipliers on `prec` for the level thinning grid pitch.
-#[derive(Clone, Copy)]
-struct ThinningFactors {
-    point: u32,
-    line: u32,
-    polygon: u32,
-}
-
 /// Per-kind multipliers on `prec` for the visibility (eligibility) threshold.
 /// Points are excluded — they have no extent, so they are always eligible
 /// from level 0 regardless of any factor.
@@ -1185,7 +1148,7 @@ struct VisibilityFactors {
 }
 
 /// Per-row tie-break ranks derived from the `--sort-key` attribute column: a
-/// larger rank means higher priority within a thinning cell (see `priority`).
+/// larger rank means higher priority within a point-thinning cell (see `priority`).
 /// Equal column values share a rank, so ties still fall through to the hashed
 /// row index; null values rank below every non-null and so always lose.
 fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> {
@@ -1199,34 +1162,34 @@ fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> 
     Ok(ranks.into_iter().map(u64::from).collect())
 }
 
-/// Grid-based density thinning. Returns an assignment of each row to a level index.
+/// Assign features to progressive levels, with grid thinning only for points.
 ///
-/// For each level (coarse → fine), bucket remaining features into grid cells of side
-/// `prec` (the level's GSD in input CRS units). Within each cell, pick the highest-
-/// priority feature to assign to this level; the rest fall through to the next level.
+/// For each level (coarse → fine), eligible Point/MultiPoint features compete in
+/// grid cells and the highest-priority feature in each cell is assigned. Lines and
+/// polygons are spatially extended: representing either by its bbox center can hide a
+/// feature that contributes visible information across many cells. They therefore do
+/// not compete in cells and are assigned as soon as they pass the visibility gate.
 ///
 /// A feature is *eligible* at a level only once its bbox diagonal reaches
 /// `vis_factor · prec` for its kind (see `min_visible`); below that it is excluded and
 /// deferred to a finer level where it becomes independently meaningful. This is a hard
-/// gate, not a tie-break: it keeps a level's feature count bounded by screen density, so
-/// the reader never fetches sub-resolution features at a coarse zoom (the read cost of a
-/// progressive `up_to_gsd` read stays independent of total dataset size). The trade-off
-/// is that a lone sub-threshold feature does not appear at coarser zooms even where its
-/// cell is otherwise empty. Point-kind features have no extent and are eligible from
-/// level 0.
+/// gate, not a tie-break, so the reader does not fetch sub-resolution extended features
+/// at a coarse zoom. It does not impose a density bound on visible lines or polygons.
+/// The trade-off is that a lone sub-threshold feature does not appear at coarser zooms.
+/// Point-kind features have no extent and are eligible from level 0.
 ///
 /// Cells already occupied by a feature assigned at a coarser level are blocked: any
 /// remaining candidate whose center re-projects into such a cell at the current
 /// level's grid is skipped (it stays in `remaining` for a finer level). Without
 /// this, a tight cluster would surface one feature per level in the same visual
 /// neighborhood — a coarse winner plus near-identical fine winners around it.
-/// Blocking is per-kind because each kind uses its own grid pitch.
+/// Blocking applies only to points.
 fn assign_levels(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
     gsds: &[f64],
     units: InputUnits,
-    thinning: ThinningFactors,
+    point_thinning_factor: u32,
     visibility: VisibilityFactors,
     sort_ranks: &[u64],
 ) -> Result<Vec<u16>> {
@@ -1248,12 +1211,7 @@ fn assign_levels(
         })
         .collect();
 
-    // Kind-specific grid coarsening. Polygons span area so 1-pick-per-prec-cell
-    // overlaps visually; points are 0D and lines are 1D in the cross-axis, so
-    // their picks look saturated at the same density — coarsen each accordingly.
-    let point_thin_mul = thinning.point as f64;
-    let line_thin_mul = thinning.line as f64;
-    let polygon_thin_mul = thinning.polygon as f64;
+    let point_thin_mul = point_thinning_factor as f64;
     let line_vis_mul = visibility.line as f64;
     let polygon_vis_mul = visibility.polygon as f64;
 
@@ -1296,51 +1254,37 @@ fn assign_levels(
         })
         .collect();
 
-    let eff_prec = |k: GeomKind, prec: f64| -> f64 {
-        match k {
-            GeomKind::Point => prec * point_thin_mul,
-            GeomKind::Line => prec * line_thin_mul,
-            GeomKind::Polygon => prec * polygon_thin_mul,
-        }
-    };
-    let cell_key = |row: u32, prec: f64| -> (u8, i64, i64) {
+    let cell_key = |row: u32, prec: f64| -> (i64, i64) {
         let b = bboxes[row as usize];
-        let k = kinds[row as usize];
-        let ep = eff_prec(k, prec);
-        (
-            k as u8,
-            (b.cx() / ep).floor() as i64,
-            (b.cy() / ep).floor() as i64,
-        )
+        let ep = prec * point_thin_mul;
+        ((b.cx() / ep).floor() as i64, (b.cy() / ep).floor() as i64)
     };
 
-    let mut assigned_so_far: Vec<u32> = Vec::new();
+    let mut assigned_points: Vec<u32> = Vec::new();
     for (level_i, prec) in precs.iter().enumerate() {
-        // Re-project every coarser-level feature onto this level's grid and
-        // mark those cells as blocked, so a candidate falling into the same
-        // (kind, ix, iy) cell as an already-placed coarse winner is skipped.
+        // Re-project every coarser-level point onto this level's grid and mark
+        // those cells as blocked, so a candidate point falling into the same
+        // cell as an already-placed coarse winner is skipped.
         // Rebuilt per level because each level's grid pitch differs.
-        let blocked: std::collections::HashSet<(u8, i64, i64)> = assigned_so_far
+        let blocked: std::collections::HashSet<(i64, i64)> = assigned_points
             .par_iter()
             .map(|&row| cell_key(row, *prec))
             .collect();
 
         let prio = |row: u32| priority(&bboxes[row as usize], sort_ranks[row as usize], row);
 
-        // Per-cell winner map built in parallel: each thread folds into a local
-        // HashMap, then reduce merges them keeping the higher-score row on
-        // collision. The key is `(kind, ix, iy)` — kind-tagged because each
-        // kind uses a different grid pitch, and an untagged `(ix, iy)` would
-        // conflate the grids.
-        let best: HashMap<(u8, i64, i64), u32> = remaining
+        // Per-cell point winner map built in parallel: each thread folds into a
+        // local HashMap, then reduce merges them keeping the higher-score row
+        // on collision.
+        let best: HashMap<(i64, i64), u32> = remaining
             .par_iter()
             .fold(HashMap::new, |mut local, &row| {
-                // Hard visibility gate: a feature not yet meaningful at this
-                // level (its bbox diagonal < `vis_factor · prec`) is excluded
-                // and deferred to a finer level. This bounds a level's feature
-                // count by screen density, so reads never fetch sub-resolution
-                // features at a coarse zoom. Points are meaningful from level 0.
+                // Points are meaningful from level 0. The visibility gate for
+                // extended geometries is applied below when they are collected.
                 if min_visible[row as usize] as usize > level_i {
+                    return local;
+                }
+                if kinds[row as usize] != GeomKind::Point {
                     return local;
                 }
                 let key = cell_key(row, *prec);
@@ -1377,11 +1321,20 @@ fn assign_levels(
                 }
                 a
             });
-        let picked: Vec<u32> = best.values().copied().collect();
+        let mut picked: Vec<u32> = best.values().copied().collect();
+        let extended: Vec<u32> = remaining
+            .par_iter()
+            .filter_map(|&row| {
+                (kinds[row as usize] != GeomKind::Point
+                    && min_visible[row as usize] as usize <= level_i)
+                    .then_some(row)
+            })
+            .collect();
+        picked.extend(extended);
         for r in &picked {
             assigned[*r as usize] = level_i as i32;
         }
-        assigned_so_far.extend(picked.iter().copied());
+        assigned_points.extend(best.values().copied());
         let picked_set: std::collections::HashSet<u32> = picked.iter().copied().collect();
         remaining.retain(|r| !picked_set.contains(r));
         if remaining.is_empty() {
@@ -1401,20 +1354,9 @@ fn assign_levels(
     Ok(out)
 }
 
-/// Primary order: `sort_rank`, the optional `--sort-key` attribute rank — 0 for
-/// every row when no key is given, so it drops out and bbox size leads as
-/// before. Secondary: bbox diagonal `w² + h²` (squared, monotonic in the real
-/// diagonal, bits give a total order over f64 including NaN guard) — a
-/// kind-agnostic, orientation-independent "size" proxy: a 45° line scores the
-/// same as an axis-aligned line of equal true length, and a square polygon
-/// scores the same as a 90°-rotated one. Tertiary: hashed row index for a
-/// deterministic tie-break.
-///
-/// `sort_rank` leads rather than trails the size: polygon/line bbox diagonals
-/// are continuous and practically never tie, so a sort key ranked *below* size
-/// could never decide anything for them. Above size it governs every kind, with
-/// size breaking ties between equal-ranked features (e.g. same road class → keep
-/// the longer one) and, for points, being a constant 0 so the rank fully orders.
+/// Point-cell winner priority. The optional `--sort-key` rank leads, bbox
+/// diagonal breaks ties for an extended MultiPoint, and a hashed row index gives
+/// a deterministic final order. Ordinary Point bboxes have zero size.
 fn priority(b: &Bbox, sort_rank: u64, row: u32) -> (u64, u64, u64) {
     let w = b.width().max(0.0);
     let h = b.height().max(0.0);
@@ -1440,7 +1382,11 @@ struct SortDir {
 impl SortDir {
     /// Whether the sort along `axis` should be descending.
     fn reverse_on(self, split_x: bool) -> bool {
-        if split_x { self.rev_x } else { self.rev_y }
+        if split_x {
+            self.rev_x
+        } else {
+            self.rev_y
+        }
     }
 
     /// Right-child direction: flip the *other* axis so the right subtree's
@@ -1448,9 +1394,15 @@ impl SortDir {
     /// subtree's first leaf land next to the left subtree's last leaf.
     fn flip_for_right_child(self, split_x: bool) -> Self {
         if split_x {
-            Self { rev_x: self.rev_x, rev_y: !self.rev_y }
+            Self {
+                rev_x: self.rev_x,
+                rev_y: !self.rev_y,
+            }
         } else {
-            Self { rev_x: !self.rev_x, rev_y: self.rev_y }
+            Self {
+                rev_x: !self.rev_x,
+                rev_y: self.rev_y,
+            }
         }
     }
 }
@@ -1466,27 +1418,38 @@ enum SnakeStart {
 
 impl SnakeStart {
     fn for_level(level_idx: usize) -> Self {
-        if level_idx.is_multiple_of(2) { Self::TopLeft } else { Self::BottomRight }
+        if level_idx.is_multiple_of(2) {
+            Self::TopLeft
+        } else {
+            Self::BottomRight
+        }
     }
 
     fn initial_dir(self) -> SortDir {
         match self {
-            Self::TopLeft => SortDir { rev_x: false, rev_y: true },
-            Self::BottomRight => SortDir { rev_x: true, rev_y: false },
+            Self::TopLeft => SortDir {
+                rev_x: false,
+                rev_y: true,
+            },
+            Self::BottomRight => SortDir {
+                rev_x: true,
+                rev_y: false,
+            },
         }
     }
 }
 
-/// Recursive STR bulk-loading with boustrophedon (snake) leaf ordering.
-/// Splits the longer extent axis at a row-group boundary at each step. The
-/// snake's starting corner alternates per `level_idx`, so adjacent COGP
-/// levels enter/exit on the same side and read order stays spatially local.
+/// STR bulk-loading into spatially compact row-group leaves.
 fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_idx: usize) {
     let dir = SnakeStart::for_level(level_idx).initial_dir();
-    // Shared scratch buffer for DSU sorting; sliced (never reallocated) as
-    // recursion descends, so total allocation is O(N) once.
     let mut scratch: Vec<(f64, u32)> = vec![(0.0, 0); rows.len()];
-    str_pack_rec(rows.as_mut_slice(), &mut scratch, bboxes, row_group_size, dir);
+    str_pack_rec(
+        rows.as_mut_slice(),
+        &mut scratch,
+        bboxes,
+        row_group_size,
+        dir,
+    );
 }
 
 fn str_pack_rec(
@@ -1527,7 +1490,11 @@ fn str_pack_rec(
         });
     scratch.par_sort_unstable_by(|a, b| {
         let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
-        if reverse { ord.reverse() } else { ord }
+        if reverse {
+            ord.reverse()
+        } else {
+            ord
+        }
     });
     rows.par_iter_mut()
         .zip(scratch.par_iter())
@@ -1535,8 +1502,8 @@ fn str_pack_rec(
             *r = *i;
         });
 
-    // Split on a row-group boundary so every leaf is fully packed at M
-    // (only the very last leaf in the level may be partial).
+    // Split on the caller's physical-unit boundary (row group in the outer
+    // pass, page in the inner pass). Only the final leaf may be partial.
     let num_leaves = n.div_ceil(m);
     let left_leaves = (num_leaves / 2).max(1);
     let split_at = left_leaves * m;
@@ -1554,7 +1521,12 @@ mod tests {
     use super::*;
 
     fn bb(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Bbox {
-        Bbox { xmin, ymin, xmax, ymax }
+        Bbox {
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+        }
     }
 
     #[test]
@@ -1562,7 +1534,10 @@ mod tests {
         let g = web_mercator_gsds(0, 4, 1024);
         assert_eq!(g.len(), 5);
         for w in g.windows(2) {
-            assert!((w[0] / 2.0 - w[1]).abs() < 1e-6, "expected halving, got {w:?}");
+            assert!(
+                (w[0] / 2.0 - w[1]).abs() < 1e-6,
+                "expected halving, got {w:?}"
+            );
         }
         // Web Mercator equatorial circumference / 1024 at z0.
         assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 1024.0).abs() < 1e-6);
@@ -1571,7 +1546,10 @@ mod tests {
     #[test]
     fn detect_input_units_branches() {
         // No metadata at all → degrees (CRS84 fallback).
-        assert!(matches!(detect_input_units(None, "geom"), InputUnits::Degrees));
+        assert!(matches!(
+            detect_input_units(None, "geom"),
+            InputUnits::Degrees
+        ));
 
         let mk = |crs: Option<serde_json::Value>| {
             let mut cols = BTreeMap::new();
@@ -1644,8 +1622,7 @@ mod tests {
 
     #[test]
     fn priority_orders_by_sort_rank_then_diagonal_then_hash() {
-        // Higher sort rank wins even against a much larger bbox — the sort key
-        // leads so it actually decides for polygons/lines, not just points.
+        // Higher sort rank wins even against a much larger MultiPoint bbox.
         let big_low_rank = priority(&bb(0.0, 0.0, 10.0, 10.0), 1, 0);
         let small_high_rank = priority(&bb(0.0, 0.0, 1.0, 1.0), 2, 0);
         assert!(small_high_rank > big_low_rank);
@@ -1674,8 +1651,11 @@ mod tests {
             &kinds,
             &gsds,
             InputUnits::Meters,
-            ThinningFactors { point: 1, line: 1, polygon: 1 },
-            VisibilityFactors { line: 1, polygon: 1 },
+            1,
+            VisibilityFactors {
+                line: 1,
+                polygon: 1,
+            },
             &[0, 0],
         )
         .unwrap();
@@ -1695,8 +1675,11 @@ mod tests {
             &kinds,
             &gsds,
             InputUnits::Meters,
-            ThinningFactors { point: 1, line: 1, polygon: 1 },
-            VisibilityFactors { line: 1, polygon: 1 },
+            1,
+            VisibilityFactors {
+                line: 1,
+                polygon: 1,
+            },
             &[0, 0],
         )
         .unwrap();
@@ -1718,8 +1701,11 @@ mod tests {
             &kinds,
             &gsds,
             InputUnits::Meters,
-            ThinningFactors { point: 1, line: 1, polygon: 1 },
-            VisibilityFactors { line: 1, polygon: 1 },
+            1,
+            VisibilityFactors {
+                line: 1,
+                polygon: 1,
+            },
             &[1, 5],
         )
         .unwrap();
@@ -1773,8 +1759,11 @@ mod tests {
             &kinds,
             &gsds,
             InputUnits::Meters,
-            ThinningFactors { point: 1, line: 1, polygon: 1 },
-            VisibilityFactors { line: 2, polygon: 4 },
+            1,
+            VisibilityFactors {
+                line: 2,
+                polygon: 4,
+            },
             &[0],
         )
         .unwrap();
@@ -1797,8 +1786,11 @@ mod tests {
             &kinds,
             &gsds,
             InputUnits::Meters,
-            ThinningFactors { point: 1, line: 1, polygon: 1 },
-            VisibilityFactors { line: 2, polygon: 4 },
+            1,
+            VisibilityFactors {
+                line: 2,
+                polygon: 4,
+            },
             &[0, 0],
         )
         .unwrap();
@@ -1806,9 +1798,43 @@ mod tests {
     }
 
     #[test]
+    fn assign_levels_does_not_thin_visible_extended_features() {
+        // Each pair has the same bbox center and passes the coarse-level
+        // visibility threshold. A center-cell grid would retain only one line
+        // and one polygon; extended geometries must all enter the first
+        // eligible level.
+        let bboxes = vec![
+            bb(-30.0, -10.0, 30.0, 10.0),
+            bb(-10.0, -30.0, 10.0, 30.0),
+            bb(-30.0, -10.0, 30.0, 10.0),
+            bb(-10.0, -30.0, 10.0, 30.0),
+        ];
+        let kinds = vec![
+            GeomKind::Line,
+            GeomKind::Line,
+            GeomKind::Polygon,
+            GeomKind::Polygon,
+        ];
+        let gsds = vec![10.0, 1.0];
+        let out = assign_levels(
+            &bboxes,
+            &kinds,
+            &gsds,
+            InputUnits::Meters,
+            1,
+            VisibilityFactors {
+                line: 2,
+                polygon: 4,
+            },
+            &[0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
     fn str_pack_preserves_set_and_uses_full_leaves() {
-        // 17 features in 4 row-group bins of 5 → packs deterministically and
-        // never drops a row.
+        // 17 features in row groups of 10 → never drops a row.
         let mut bboxes = Vec::new();
         for i in 0..17 {
             let x = (i % 5) as f64;
@@ -1816,7 +1842,7 @@ mod tests {
             bboxes.push(bb(x, y, x + 0.1, y + 0.1));
         }
         let mut rows: Vec<u32> = (0..17u32).collect();
-        str_pack(&mut rows, &bboxes, 5, 0);
+        str_pack(&mut rows, &bboxes, 10, 0);
         let mut sorted = rows.clone();
         sorted.sort();
         let expected: Vec<u32> = (0..17u32).collect();
