@@ -8,6 +8,7 @@ import {
 } from './dataset-service';
 
 const COGP_SOURCE_ID = 'cogp';
+const VIEWPORT_REFRESH_INTERVAL_MS = 150;
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -93,8 +94,11 @@ map.on('load', () => {
   if (active) installCogpSource();
 });
 
-map.on('moveend', () => {
-  if (active) void refreshViewport();
+map.on('move', () => {
+  if (active) {
+    viewportToken += 1;
+    requestViewportRefresh();
+  }
 });
 
 function installCogpSource(): void {
@@ -139,7 +143,8 @@ function installCogpSource(): void {
     },
   });
 
-  void refreshViewport();
+  viewportToken += 1;
+  requestViewportRefresh(true);
 }
 
 function removeCogpLayersAndSource(): void {
@@ -154,13 +159,47 @@ function emptyFC(): FeatureCollection {
 }
 
 let viewportToken = 0;
+let viewportRefreshTimer: number | null = null;
+let viewportRefreshInFlight = false;
+let viewportRefreshRequested = false;
+let lastViewportRefreshStartedAt = -Infinity;
+
+function requestViewportRefresh(immediate = false): void {
+  viewportRefreshRequested = true;
+  if (viewportRefreshInFlight) return;
+
+  if (viewportRefreshTimer !== null) {
+    if (!immediate) return;
+    clearTimeout(viewportRefreshTimer);
+  }
+
+  const elapsed = performance.now() - lastViewportRefreshStartedAt;
+  const delay = immediate ? 0 : Math.max(0, VIEWPORT_REFRESH_INTERVAL_MS - elapsed);
+  viewportRefreshTimer = window.setTimeout(() => {
+    viewportRefreshTimer = null;
+    void runViewportRefresh();
+  }, delay);
+}
+
+async function runViewportRefresh(): Promise<void> {
+  if (!viewportRefreshRequested || viewportRefreshInFlight) return;
+  viewportRefreshRequested = false;
+  viewportRefreshInFlight = true;
+  lastViewportRefreshStartedAt = performance.now();
+  try {
+    await refreshViewport();
+  } finally {
+    viewportRefreshInFlight = false;
+    if (viewportRefreshRequested) requestViewportRefresh();
+  }
+}
 
 async function refreshViewport(): Promise<void> {
   const ds = active;
   if (!ds) return;
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
   if (!source) return;
-  const myToken = ++viewportToken;
+  const myToken = viewportToken;
   const b = map.getBounds();
   const bbox = {
     minX: b.getWest(),
