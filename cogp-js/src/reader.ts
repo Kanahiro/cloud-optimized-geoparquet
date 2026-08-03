@@ -90,8 +90,6 @@ export interface ReadOptions {
    * etc.) are not measured.
    */
   maxRowWkbBytes?: number;
-  /** Use Parquet page indexes for bbox pushdown; defaults to false. */
-  usePageIndex?: boolean;
 }
 
 export class CogpReader {
@@ -201,10 +199,8 @@ export class CogpReader {
    * from the on-disk WKB; decoding happens lazily after bbox filtering so
    * rows that miss the query never pay for it.
    *
-   * Bbox pruning runs at two levels: row groups whose covering envelope
-   * misses the query are skipped entirely (no I/O). When `usePageIndex` is
-   * enabled, Parquet page indexes additionally prune page ranges inside
-   * surviving groups. The remaining rows are filtered exactly against each
+   * Row groups whose covering envelope misses the query are skipped entirely
+   * (no I/O). Rows in the remaining groups are filtered exactly against each
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
@@ -253,7 +249,7 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns, bbox, opts.usePageIndex ?? false)) {
+    for await (const batch of this.streamRuns(rgs, columns)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -316,12 +312,9 @@ export class CogpReader {
   private async *streamRuns(
     rgIndices: number[],
     columns: string[] | undefined,
-    bbox?: Bbox,
-    usePageIndex = false,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
-    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
     for (const run of this.coalescedRuns(rgIndices)) {
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
@@ -332,15 +325,10 @@ export class CogpReader {
         metadata: this.metadata,
         rowStart,
         rowEnd,
-        filter,
-        // Page-index pushdown is opt-in in hyparquet. It is a no-op without
-        // a filter and falls back safely when indexes are unavailable.
-        usePageIndex,
         compressors,
         parsers: LAZY_GEO_PARSERS,
       };
       if (columns) readArgs['columns'] = columns;
-      if (!filter) delete readArgs['filter'];
       yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
     }
   }
@@ -371,17 +359,6 @@ export class CogpReader {
     return n;
   }
 
-}
-
-function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
-  return {
-    $and: [
-      { [paths.xmin.join('.')]: { $lte: bbox.maxX } },
-      { [paths.ymin.join('.')]: { $lte: bbox.maxY } },
-      { [paths.xmax.join('.')]: { $gte: bbox.minX } },
-      { [paths.ymax.join('.')]: { $gte: bbox.minY } },
-    ],
-  };
 }
 
 function normalizeBbox(input?: BboxInput): Bbox | undefined {

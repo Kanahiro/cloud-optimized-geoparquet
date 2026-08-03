@@ -17,8 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
-    "benchmark:page-index": "npm run build && node benchmark/page-index.mjs"
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "hyparquet": "^1.27.1",

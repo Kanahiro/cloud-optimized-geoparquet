@@ -22,11 +22,9 @@
 //! [`geozero`](https://crates.io/crates/geozero) — see the README.
 use anyhow::{anyhow, Context, Result};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    ParquetRecordBatchReaderBuilder, RowSelection,
+    ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::page_index::index::Index;
 use parquet::file::reader::ChunkReader;
 use parquet::file::statistics::Statistics;
 use std::fs::File;
@@ -55,60 +53,23 @@ pub struct Reader {
     arrow_meta: ArrowReaderMetadata,
     geo_meta: GeoMeta,
     cogp_meta: CogpMeta,
-    use_page_index: bool,
-}
-
-/// Controls optional work performed by [`Reader`].
-///
-/// Page indexes are disabled by default because loading them can add remote
-/// range requests and page pruning is not always a latency win. Enabling the
-/// option loads the column and offset indexes at construction and uses them
-/// for bbox reads.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ReaderOptions {
-    use_page_index: bool,
-}
-
-impl ReaderOptions {
-    pub fn with_page_index(mut self, enabled: bool) -> Self {
-        self.use_page_index = enabled;
-        self
-    }
-
-    pub fn use_page_index(&self) -> bool {
-        self.use_page_index
-    }
 }
 
 impl Reader {
     /// Open a local file, parse the footer once, then drop the file handle.
     /// Per-request reads supply a fresh `File` (or any [`ChunkReader`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_options(path, ReaderOptions::default())
-    }
-
-    /// Open a local file with explicit reader options.
-    pub fn open_with_options(path: impl AsRef<Path>, options: ReaderOptions) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        Self::try_new_with_options(file, options)
+        Self::try_new(file)
     }
 
     /// Parse the footer from any [`ChunkReader`] (e.g. `File`, `bytes::Bytes`).
     /// The reader is consumed for the footer read; it is **not** stored — pass
     /// a fresh reader to [`Self::sync_batch_reader`] per request.
     pub fn try_new<R: ChunkReader + 'static>(reader: R) -> Result<Self> {
-        Self::try_new_with_options(reader, ReaderOptions::default())
-    }
-
-    /// Parse the footer with explicit reader options.
-    pub fn try_new_with_options<R: ChunkReader + 'static>(
-        reader: R,
-        options: ReaderOptions,
-    ) -> Result<Self> {
-        let arrow_options = ArrowReaderOptions::new().with_page_index(options.use_page_index);
-        let arrow_meta = ArrowReaderMetadata::load(&reader, arrow_options)?;
-        Self::from_arrow_metadata_with_options(arrow_meta, options)
+        let arrow_meta = ArrowReaderMetadata::load(&reader, Default::default())?;
+        Self::from_arrow_metadata(arrow_meta)
     }
 
     /// Parse the footer from an [`AsyncFileReader`] (e.g. an `object_store`
@@ -118,60 +79,20 @@ impl Reader {
     /// stream consumes the reader by value.
     #[cfg(feature = "async")]
     pub async fn try_new_async<R: AsyncFileReader>(reader: &mut R) -> Result<Self> {
-        Self::try_new_async_with_options(reader, ReaderOptions::default()).await
-    }
-
-    /// Parse async metadata with explicit reader options.
-    ///
-    /// For [`ParquetObjectReader`], prefer [`Self::try_new_object_store`]: the
-    /// upstream object-store adapter has separate preload switches that must
-    /// be set before metadata is fetched.
-    #[cfg(feature = "async")]
-    pub async fn try_new_async_with_options<R: AsyncFileReader>(
-        reader: &mut R,
-        options: ReaderOptions,
-    ) -> Result<Self> {
-        let arrow_options = ArrowReaderOptions::new().with_page_index(options.use_page_index);
-        let arrow_meta = ArrowReaderMetadata::load_async(reader, arrow_options).await?;
-        Self::from_arrow_metadata_with_options(arrow_meta, options)
-    }
-
-    /// Parse metadata from object storage while applying the Page Index
-    /// option to both the transport preload and bbox page pruning.
-    #[cfg(feature = "object_store")]
-    pub async fn try_new_object_store(
-        reader: ParquetObjectReader,
-        options: ReaderOptions,
-    ) -> Result<Self> {
-        let mut reader = reader
-            .with_preload_column_index(options.use_page_index)
-            .with_preload_offset_index(options.use_page_index);
-        Self::try_new_async_with_options(&mut reader, options).await
+        let arrow_meta = ArrowReaderMetadata::load_async(reader, Default::default()).await?;
+        Self::from_arrow_metadata(arrow_meta)
     }
 
     /// Build from an already-parsed [`ArrowReaderMetadata`]. Useful when the
     /// caller has its own footer cache (e.g. a CDN / Redis layer in front of
     /// S3) and wants to skip even the initial range request.
     pub fn from_arrow_metadata(arrow_meta: ArrowReaderMetadata) -> Result<Self> {
-        Self::from_arrow_metadata_with_options(arrow_meta, ReaderOptions::default())
-    }
-
-    /// Build from already-parsed metadata with explicit reader options.
-    pub fn from_arrow_metadata_with_options(
-        arrow_meta: ArrowReaderMetadata,
-        options: ReaderOptions,
-    ) -> Result<Self> {
         let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata())?;
         Ok(Self {
             arrow_meta,
             geo_meta,
             cogp_meta,
-            use_page_index: options.use_page_index,
         })
-    }
-
-    pub fn uses_page_index(&self) -> bool {
-        self.use_page_index
     }
 
     pub fn arrow_metadata(&self) -> &ArrowReaderMetadata {
@@ -307,103 +228,6 @@ impl Reader {
         out
     }
 
-    /// Build a conservative page-level row selection for a bbox query.
-    ///
-    /// The selection applies the four covering predicates (`xmin <= qxmax`,
-    /// `ymin <= qymax`, `xmax >= qxmin`, `ymax >= qymin`) to page min/max
-    /// indexes. Pages that provably cannot intersect are skipped before their
-    /// data is fetched or decoded. Missing or malformed indexes are kept, so
-    /// this optimization cannot introduce false negatives.
-    ///
-    /// This is page pruning, not an exact spatial filter: callers must still
-    /// test each returned feature bbox. The selection is relative to the
-    /// concatenation of `row_groups`, matching Parquet's reader contract.
-    pub fn row_selection_intersecting_bbox(
-        &self,
-        row_groups: &[usize],
-        bbox: [f64; 4],
-    ) -> RowSelection {
-        let metadata = self.arrow_meta.metadata();
-        let total_rows = row_groups
-            .iter()
-            .filter_map(|&rg| metadata.row_groups().get(rg))
-            .map(|rg| rg.num_rows() as usize)
-            .sum();
-        let mut keep = vec![true; total_rows];
-
-        let Some((xmin_i, ymin_i, xmax_i, ymax_i)) = self.bbox_column_indexes() else {
-            return selection_from_bitmap(&keep);
-        };
-        let (Some(column_indexes), Some(offset_indexes)) =
-            (metadata.column_index(), metadata.offset_index())
-        else {
-            return selection_from_bitmap(&keep);
-        };
-
-        let [qxmin, qymin, qxmax, qymax] = bbox;
-        let mut base = 0;
-        for &rg_i in row_groups {
-            let Some(rg) = metadata.row_groups().get(rg_i) else {
-                continue;
-            };
-            let rows = rg.num_rows() as usize;
-            let Some(rg_columns) = column_indexes.get(rg_i) else {
-                base += rows;
-                continue;
-            };
-            let Some(rg_offsets) = offset_indexes.get(rg_i) else {
-                base += rows;
-                continue;
-            };
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(xmin_i),
-                rg_offsets.get(xmin_i),
-                |min, _| min > qxmax,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(ymin_i),
-                rg_offsets.get(ymin_i),
-                |min, _| min > qymax,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(xmax_i),
-                rg_offsets.get(xmax_i),
-                |_, max| max < qxmin,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(ymax_i),
-                rg_offsets.get(ymax_i),
-                |_, max| max < qymin,
-            );
-            base += rows;
-        }
-        selection_from_bitmap(&keep)
-    }
-
-    /// Build a sync reader with row-group bbox pruning and, when enabled at
-    /// construction, page-level bbox pruning.
-    pub fn sync_batch_reader_with_bbox<R: ChunkReader + 'static>(
-        &self,
-        reader: R,
-        row_groups: &[usize],
-        bbox: [f64; 4],
-    ) -> Result<ParquetRecordBatchReader> {
-        let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        let builder = builder.with_row_groups(row_groups.clone());
-        let builder = if self.use_page_index {
-            builder.with_row_selection(self.row_selection_intersecting_bbox(&row_groups, bbox))
-        } else {
-            builder
-        };
-        Ok(builder.build()?)
-    }
-
     /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
     /// reusing the cached footer metadata (no second footer parse).
     pub fn sync_batch_reader<R: ChunkReader + 'static>(
@@ -431,110 +255,6 @@ impl Reader {
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
-
-    /// Build an async stream with row-group bbox pruning and, when enabled at
-    /// construction, page-level bbox pruning.
-    #[cfg(feature = "async")]
-    pub fn async_batch_stream_with_bbox<R: AsyncFileReader + Send + 'static>(
-        &self,
-        reader: R,
-        row_groups: &[usize],
-        bbox: [f64; 4],
-    ) -> Result<ParquetRecordBatchStream<R>> {
-        let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let builder =
-            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        let builder = builder.with_row_groups(row_groups.clone());
-        let builder = if self.use_page_index {
-            builder.with_row_selection(self.row_selection_intersecting_bbox(&row_groups, bbox))
-        } else {
-            builder
-        };
-        Ok(builder.build()?)
-    }
-
-    fn bbox_column_indexes(&self) -> Option<(usize, usize, usize, usize)> {
-        let covering = self
-            .geo_meta
-            .columns
-            .get(&self.geo_meta.primary_column)?
-            .covering
-            .as_ref()?;
-        let schema = self.arrow_meta.metadata().file_metadata().schema_descr();
-        let find = |path: &[String]| {
-            let dotted = path.join(".");
-            (0..schema.num_columns()).find(|&i| schema.column(i).path().string() == dotted)
-        };
-        Some((
-            find(&covering.bbox.xmin)?,
-            find(&covering.bbox.ymin)?,
-            find(&covering.bbox.xmax)?,
-            find(&covering.bbox.ymax)?,
-        ))
-    }
-
-    fn bbox_candidate_row_groups(&self, row_groups: &[usize], bbox: [f64; 4]) -> Vec<usize> {
-        let candidates = self.row_groups_intersecting_bbox(bbox);
-        row_groups
-            .iter()
-            .copied()
-            .filter(|rg| candidates.binary_search(rg).is_ok())
-            .collect()
-    }
-}
-
-fn prune_double_pages(
-    keep: &mut [bool],
-    index: Option<&Index>,
-    offsets: Option<&parquet::file::page_index::offset_index::OffsetIndexMetaData>,
-    misses: impl Fn(f64, f64) -> bool,
-) {
-    let (Some(Index::DOUBLE(index)), Some(offsets)) = (index, offsets) else {
-        return;
-    };
-    let locations = offsets.page_locations();
-    for (page_i, stats) in index.indexes.iter().enumerate() {
-        let (Some(min), Some(max), Some(location)) = (
-            stats.min().copied(),
-            stats.max().copied(),
-            locations.get(page_i),
-        ) else {
-            continue;
-        };
-        if !misses(min, max) {
-            continue;
-        }
-        let Ok(start) = usize::try_from(location.first_row_index) else {
-            continue;
-        };
-        let end = locations
-            .get(page_i + 1)
-            .and_then(|p| usize::try_from(p.first_row_index).ok())
-            .unwrap_or(keep.len())
-            .min(keep.len());
-        if start <= end && start < keep.len() {
-            keep[start..end].fill(false);
-        }
-    }
-}
-
-fn selection_from_bitmap(keep: &[bool]) -> RowSelection {
-    let mut ranges = Vec::new();
-    let mut start = None;
-    for (row, &selected) in keep.iter().enumerate() {
-        match (start, selected) {
-            (None, true) => start = Some(row),
-            (Some(first), false) => {
-                ranges.push(first..row);
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(first) = start {
-        ranges.push(first..keep.len());
-    }
-    RowSelection::from_consecutive_ranges(ranges.into_iter(), keep.len())
 }
 
 fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)> {
@@ -566,12 +286,9 @@ mod tests {
     use crate::meta::{
         BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, COGP_VERSION, GEOPARQUET_VERSION,
     };
-    use arrow::array::{ArrayRef, Float64Array, StructArray};
-    use arrow::datatypes::{DataType, Field, Fields, Schema};
-    use arrow::record_batch::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::metadata::KeyValue;
-    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use std::collections::BTreeMap;
 
     fn level(row_group_end: i64, gsd: f64) -> Level {
@@ -665,118 +382,6 @@ mod tests {
         assert_eq!(r.row_groups_up_to_gsd(500.0), 0..2);
         // target coarser than every level → empty
         assert!(r.row_groups_up_to_gsd(1e9).is_empty());
-    }
-
-    #[test]
-    fn bbox_batch_reader_prunes_non_intersecting_pages() {
-        let bbox_fields = Fields::from(vec![
-            Field::new("xmin", DataType::Float64, false),
-            Field::new("ymin", DataType::Float64, false),
-            Field::new("xmax", DataType::Float64, false),
-            Field::new("ymax", DataType::Float64, false),
-        ]);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "bbox",
-            DataType::Struct(bbox_fields.clone()),
-            false,
-        )]));
-        let values = vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0];
-        let bbox: ArrayRef = Arc::new(
-            StructArray::try_new(
-                bbox_fields,
-                vec![
-                    Arc::new(Float64Array::from(values.clone())),
-                    Arc::new(Float64Array::from(values.clone())),
-                    Arc::new(Float64Array::from(values.clone())),
-                    Arc::new(Float64Array::from(values)),
-                ],
-                None,
-            )
-            .unwrap(),
-        );
-        let batch = RecordBatch::try_new(schema.clone(), vec![bbox]).unwrap();
-        let props = WriterProperties::builder()
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_data_page_row_count_limit(2)
-            .set_write_batch_size(2)
-            .build();
-        let mut buf = Vec::new();
-        {
-            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-            let mut columns = BTreeMap::new();
-            columns.insert(
-                "geometry".to_string(),
-                GeoColumn {
-                    encoding: "WKB".into(),
-                    geometry_types: vec![],
-                    covering: Some(Covering {
-                        bbox: BboxCovering {
-                            xmin: vec!["bbox".into(), "xmin".into()],
-                            ymin: vec!["bbox".into(), "ymin".into()],
-                            xmax: vec!["bbox".into(), "xmax".into()],
-                            ymax: vec!["bbox".into(), "ymax".into()],
-                        },
-                    }),
-                    bbox: None,
-                    crs: None,
-                },
-            );
-            let geo = GeoMeta {
-                version: GEOPARQUET_VERSION.into(),
-                primary_column: "geometry".into(),
-                columns,
-            };
-            let cogp = CogpMeta {
-                version: COGP_VERSION.into(),
-                levels: vec![level(0, 1.0)],
-            };
-            writer.append_key_value_metadata(KeyValue {
-                key: GEO_METADATA_KEY.into(),
-                value: Some(serde_json::to_string(&geo).unwrap()),
-            });
-            writer.append_key_value_metadata(KeyValue {
-                key: COGP_METADATA_KEY.into(),
-                value: Some(serde_json::to_string(&cogp).unwrap()),
-            });
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
-
-        let bytes = bytes::Bytes::from(buf);
-
-        let default_reader = Reader::try_new(bytes.clone()).unwrap();
-        assert!(!default_reader.uses_page_index());
-        assert!(default_reader.parquet_metadata().column_index().is_none());
-        let default_rows = default_reader
-            .sync_batch_reader_with_bbox(bytes.clone(), &[0], [9.0, 9.0, 12.0, 12.0])
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum::<usize>();
-        assert_eq!(default_rows, 6);
-
-        let reader = Reader::try_new_with_options(
-            bytes.clone(),
-            ReaderOptions::default().with_page_index(true),
-        )
-        .unwrap();
-        assert!(reader.uses_page_index());
-        assert!(reader.parquet_metadata().column_index().is_some());
-        let batches: Vec<_> = reader
-            .sync_batch_reader_with_bbox(bytes.clone(), &[0], [9.0, 9.0, 12.0, 12.0])
-            .unwrap()
-            .map(|batch| batch.unwrap())
-            .collect();
-        assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-            2
-        );
-
-        let outside = reader
-            .sync_batch_reader_with_bbox(bytes, &[0], [100.0, 100.0, 101.0, 101.0])
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum::<usize>();
-        assert_eq!(outside, 0);
     }
 
     /// Build a tiny parquet `bytes::Bytes` blob with the given KV metadata

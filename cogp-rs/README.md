@@ -41,10 +41,9 @@ cogp convert <INPUT> <OUTPUT> [OPTIONS]
 Examples:
 
 ```
-# Narrow the zoom range and use five spatial pages per row group.
+# Narrow the zoom range and bump the row group size for a small dataset.
 cogp convert input.parquet output.cogp.parquet \
-    --webmerc-minzoom 4 --webmerc-maxzoom 12 \
-    --row-group-size 51200 --page-size 10240
+    --webmerc-minzoom 4 --webmerc-maxzoom 12 --row-group-size 20000
 
 # Optimize for a renderer other than Web Mercator: pass GSDs directly
 # (meters, coarse to fine). The defaults still produce a valid COGP file for
@@ -78,16 +77,8 @@ readable by any renderer regardless of which path you pick.
 
 Other options:
 
-- `--row-group-size` (default `102400`) — maximum Parquet row group size in
-  rows. It must be an integer multiple of `--page-size`; row group boundaries
-  always align with level boundaries. STR packing first creates spatially
-  compact leaves of this size, matching the first pruning unit used by remote
-  readers.
-- `--page-size` (default `10240`) — target maximum number of rows per Parquet
-  data page. A second STR pass runs independently inside each row group, so the
-  defaults place ten independently prunable spatial page leaves in each full
-  row group without sacrificing row-group bbox locality. The writer can split
-  a variable-width column earlier when it reaches the byte-size limit.
+- `--row-group-size` (default `10000`) — max Parquet row group size in rows.
+  Row group boundaries always align with level boundaries.
 - `--row-group-max-bytes` — max estimated encoded Parquet row group size in
   bytes. This must be a numeric byte count, without suffixes. It is enforced
   using the Parquet writer's in-progress encoded-size estimate, checked at batch
@@ -167,16 +158,12 @@ arrow-array = "56"
 ```rust
 use std::fs::File;
 use arrow_array::{Array, BinaryArray, LargeBinaryArray};
-use cogp::reader::{Reader, ReaderOptions};
+use cogp::reader::Reader;
 use geozero::wkb::Wkb;
 use geozero::ToJson;
 
-// The default loads only the footer. Page indexes are opt-in because loading
-// them can cost extra I/O and is not always faster.
-let reader = Reader::open_with_options(
-    "data.cogp.parquet",
-    ReaderOptions::default().with_page_index(true),
-)?;
+// The footer is parsed here and cached. Hold this in app state.
+let reader = Reader::open("data.cogp.parquet")?;
 let primary = reader.primary_column().to_string();
 
 // Pre-filter row groups using bbox stats + a target GSD/zoom — these
@@ -185,14 +172,10 @@ let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
 let by_level = reader.row_groups_up_to_level(8);
 let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
 
-// Per request: page indexes further prune bbox misses inside candidate groups.
-// The result is conservative; test each returned feature bbox for an exact filter.
+// Per request: discard row groups whose bbox misses the query.
+// Test each returned feature bbox for an exact filter.
 let file = File::open("data.cogp.parquet")?;
-let batches = reader.sync_batch_reader_with_bbox(
-    file,
-    &rgs,
-    [139.0, 35.0, 140.0, 36.0],
-)?;
+let batches = reader.sync_batch_reader(file, &rgs)?;
 
 for batch in batches {
     let batch = batch?;
@@ -229,7 +212,6 @@ futures = "0.3"
 use std::sync::Arc;
 use cogp::reader::{
     ParquetObjectReader, RangeCoalescingOptions, RangeCoalescingReader, Reader,
-    ReaderOptions,
 };
 use futures::StreamExt;
 use object_store::{aws::AmazonS3Builder, path::Path as ObjPath, ObjectStore};
@@ -239,14 +221,10 @@ let store: Arc<dyn ObjectStore> =
 let path = ObjPath::from("layers/admin.cogp.parquet");
 let head = store.head(&path).await?;
 
-// One opt-in controls both remote index preloading and bbox page pruning.
-// Without it, only the footer is loaded and no Page Index request is made.
-let footer_reader = ParquetObjectReader::new(store.clone(), path.clone())
+// Load and cache the footer for the lifetime of the server.
+let mut footer_reader = ParquetObjectReader::new(store.clone(), path.clone())
     .with_file_size(head.size);
-let reader = Reader::try_new_object_store(
-    footer_reader,
-    ReaderOptions::default().with_page_index(true),
-).await?;
+let reader = Reader::try_new_async(&mut footer_reader).await?;
 let primary = reader.primary_column().to_string();
 
 // Per request: filter row groups (footer-only, no IO), then stream just
@@ -262,11 +240,7 @@ let per_request_reader = RangeCoalescingReader::try_new(
         .with_max_gap_bytes(128 * 1024)
         .with_max_overfetch_ratio(1.25),
 )?;
-let mut stream = reader.async_batch_stream_with_bbox(
-    per_request_reader,
-    &rgs,
-    [139.0, 35.0, 140.0, 36.0],
-)?;
+let mut stream = reader.async_batch_stream(per_request_reader, &rgs)?;
 
 while let Some(batch) = stream.next().await {
     let _batch = batch?;
@@ -278,20 +252,12 @@ while let Some(batch) = stream.next().await {
 
 ### Reader API at a glance
 
-Construction (parses and caches the footer; Page Index loading is disabled by
-default):
+Construction (parses and caches the footer):
 
 - `Reader::open(path)` — local file.
-- `Reader::open_with_options(path, options)` — local file with optional Page
-  Index loading.
 - `Reader::try_new(reader)` — any `parquet::file::reader::ChunkReader`.
-- `Reader::try_new_with_options(reader, options)` — sync construction with
-  optional Page Index loading.
 - `Reader::try_new_async(reader)` — any
   `parquet::arrow::async_reader::AsyncFileReader` (`feature = "async"`).
-- `Reader::try_new_object_store(reader, options)` — object storage construction;
-  one `ReaderOptions::with_page_index(true)` enables both column/offset index
-  preloading and bbox page pruning (`feature = "object_store"`).
 - `Reader::from_arrow_metadata(meta)` — bring your own cached
   `ArrowReaderMetadata`.
 
@@ -313,20 +279,12 @@ Selectors (`&self`, no IO — they only consult the cached footer):
 - `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
   covering-bbox envelope intersects the query, via Parquet column statistics.
-- `row_selection_intersecting_bbox(&row_groups, bbox)` — conservative page-level
-  selection using covering-bbox column and offset indexes.
 
 Per-request reads (hand in a fresh sync / async reader; footer is reused):
 
 - `sync_batch_reader(reader, &row_groups)` — `ParquetRecordBatchReader`.
-- `sync_batch_reader_with_bbox(reader, &row_groups, bbox)` — row-group-pruned
-  `ParquetRecordBatchReader`; also page-pruned when enabled at construction
-  (still requires exact per-row bbox filtering).
 - `async_batch_stream(reader, &row_groups)` — `ParquetRecordBatchStream`
   (`feature = "async"`).
-- `async_batch_stream_with_bbox(reader, &row_groups, bbox)` — async row-group-
-  pruned stream, also page-pruned when enabled at construction (`feature =
-  "async"`; still requires exact row filtering).
 
 ## validate
 

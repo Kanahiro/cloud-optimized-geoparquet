@@ -7,8 +7,7 @@ use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use clap::Args;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-    RowSelector,
+    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Compression;
@@ -54,18 +53,9 @@ pub struct ConvertArgs {
     /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
-    /// Maximum Parquet row group size in rows. Must be an integer multiple of
-    /// --page-size. STR first forms spatial row-group leaves, then spatial
-    /// page leaves within each row group.
-    #[arg(long, default_value_t = 102400)]
+    /// Parquet row group size in rows.
+    #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
-    /// Target maximum number of rows per Parquet data page. The inner STR
-    /// packing stage uses this as its leaf size, making each bbox page a
-    /// spatially coherent unit without weakening row-group locality.
-    /// The Parquet writer may split variable-width columns earlier when they
-    /// reach its byte-size limit.
-    #[arg(long, default_value_t = 10240)]
-    pub page_size: usize,
     /// Maximum estimated encoded Parquet row group size in bytes
     #[arg(long)]
     pub row_group_max_bytes: Option<usize>,
@@ -325,27 +315,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
     }
-    if args.page_size == 0 {
-        bail!("--page-size must be >= 1");
-    }
-    if !args.row_group_size.is_multiple_of(args.page_size) {
-        bail!(
-            "--row-group-size ({}) must be an integer multiple of --page-size ({})",
-            args.row_group_size,
-            args.page_size
-        );
-    }
-
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     // Footer parsed once; both streaming passes below reuse it via
-    // `new_with_metadata`, and each pass opens its own file handle. The page
-    // index matters for pass 2: without it a row selection can only skip
-    // whole row groups, so every chunk would decompress all pages of every
-    // row group it touches instead of just the pages holding selected rows.
-    let arrow_meta =
-        ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true))?;
+    // `new_with_metadata`, and each pass opens its own file handle.
+    let arrow_meta = ArrowReaderMetadata::load(&file, Default::default())?;
     drop(file);
 
     let input_schema = arrow_meta.schema().clone();
@@ -487,13 +462,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(
-            rows,
-            &bboxes,
-            args.row_group_size,
-            args.page_size,
-            level_idx,
-        );
+        str_pack(rows, &bboxes, args.row_group_size, level_idx);
     }
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
@@ -534,14 +503,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut props_builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_size(args.row_group_size)
-        .set_data_page_row_count_limit(args.page_size)
-        // Page row limits are checked between write batches. Keeping the batch
-        // no larger than a page makes small configured pages effective; the
-        // default 10,240-row page remains exactly aligned to 1,024-row batches.
-        .set_write_batch_size(args.page_size.min(1024))
-        // Page statistics produce the column index used for bbox page pruning.
-        // The Parquet writer emits the matching offset index by default.
-        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
@@ -1476,22 +1439,9 @@ impl SnakeStart {
     }
 }
 
-/// Hierarchical STR bulk-loading aligned to Parquet's pruning hierarchy.
-///
-/// The outer pass forms spatially compact row groups. Only then does an inner
-/// pass form compact pages inside each row group. Packing pages globally and
-/// concatenating them into row groups can give a row group a large union bbox,
-/// forcing remote readers to fetch it before the page index can help.
-fn str_pack(
-    rows: &mut Vec<u32>,
-    bboxes: &[Bbox],
-    row_group_size: usize,
-    page_size: usize,
-    level_idx: usize,
-) {
+/// STR bulk-loading into spatially compact row-group leaves.
+fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_idx: usize) {
     let dir = SnakeStart::for_level(level_idx).initial_dir();
-    // Both hierarchy passes share one DSU scratch allocation. Each inner pass
-    // receives the slice corresponding exactly to its row group.
     let mut scratch: Vec<(f64, u32)> = vec![(0.0, 0); rows.len()];
     str_pack_rec(
         rows.as_mut_slice(),
@@ -1500,16 +1450,6 @@ fn str_pack(
         row_group_size,
         dir,
     );
-
-    rows.par_chunks_mut(row_group_size)
-        .zip(scratch.par_chunks_mut(row_group_size))
-        .enumerate()
-        .for_each(|(row_group_idx, (row_group, row_group_scratch))| {
-            // Alternating the inner traversal avoids repeatedly jumping back to
-            // the same corner at physical row-group boundaries.
-            let page_dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
-            str_pack_rec(row_group, row_group_scratch, bboxes, page_size, page_dir);
-        });
 }
 
 fn str_pack_rec(
@@ -1894,7 +1834,7 @@ mod tests {
 
     #[test]
     fn str_pack_preserves_set_and_uses_full_leaves() {
-        // 17 features in row groups of 10 and pages of 5 → never drops a row.
+        // 17 features in row groups of 10 → never drops a row.
         let mut bboxes = Vec::new();
         for i in 0..17 {
             let x = (i % 5) as f64;
@@ -1902,44 +1842,11 @@ mod tests {
             bboxes.push(bb(x, y, x + 0.1, y + 0.1));
         }
         let mut rows: Vec<u32> = (0..17u32).collect();
-        str_pack(&mut rows, &bboxes, 10, 5, 0);
+        str_pack(&mut rows, &bboxes, 10, 0);
         let mut sorted = rows.clone();
         sorted.sort();
         let expected: Vec<u32> = (0..17u32).collect();
         assert_eq!(sorted, expected, "str_pack must preserve the row set");
-    }
-
-    #[test]
-    fn str_pack_makes_row_groups_then_page_sized_spatial_leaves() {
-        // An 8×8 grid becomes four compact 4×4 row groups, each containing
-        // compact 2×2 pages. A global page-first packing can instead combine
-        // distant page leaves into a long, overlapping row-group bbox.
-        let mut bboxes = Vec::new();
-        for x in 0..8 {
-            for y in 0..8 {
-                bboxes.push(bb(x as f64, y as f64, x as f64, y as f64));
-            }
-        }
-        let mut rows: Vec<u32> = (0..64).rev().collect();
-        str_pack(&mut rows, &bboxes, 16, 4, 0);
-
-        for row_group in rows.chunks(16) {
-            let mut extent = Bbox::empty();
-            for row in row_group {
-                extent.merge(&bboxes[*row as usize]);
-            }
-            assert!(extent.width() <= 3.0, "row group is too wide: {extent:?}");
-            assert!(extent.height() <= 3.0, "row group is too tall: {extent:?}");
-        }
-
-        for leaf in rows.chunks(4) {
-            let mut extent = Bbox::empty();
-            for row in leaf {
-                extent.merge(&bboxes[*row as usize]);
-            }
-            assert!(extent.width() <= 1.0, "page leaf is too wide: {extent:?}");
-            assert!(extent.height() <= 1.0, "page leaf is too tall: {extent:?}");
-        }
     }
 
     #[test]

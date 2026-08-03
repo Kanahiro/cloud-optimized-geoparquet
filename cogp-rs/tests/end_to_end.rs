@@ -14,10 +14,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
-use cogp::reader::{Reader, ReaderOptions};
+use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
-use parquet::file::page_index::index::Index;
 
 /// Little-endian WKB encoder for the geometry kinds we use in the fixture.
 mod wkb {
@@ -139,7 +138,6 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
-        page_size: 2,
         row_group_max_bytes: None,
         input_units: InputUnits::Degrees,
         geometry_column: None,
@@ -164,16 +162,7 @@ fn convert_reader_validate_pipeline() {
     // The validator must accept the output.
     cogp::validate::run(&output).unwrap();
 
-    let default_reader = Reader::open(&output).unwrap();
-    assert!(!default_reader.uses_page_index());
-    assert!(default_reader.parquet_metadata().column_index().is_none());
-
-    let reader = Reader::open_with_options(
-        &output,
-        ReaderOptions::default().with_page_index(true),
-    )
-    .unwrap();
-    assert!(reader.uses_page_index());
+    let reader = Reader::open(&output).unwrap();
     assert!(!reader.levels().is_empty(), "must emit at least one level");
     assert_eq!(reader.primary_column(), "geometry");
 
@@ -196,44 +185,17 @@ fn convert_reader_validate_pipeline() {
     let total_rgs = reader.num_row_groups();
     assert_eq!(cogp.levels.last().unwrap().row_group_end as usize + 1, total_rgs);
 
-    // Converter output carries readable page statistics for every column.
-    let metadata = reader.parquet_metadata();
-    let column_indexes = metadata.column_index().expect("column indexes");
-    let offset_indexes = metadata.offset_index().expect("offset indexes");
-    assert!(column_indexes.iter().all(|row_group| row_group
+    // The profile relies only on row-group statistics; the converter must not
+    // add page-level index structures to the output.
+    assert!(reader
+        .parquet_metadata()
+        .row_groups()
         .iter()
-        .all(|column| !matches!(column, Index::NONE))));
-
-    // In particular, all four covering leaves must be typed Double indexes.
-    let schema = metadata.file_metadata().schema_descr();
-    for child in ["xmin", "ymin", "xmax", "ymax"] {
-        let path = format!("bbox.{child}");
-        let column = (0..schema.num_columns())
-            .find(|&i| schema.column(i).path().string() == path)
-            .unwrap();
-        assert!(
-            column_indexes
-                .iter()
-                .all(|row_group| matches!(row_group[column], Index::DOUBLE(_))),
-            "missing page statistics for {path}"
-        );
-        for (rg_i, row_group) in metadata.row_groups().iter().enumerate() {
-            let locations = offset_indexes[rg_i][column].page_locations();
-            assert!(!locations.is_empty(), "missing page offsets for {path}");
-            for (page_i, location) in locations.iter().enumerate() {
-                let start = location.first_row_index as usize;
-                let end = locations
-                    .get(page_i + 1)
-                    .map(|next| next.first_row_index as usize)
-                    .unwrap_or(row_group.num_rows() as usize);
-                assert!(
-                    end - start <= 2,
-                    "{path} page has {} rows, configured maximum is 2",
-                    end - start
-                );
-            }
-        }
-    }
+        .all(|row_group| {
+            row_group.columns().iter().all(|column| {
+                column.column_index_offset().is_none() && column.offset_index_offset().is_none()
+            })
+        }));
 
     // Selector contracts.
     assert!(reader.row_groups_in_level(reader.levels().len()).is_none());
@@ -316,25 +278,6 @@ fn convert_rejects_zero_thinning_factor() {
     args.point_thinning_factor = 0;
     let err = cogp::convert::run(args).unwrap_err();
     assert!(format!("{err}").contains("point-thinning-factor"));
-}
-
-#[test]
-fn convert_rejects_invalid_page_layout() {
-    let tmp = TempDir::new("bad-page-layout");
-    let input = tmp.path().join("input.parquet");
-    let output = tmp.path().join("out.parquet");
-    write_input(&input);
-
-    let mut zero = convert_args(&input, &output);
-    zero.page_size = 0;
-    let err = cogp::convert::run(zero).unwrap_err();
-    assert!(format!("{err}").contains("--page-size must be >= 1"));
-
-    let mut unaligned = convert_args(&input, &output);
-    unaligned.row_group_size = 7;
-    unaligned.page_size = 2;
-    let err = cogp::convert::run(unaligned).unwrap_err();
-    assert!(format!("{err}").contains("integer multiple"));
 }
 
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead

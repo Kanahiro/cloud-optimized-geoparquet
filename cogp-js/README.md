@@ -3,14 +3,12 @@
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
-area and ground sample distance. Bbox reads always use covering-column
-statistics at row-group granularity and can optionally use Page Index pruning,
-then apply an exact per-feature bbox filter to the surviving rows. Page Index
-use is disabled by default because its extra range requests are not always a
-latency win; opt in per read with `usePageIndex: true`.
+area and ground sample distance. Bbox reads use covering-column statistics to
+prune row groups, then apply an exact per-feature bbox filter to the surviving
+rows.
 
 Remote reads coalesce nearby concurrent byte ranges by default. This reduces
-HTTP request count after page-index pruning while bounding extra transfer to a
+HTTP request count while bounding extra transfer to a
 128 KiB gap and total fetched bytes to 1.25× the uniquely requested bytes. Tune
 or disable it when opening:
 
