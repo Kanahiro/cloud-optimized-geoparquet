@@ -3,8 +3,10 @@
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` reorders the features of a GeoParquet file across row groups using
-point-grid density thinning, extent-based line/polygon visibility, and
-Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
+point-grid density thinning for points, simplification viability for lines and
+polygons, and Sort-Tile-Recursive (STR) bbox packing inside each level. It
+derives the output hierarchy from the actual simplified WKB payload and emits
+one sparse geometry overview per selected level. `validate` checks the
 structural rules in SPEC §5.
 
 ## Install
@@ -30,7 +32,9 @@ The output COGP file itself is projection-agnostic — it can be consumed by
 any renderer regardless of projection. The defaults simply pick GSDs tuned
 for a Web Mercator z0..=z16 tile pyramid (17 levels), since that's the most
 common viewer target. Pass `--gsd` to optimize for a different renderer.
-Works on any GeoParquet 1.x file with a WKB geometry column.
+The input must be GeoParquet 1.x with a WKB geometry column containing one
+topological family (Point, Line, or Polygon); singular and Multi variants of
+that family may coexist.
 
 ## convert
 
@@ -75,14 +79,31 @@ readable by any renderer regardless of which path you pick.
   resolution, so features collapsing within a few subpixels are deferred to
   finer levels. Controls level granularity; ignored when `--gsd` is given.
 
+Geometry overviews:
+
+- `--simplification-tolerance-factor` (default `1`) — multiplies the GSD at
+  each selected level to obtain that overview's simplification tolerance.
+- Hierarchy depth is data-derived, not configured. `convert` measures the exact
+  simplified WKB prefix at every candidate GSD, makes that size curve monotonic,
+  and retains the fewest occupied candidates needed to keep adjacent payload
+  growth near the 4× area growth implied by halving linear resolution. The
+  coarsest and finest occupied candidates are always retained.
+- Every selected level has exactly one overview column. The final overview
+  covers the complete feature ladder, so rendering readers need not project raw
+  geometry.
+- Each overview is non-null through its linked level boundary and entirely
+  null afterward. The primary WKB column remains lossless for every row.
+
 Other options:
 
 - `--row-group-size` (default `10000`) — max Parquet row group size in rows.
   Row group boundaries always align with level boundaries.
-- `--row-group-max-bytes` — max estimated encoded Parquet row group size in
-  bytes. This must be a numeric byte count, without suffixes. It is enforced
-  using the Parquet writer's in-progress encoded-size estimate, checked at batch
-  granularity, so an individual row group can exceed the target slightly.
+- `--row-group-max-bytes` (default `4194304`, 4 MiB) — max cumulative WKB
+  payload per row group, measured against the largest non-null geometry
+  overview for each row. The lossless primary WKB is deliberately excluded
+  because rendering readers do not project it. This must be a numeric byte
+  count without suffixes. A single indivisible geometry may exceed the target
+  and receives its own row group.
 - `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
   PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
   per OGC:CRS84). Override with `degrees` or `meters` explicitly.
@@ -93,23 +114,14 @@ Other options:
   `Point` / `MultiPoint`) thin on a grid this many times coarser per axis
   than the level GSD, yielding approximately `factor²` fewer points than a
   factor of `1`. Set to `1` for one winner per GSD-sized cell. Grid thinning
-  applies only to points: lines and
-  polygons are assigned as soon as they meet their visibility threshold,
-  because a bbox center cannot represent an extended geometry's footprint.
-- `--line-visibility-factor` (default `2`) — coarsest level at which a
-  LineString is considered independently meaningful: its bbox diagonal must
-  reach `factor · GSD` of that level. Lines are 1D so a diagonal equal to
-  one GSD is only a hairline. This is a hard cutoff: a line shorter than the
-  threshold is excluded from that level and deferred to a finer one, so a
-  coarse-zoom read never fetches sub-resolution lines. Set to `1` for the least
-  restrictive supported threshold.
-- `--polygon-visibility-factor` (default `4`) — coarsest level at which a
-  Polygon is considered independently meaningful: its bbox diagonal must
-  reach `factor · GSD` of that level. A hard cutoff, like
-  `--line-visibility-factor`: a polygon below the threshold is excluded from
-  that level and deferred to a finer one. The default keeps coarse levels from
-  being crowded by tiny polygons. Set to `1` for the least restrictive supported
-  threshold.
+  applies only to points; a bbox center cannot represent an extended
+  geometry's footprint.
+- Line and Polygon levels are derived from simplification itself. A LineString
+  is deferred while its simplified length does not exceed the level tolerance;
+  a Polygon is deferred while simplification cannot retain a valid exterior
+  ring. Extended geometries do not compete in grid cells. Collapsed polygon
+  interior rings are dropped independently; the lossless final level remains
+  the fallback for a geometry that never survives simplification.
 - `--sort-key` — attribute column that decides which feature wins when several
   points contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is
@@ -272,8 +284,13 @@ Remote range coalescing (`feature = "async"):
 
 Selectors (`&self`, no IO — they only consult the cached footer):
 
-- `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
+- `levels()`, `geometry_overviews()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
   `num_row_groups()`, `parquet_metadata()`.
+- `geometry_column_for_gsd(gsd)` — the first overview whose boundary covers
+  the selected feature prefix and whose `tolerance_meters` is sufficiently
+  precise. Polygon-only data stays on the finest complete overview instead of
+  falling back to raw WKB when overviews exist. Line/Polygon files without any
+  overviews, and other geometry types, retain the lossless fallback.
 - `row_groups_in_level(i)` — one level.
 - `row_groups_up_to_level(i)` — every level up to and including `i`.
 - `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.

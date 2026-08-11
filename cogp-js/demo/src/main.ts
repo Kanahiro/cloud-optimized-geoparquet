@@ -3,12 +3,12 @@ import type { FeatureCollection } from 'geojson';
 
 import {
   openDataset as openCogpDataset,
+  readFeatureProperties,
   readViewport,
   type MetadataSummary,
 } from './dataset-service';
 
 const COGP_SOURCE_ID = 'cogp';
-const VIEWPORT_REFRESH_INTERVAL_MS = 150;
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -35,14 +35,30 @@ map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
 const COGP_INTERACTIVE_LAYERS = ['cogp-fill', 'cogp-line', 'cogp-point'];
 
-map.on('click', (e) => {
+map.on('click', async (e) => {
   const features = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS });
   const feature = features[0];
   if (!feature) return;
-  new maplibregl.Popup({ maxWidth: '360px' })
+  const ds = active;
+  const rowIndex = Number(feature.id);
+  const popup = new maplibregl.Popup({ maxWidth: '360px' })
     .setLngLat(e.lngLat)
-    .setHTML(renderPropertiesHtml(feature.properties))
+    .setHTML('<div class="cogp-popup"><em>Loading properties…</em></div>')
     .addTo(map);
+  if (!ds || !Number.isSafeInteger(rowIndex)) {
+    popup.setHTML(renderPropertiesHtml(feature.properties));
+    return;
+  }
+  try {
+    const { properties } = await readFeatureProperties(ds.url, rowIndex);
+    if (popup.isOpen()) popup.setHTML(renderPropertiesHtml(properties));
+  } catch (err) {
+    if (popup.isOpen()) {
+      popup.setHTML(
+        `<div class="cogp-popup"><em>Failed to load properties: ${escapeHtml((err as Error).message)}</em></div>`,
+      );
+    }
+  }
 });
 
 for (const layerId of COGP_INTERACTIVE_LAYERS) {
@@ -94,11 +110,12 @@ map.on('load', () => {
   if (active) installCogpSource();
 });
 
-map.on('move', () => {
-  if (active) {
-    viewportToken += 1;
-    requestViewportRefresh();
-  }
+map.on('movestart', () => {
+  if (active) viewportToken += 1;
+});
+
+map.on('moveend', () => {
+  if (active) requestViewportRefresh();
 });
 
 function installCogpSource(): void {
@@ -144,7 +161,7 @@ function installCogpSource(): void {
   });
 
   viewportToken += 1;
-  requestViewportRefresh(true);
+  requestViewportRefresh();
 }
 
 function removeCogpLayersAndSource(): void {
@@ -159,38 +176,23 @@ function emptyFC(): FeatureCollection {
 }
 
 let viewportToken = 0;
-let viewportRefreshTimer: number | null = null;
 let viewportRefreshInFlight = false;
 let viewportRefreshRequested = false;
-let lastViewportRefreshStartedAt = -Infinity;
 
-function requestViewportRefresh(immediate = false): void {
+function requestViewportRefresh(): void {
   viewportRefreshRequested = true;
-  if (viewportRefreshInFlight) return;
-
-  if (viewportRefreshTimer !== null) {
-    if (!immediate) return;
-    clearTimeout(viewportRefreshTimer);
-  }
-
-  const elapsed = performance.now() - lastViewportRefreshStartedAt;
-  const delay = immediate ? 0 : Math.max(0, VIEWPORT_REFRESH_INTERVAL_MS - elapsed);
-  viewportRefreshTimer = window.setTimeout(() => {
-    viewportRefreshTimer = null;
-    void runViewportRefresh();
-  }, delay);
+  if (!viewportRefreshInFlight && !map.isMoving()) void runViewportRefresh();
 }
 
 async function runViewportRefresh(): Promise<void> {
   if (!viewportRefreshRequested || viewportRefreshInFlight) return;
   viewportRefreshRequested = false;
   viewportRefreshInFlight = true;
-  lastViewportRefreshStartedAt = performance.now();
   try {
     await refreshViewport();
   } finally {
     viewportRefreshInFlight = false;
-    if (viewportRefreshRequested) requestViewportRefresh();
+    if (viewportRefreshRequested && !map.isMoving()) void runViewportRefresh();
   }
 }
 

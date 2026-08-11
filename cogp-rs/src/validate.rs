@@ -1,10 +1,13 @@
 use anyhow::{bail, Context, Result};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 
-use crate::meta::{CogpMeta, GeoMeta, COGP_METADATA_KEY, GEO_METADATA_KEY};
+use crate::meta::{
+    geometry_family, CogpMeta, GeoMeta, COGP_METADATA_KEY, COGP_VERSION, GEO_METADATA_KEY,
+};
 
 pub fn run(path: &Path) -> Result<()> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -49,23 +52,35 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
     if !geo.version.starts_with("1.") {
-        warnings.push(format!("GeoParquet version is `{}`; COGP v0.1 targets 1.1.x", geo.version));
+        warnings.push(format!(
+            "GeoParquet version is `{}`; COGP {COGP_VERSION} targets 1.1.x",
+            geo.version
+        ));
     }
 
     let primary = geo.primary_column.clone();
     let primary_col = match geo.columns.get(&primary) {
         Some(c) => c.clone(),
         None => {
-            errors.push(format!("`geo.columns` is missing primary_column `{primary}`"));
+            errors.push(format!(
+                "`geo.columns` is missing primary_column `{primary}`"
+            ));
             print_report(path, &errors, &warnings);
             bail!("validation failed");
         }
     };
+    if geometry_family(&primary_col.geometry_types).is_none() {
+        errors.push(format!(
+            "`geo.columns[{primary}].geometry_types` must declare exactly one Point, Line, or Polygon family"
+        ));
+    }
 
     let covering = match primary_col.covering.as_ref() {
         Some(c) => c,
         None => {
-            errors.push(format!("`geo.columns[{primary}].covering` is required by COGP §5.1"));
+            errors.push(format!(
+                "`geo.columns[{primary}].covering` is required by COGP §5.1"
+            ));
             print_report(path, &errors, &warnings);
             bail!("validation failed");
         }
@@ -88,9 +103,17 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
 
-    let major: u32 = cogp.version.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let major: u32 = cogp
+        .version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     if major != 0 {
-        errors.push(format!("unsupported cogp major version `{}`; this validator implements 0.x", cogp.version));
+        errors.push(format!(
+            "unsupported cogp major version `{}`; this validator implements 0.x",
+            cogp.version
+        ));
     }
     if cogp.levels.is_empty() {
         errors.push("`cogp.levels` must be non-empty".into());
@@ -143,6 +166,120 @@ pub fn run(path: &Path) -> Result<()> {
         }
     }
 
+    let parquet_schema = metadata.file_metadata().schema_descr();
+    let mut overview_names = HashSet::new();
+    let mut previous_overview_level: Option<usize> = None;
+    let mut previous_overview_tolerance: Option<f64> = None;
+    for (index, overview) in cogp.geometry_overviews.iter().enumerate() {
+        if !overview_names.insert(overview.column.as_str()) {
+            errors.push(format!(
+                "geometry_overviews[{index}].column=`{}` is duplicated",
+                overview.column
+            ));
+        }
+        if let Some(previous) = previous_overview_level {
+            if overview.level <= previous {
+                errors.push(format!(
+                    "geometry_overviews[{index}].level={} must be greater than previous ({previous})",
+                    overview.level
+                ));
+            }
+        }
+        previous_overview_level = Some(overview.level);
+        if overview.tolerance_meters.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            errors.push(format!(
+                "geometry_overviews[{index}].tolerance_meters={} must be positive",
+                overview.tolerance_meters
+            ));
+        }
+        if let Some(previous) = previous_overview_tolerance {
+            if overview.tolerance_meters.partial_cmp(&previous) != Some(std::cmp::Ordering::Less) {
+                errors.push(format!(
+                    "geometry_overviews[{index}].tolerance_meters={} must be less than previous ({previous})",
+                    overview.tolerance_meters
+                ));
+            }
+        }
+        previous_overview_tolerance = Some(overview.tolerance_meters);
+
+        let Some(level) = cogp.levels.get(overview.level) else {
+            errors.push(format!(
+                "geometry_overviews[{index}].level={} is out of range",
+                overview.level
+            ));
+            continue;
+        };
+        match geo.columns.get(&overview.column) {
+            Some(column) if column.encoding == "WKB" => {}
+            Some(column) => errors.push(format!(
+                "geometry overview `{}` must have GeoParquet WKB encoding, got `{}`",
+                overview.column, column.encoding
+            )),
+            None => errors.push(format!(
+                "geometry overview `{}` is missing from `geo.columns`",
+                overview.column
+            )),
+        }
+
+        let parquet_column = (0..parquet_schema.num_columns()).find(|column_index| {
+            parquet_schema.column(*column_index).path().string() == overview.column
+        });
+        let Some(parquet_column) = parquet_column else {
+            errors.push(format!(
+                "geometry overview `{}` is missing from the Parquet schema",
+                overview.column
+            ));
+            continue;
+        };
+        if !parquet_schema
+            .column(parquet_column)
+            .self_type()
+            .is_optional()
+        {
+            errors.push(format!(
+                "geometry overview `{}` must be nullable in the Parquet schema",
+                overview.column
+            ));
+        }
+
+        for row_group_index in 0..num_rgs {
+            let row_group = metadata.row_group(row_group_index);
+            let expected_nulls = if (row_group_index as i64) <= level.row_group_end {
+                0
+            } else {
+                row_group.num_rows() as u64
+            };
+            let actual_nulls = row_group
+                .column(parquet_column)
+                .statistics()
+                .and_then(Statistics::null_count_opt);
+            if let Some(actual_nulls) = actual_nulls {
+                if actual_nulls != expected_nulls {
+                    errors.push(format!(
+                        "row group {row_group_index} geometry overview `{}` has {actual_nulls} null(s), expected {expected_nulls}",
+                        overview.column
+                    ));
+                }
+            } else {
+                warnings.push(format!(
+                    "row group {row_group_index} geometry overview `{}` has no null-count statistics; sparse boundary was not verified",
+                    overview.column
+                ));
+            }
+        }
+    }
+    if let (Some(final_overview), Some(final_level_index)) = (
+        cogp.geometry_overviews.last(),
+        cogp.levels.len().checked_sub(1),
+    ) {
+        if final_overview.level != final_level_index {
+            errors.push(format!(
+                "final geometry overview level={} must equal final level index={final_level_index}",
+                final_overview.level
+            ));
+        }
+    }
+
     // §5.1 cont: bbox covering columns must have row group min/max stats.
     // Locate the column indexes for each bbox sub-field.
     let schema = file_meta.schema_descr();
@@ -163,14 +300,30 @@ pub fn run(path: &Path) -> Result<()> {
                     match col.statistics() {
                         Some(stats) => {
                             let has_min_max = match stats {
-                                Statistics::Boolean(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int32(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int64(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int96(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Float(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Double(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::ByteArray(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::FixedLenByteArray(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
+                                Statistics::Boolean(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int32(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int64(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int96(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Float(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Double(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::ByteArray(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::FixedLenByteArray(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
                             };
                             if !has_min_max {
                                 errors.push(format!(
@@ -196,7 +349,7 @@ pub fn run(path: &Path) -> Result<()> {
 
 fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     if errors.is_empty() {
-        println!("OK: {} conforms to COGP v0.1", path.display());
+        println!("OK: {} conforms to COGP {COGP_VERSION}", path.display());
     } else {
         println!("FAIL: {} ({} error(s))", path.display(), errors.len());
     }

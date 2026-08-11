@@ -1,4 +1,5 @@
 import type {
+  FeaturePropertiesResult,
   OpenResult,
   ViewportBbox,
   ViewportResult,
@@ -6,7 +7,12 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-export type { MetadataSummary, OpenResult, ViewportResult } from './cogp-types';
+export type {
+  FeaturePropertiesResult,
+  MetadataSummary,
+  OpenResult,
+  ViewportResult,
+} from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 
@@ -44,4 +50,11 @@ export function readViewport(
   targetGsd: number,
 ): Promise<ViewportResult> {
   return call<ViewportResult>({ type: 'readViewport', url, bbox, targetGsd });
+}
+
+export function readFeatureProperties(
+  url: string,
+  rowIndex: number,
+): Promise<FeaturePropertiesResult> {
+  return call<FeaturePropertiesResult>({ type: 'readProperties', url, rowIndex });
 }

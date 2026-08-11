@@ -16,13 +16,21 @@ import {
   coalescingAsyncBuffer,
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
-import { selectLevelByGsd } from './level.js';
-import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
+import { lruCachingAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
+import { selectGeometryColumnByGsd, selectLevelByGsd } from './level.js';
+import {
+  type BboxCovering,
+  type CogpMeta,
+  extractCogpDocument,
+  geometryFamily,
+  type GeoMeta,
+} from './meta.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
 interface FullFileMetadata extends FileMetadataLike {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
+  schema: ReadonlyArray<{ name: string; num_children?: number }>;
 }
 
 export type BboxInput = Bbox | readonly [number, number, number, number];
@@ -32,6 +40,8 @@ export interface OpenOptions {
   byteLength?: number;
   /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
   rangeCoalescing?: RangeCoalescingOptions | false;
+  /** Retain exact requested ranges in a bounded LRU; defaults to 128 MiB. */
+  rangeCache?: RangeCacheOptions | false;
 }
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
@@ -63,6 +73,8 @@ function decodeWkb(bytes: Uint8Array): unknown {
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
+  /** Select a scale-specific geometry overview and, by default, its row prefix. */
+  targetGsd?: number;
   /** Spatial filter; row groups whose covering envelope misses this bbox are skipped. */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
@@ -90,6 +102,17 @@ export interface ReadOptions {
    * etc.) are not measured.
    */
   maxRowWkbBytes?: number;
+  /**
+   * Add each source row's zero-based file index under this property name.
+   * This is useful for lightweight viewport reads that fetch full attributes
+   * later with `readRow`. The name must not collide with a physical column.
+   */
+  rowIndexColumn?: string;
+}
+
+export interface ReadRowOptions {
+  /** Subset of physical columns to materialize. */
+  columns?: string[];
 }
 
 export class CogpReader {
@@ -98,9 +121,12 @@ export class CogpReader {
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });
-    const file = opts.rangeCoalescing === false
+    const coalesced = opts.rangeCoalescing === false
       ? source
       : coalescingAsyncBuffer(source, opts.rangeCoalescing);
+    const file = opts.rangeCache === false
+      ? coalesced
+      : lruCachingAsyncBuffer(coalesced, opts.rangeCache);
     return CogpReader.fromAsyncBuffer(file, url);
   }
 
@@ -120,14 +146,15 @@ export class CogpReader {
 
   readonly cogp: CogpMeta;
   readonly geo: GeoMeta;
+  readonly columnNames: readonly string[];
+  readonly numRows: number;
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
   private readonly bboxPaths: BboxCovering;
-  /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
-  private readonly geomColumns: readonly string[];
+  private readonly extendedGeometry: boolean;
 
   private constructor(
     private readonly file: unknown,
@@ -145,11 +172,15 @@ export class CogpReader {
       acc += Number(rg.num_rows ?? 0);
     }
     this.rowOffsets = offsets;
+    this.numRows = acc;
+    this.columnNames = topLevelColumnNames(metadata.schema);
 
     // SPEC: COGP mandates a per-feature bbox covering on the primary
     // geometry column. Surface a clear error rather than silently falling
     // back to "no spatial filter" when the file is malformed.
     const primaryCol = this.geo.columns[this.geo.primary_column];
+    const family = geometryFamily(primaryCol?.geometry_types ?? []);
+    this.extendedGeometry = family === 'line' || family === 'polygon';
     const covering = primaryCol?.covering;
     if (!covering?.bbox) {
       throw new Error(
@@ -163,11 +194,6 @@ export class CogpReader {
     }
     this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
 
-    const geomCols: string[] = [];
-    for (const [name, col] of Object.entries(this.geo.columns)) {
-      if (col?.encoding === 'WKB') geomCols.push(name);
-    }
-    this.geomColumns = geomCols;
   }
 
   get levels() {
@@ -194,6 +220,24 @@ export class CogpReader {
   }
 
   /**
+   * Physical WKB column precise enough for the target and complete for the
+   * prefix. Extended-geometry streaming deliberately stays on the finest
+   * complete overview when one exists. Files without overviews use the
+   * lossless primary column.
+   */
+  selectGeometryColumn(targetGsd?: number, maxLevel?: number): string {
+    if (targetGsd === undefined) return this.primaryGeometryColumn;
+    const minimumLevel = maxLevel ?? this.selectLevel(targetGsd);
+    return selectGeometryColumnByGsd(
+      this.cogp.geometry_overviews ?? [],
+      targetGsd,
+      minimumLevel,
+      this.primaryGeometryColumn,
+      this.extendedGeometry,
+    );
+  }
+
+  /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
    * records. The geometry column carries a GeoJSON Geometry object decoded
    * from the on-disk WKB; decoding happens lazily after bbox filtering so
@@ -204,24 +248,42 @@ export class CogpReader {
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
-    const maxLevel = opts.maxLevel ?? this.levels.length - 1;
+    const maxLevel = opts.maxLevel ?? this.selectLevel(opts.targetGsd);
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
     const maxRowWkbBytes = opts.maxRowWkbBytes;
+    const rowIndexColumn = opts.rowIndexColumn;
+    if (rowIndexColumn && this.columnNames.includes(rowIndexColumn)) {
+      throw new Error(`rowIndexColumn \`${rowIndexColumn}\` collides with a physical column`);
+    }
     let wkbBytes = 0;
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
     // struct when you name its root.
+    const selectedGeometry = this.selectGeometryColumn(opts.targetGsd, maxLevel);
+    const overviewNames = new Set(
+      (this.cogp.geometry_overviews ?? []).map((overview) => overview.column),
+    );
+    const primaryRequested = !opts.columns || opts.columns.includes(this.primaryGeometryColumn);
     let columns = opts.columns;
+    if (columns && primaryRequested && selectedGeometry !== this.primaryGeometryColumn) {
+      columns = columns.map((column) =>
+        column === this.primaryGeometryColumn ? selectedGeometry : column
+      );
+    } else if (!columns && overviewNames.size > 0) {
+      columns = topLevelColumnNames(this.metadata.schema).filter(
+        (column) => column !== this.primaryGeometryColumn && !overviewNames.has(column),
+      );
+      columns.push(selectedGeometry);
+    }
     if (bbox && columns) {
       const top = this.bboxPaths.xmin[0]!;
       if (!columns.includes(top)) columns = [...columns, top];
     }
     const out: Record<string, unknown>[] = [];
     const paths = bbox ? this.bboxPaths : null;
-    const geomCols = this.geomColumns;
     // Returns true once a cap has been reached, signalling callers to stop
     // iterating the current row group (and the outer stream) immediately
     // rather than draining the rest of the batch. The geometry-byte check
@@ -232,24 +294,28 @@ export class CogpReader {
     //
     const acceptRow = (row: Record<string, unknown>): boolean => {
       if (maxRowWkbBytes !== undefined) {
-        let rowWkbBytes = 0;
-        for (const col of geomCols) {
-          const v = row[col];
-          if (v instanceof Uint8Array) rowWkbBytes += v.byteLength;
-        }
+        const geometry = row[selectedGeometry];
+        const rowWkbBytes = geometry instanceof Uint8Array ? geometry.byteLength : 0;
         if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
         wkbBytes += rowWkbBytes;
       }
-      for (const col of geomCols) {
-        const v = row[col];
-        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
+      if (primaryRequested) {
+        const geometry = row[selectedGeometry];
+        if (geometry instanceof Uint8Array) {
+          row[this.primaryGeometryColumn] = decodeWkb(geometry);
+          if (selectedGeometry !== this.primaryGeometryColumn) delete row[selectedGeometry];
+        } else if (selectedGeometry !== this.primaryGeometryColumn) {
+          throw new Error(
+            `geometry overview \`${selectedGeometry}\` is null inside its declared level boundary`,
+          );
+        }
       }
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns)) {
+    for await (const batch of this.streamRuns(rgs, columns, rowIndexColumn)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -282,6 +348,31 @@ export class CogpReader {
     return out;
   }
 
+  /**
+   * Read one source row by its stable zero-based file index. Callers can keep
+   * viewport reads narrow, then fetch expensive properties only for a feature
+   * the user actually inspects.
+   */
+  async readRow(
+    rowIndex: number,
+    opts: ReadRowOptions = {},
+  ): Promise<Record<string, unknown> | null> {
+    if (!Number.isSafeInteger(rowIndex) || rowIndex < 0 || rowIndex >= this.numRows) {
+      throw new Error(`rowIndex ${rowIndex} out of range [0, ${this.numRows})`);
+    }
+    const readArgs: Record<string, unknown> = {
+      file: this.file,
+      metadata: this.metadata,
+      rowStart: rowIndex,
+      rowEnd: rowIndex + 1,
+      compressors,
+      parsers: LAZY_GEO_PARSERS,
+    };
+    if (opts.columns) readArgs['columns'] = opts.columns;
+    const rows = (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+    return rows[0] ?? null;
+  }
+
   /** Bbox of a single row group as derived from covering column statistics. */
   rowGroupEnvelope(rgIndex: number): Bbox | null {
     const rg = this.metadata.row_groups[rgIndex];
@@ -306,12 +397,13 @@ export class CogpReader {
   /**
    * Materialize consecutive row-group runs in order. Each run is capped at
    * `RUN_MAX_ROWS`, bounding peak memory while allowing hyparquet to combine
-   * adjacent column-chunk reads. Byte-range reuse is delegated to the HTTP
-   * cache instead of retaining decoded row objects in the JS heap.
+   * adjacent column-chunk reads. The AsyncBuffer's bounded LRU retains exact
+   * slices across calls before this method materializes decoded rows.
    */
   private async *streamRuns(
     rgIndices: number[],
     columns: string[] | undefined,
+    rowIndexColumn: string | undefined,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
@@ -329,7 +421,13 @@ export class CogpReader {
         parsers: LAZY_GEO_PARSERS,
       };
       if (columns) readArgs['columns'] = columns;
-      yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+      const rows = (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+      if (rowIndexColumn) {
+        for (let index = 0; index < rows.length; index++) {
+          rows[index]![rowIndexColumn] = rowStart + index;
+        }
+      }
+      yield rows;
     }
   }
 
@@ -376,4 +474,24 @@ function readNum(row: Record<string, unknown>, path: readonly string[]): number 
   let cur: unknown = row;
   for (const p of path) cur = (cur as Record<string, unknown>)[p];
   return cur as number;
+}
+
+/** Top-level field names from Parquet's flattened depth-first schema list. */
+function topLevelColumnNames(
+  schema: ReadonlyArray<{ name: string; num_children?: number }>,
+): string[] {
+  const names: string[] = [];
+  const skipSubtree = (index: number): number => {
+    let next = index + 1;
+    const children = schema[index]?.num_children ?? 0;
+    for (let child = 0; child < children; child++) next = skipSubtree(next);
+    return next;
+  };
+  const rootChildren = schema[0]?.num_children ?? Math.max(schema.length - 1, 0);
+  let index = schema.length > 0 ? 1 : 0;
+  for (let child = 0; child < rootChildren && index < schema.length; child++) {
+    names.push(schema[index]!.name);
+    index = skipSubtree(index);
+  }
+  return names;
 }

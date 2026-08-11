@@ -1,6 +1,6 @@
 ---
 title: Cloud Optimized GeoParquet Profile (COGP)
-version: "0.1.0"
+version: "0.2.0"
 status: Draft
 scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
 license: CC BY 4.0
@@ -19,7 +19,7 @@ A COGP file is:
 3. organized so that each level ends at a Parquet row group boundary;
 4. annotated with minimal metadata describing those level boundaries.
 
-COGP is feature-level: it reorders features across row groups; it does not simplify, aggregate, or duplicate them.
+COGP keeps a lossless primary geometry while allowing sparse, scale-specific WKB columns for rendering. Feature rows are reordered but never duplicated.
 
 ## 2. Motivation
 
@@ -39,13 +39,13 @@ The core idea is:
 
 > Earlier row groups contain features that are independently meaningful at coarse display resolutions. Later row groups add features that are only independently meaningful at finer display resolutions.
 
-COGP is a **feature-level progressive subset**, not a geometry-decimation scheme:
+COGP's row layout is a **feature-level progressive subset**:
 
 * each source feature is placed, in full, in exactly one row group;
-* a feature's geometry is preserved verbatim — vertices, bends, and detail within a feature are never removed or simplified by this profile;
+* a feature's primary geometry is preserved verbatim;
 * features are assigned to the coarsest level at which they become independently renderable as whole features.
 
-Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels, and does not produce simplified geometries.
+Unlike a tile pyramid, COGP does not duplicate rows across levels. Optional geometry overview columns contain simplified rendering copies and are sparse outside the row prefix where they apply.
 
 A reader can choose how many leading row groups to load based on its target rendering resolution.
 
@@ -73,7 +73,10 @@ The value is always expressed in meters of ground distance at the geographic loc
 
 For example, a level with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later levels.
 
-Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse level retains its full geometry, including fine internal detail.
+For feature levels, `gsd` describes the threshold at which whole features
+become independently meaningful. Geometry precision is described separately by
+each overview's `tolerance_meters`; linking an overview to a level defines only
+which feature prefix that column covers.
 
 This may apply to deferring features such as:
 
@@ -86,7 +89,7 @@ This value is rendering-oriented. It does not guarantee positional accuracy, top
 
 ## 5. Requirements
 
-A COGP v0.1 file MUST satisfy the following requirements.
+A COGP v0.2 file MUST satisfy the following requirements.
 
 ### 5.1 GeoParquet compatibility
 
@@ -100,9 +103,15 @@ geo.columns[<primary_column>].covering.bbox
 
 where `<primary_column>` is the value of the GeoParquet `primary_column` field.
 
+The primary geometry column's GeoParquet `geometry_types` array MUST be
+non-empty and MUST describe exactly one topological family: Point/MultiPoint,
+LineString/MultiLineString, or Polygon/MultiPolygon. Singular and Multi variants
+of the same family MAY coexist; geometry families MUST NOT be mixed in one COGP
+file. GeometryCollection is not supported by this profile.
+
 Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
 
-For COGP v0.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
+For COGP v0.2, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
 
 ### 5.2 Physical ordering
 
@@ -112,11 +121,19 @@ Earlier row groups MUST contain features that are independently meaningful at co
 
 Later row groups MUST add features that are independently meaningful only at finer render resolutions.
 
-Every source feature MUST appear in exactly one row group. Feature geometry and attributes MUST NOT be simplified or aggregated.
+Every source feature MUST appear in exactly one row group. Its primary geometry and attributes MUST NOT be simplified or aggregated. Geometry overview columns MAY contain simplified copies.
 
-Level ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
+Level ordering is defined with respect to the primary geometry column.
 
 Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective.
+
+For LineString and Polygon features, producers SHOULD derive the first visible
+level from simplification at the level's rendering tolerance. A LineString
+SHOULD be deferred while its simplified length does not exceed that tolerance;
+a Polygon SHOULD be deferred while simplification cannot retain a valid
+exterior ring. Such features SHOULD NOT be thinned by assigning their bbox
+centers to density-grid cells; the simplified geometry is the more direct
+signal.
 
 Producers SHOULD spatially sort or pack features within each level before forming row groups. Suitable approaches include, but are not limited to, ordering features by a spatial filling curve such as a Hilbert curve, ordering features by Quadkey or another quadtree-derived key, or using a packed spatial index layout such as STR packing.
 
@@ -151,7 +168,55 @@ Producers SHOULD choose row group sizes so that each level prefix can be fetched
 
 Producers SHOULD avoid placing so many bytes or features in an early row group that the first level is no longer useful as a coarse overview.
 
+When geometry overviews are present, producers SHOULD size row groups using the
+geometry column chunks that rendering readers actually project rather than the
+lossless primary WKB column. A producer MAY use the largest usable overview WKB
+payload as a conservative pre-compression estimate.
+
 This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
+
+Producers SHOULD derive hierarchy depth from rendering payload rather than a
+fixed number of levels or overview columns. One deterministic approach is to
+evaluate a candidate GSD ladder whose linear resolution halves at every step,
+measure each candidate's simplified WKB prefix, and retain the finest candidate
+whose payload is no more than four times the previously retained payload. If
+the immediately following candidate already exceeds that bound, it is retained
+so progress is guaranteed. Empty candidates are omitted, while the coarsest and
+finest occupied candidates are retained. The factor of four corresponds to the
+area growth produced by halving linear resolution, as in a raster overview
+pyramid.
+
+For this calculation, the simplified WKB prefix at candidate `i` is the sum of
+the WKB sizes, simplified independently at candidate `i`'s tolerance, of every
+feature introduced at or before candidate `i`. Producers SHOULD use the prefix
+maximum of this sequence so that hierarchy selection is monotonic even when a
+particular simplification result is anomalously smaller at a finer tolerance.
+
+### 5.5 Geometry overview columns
+
+Each geometry overview MUST link to one entry in `levels`. Its physical WKB
+column MUST be non-null from row group `0` through the linked level's
+`row_group_end`, inclusive, and MUST be null in every later row group.
+Each entry MUST declare `tolerance_meters` as a positive finite number giving
+the maximum spatial simplification tolerance in meters. This value is
+independent of the linked level: `level` describes completeness, while
+`tolerance_meters` describes geometric precision.
+
+Within one overview column, producers MUST apply one scale-derived spatial
+tolerance consistently to all non-point geometries. Producers MUST derive each
+overview directly from the lossless primary geometry or from an equivalent
+progressive hierarchy; simplification error MUST NOT accumulate by repeatedly
+simplifying the previous overview. Point geometries remain unchanged.
+
+Geometry overview entries MUST be ordered by strictly increasing level index
+and strictly decreasing `tolerance_meters`.
+When `geometry_overviews` is non-empty, its final entry MUST link to the final
+entry in `levels`. This makes the finest overview non-null across the complete
+feature ladder, allowing rendering readers to avoid projecting the lossless
+primary geometry.
+Their columns MUST be nullable WKB geometry columns declared in GeoParquet
+metadata. The primary geometry MUST remain unchanged and non-null wherever the
+source geometry is non-null.
 
 ## 6. Metadata
 
@@ -178,7 +243,7 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "levels": [
     {
       "row_group_end": 0,
@@ -192,6 +257,11 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
       "row_group_end": 12,
       "gsd": 100
     }
+  ],
+  "geometry_overviews": [
+    { "column": "geometry_ovr_0", "level": 0, "tolerance_meters": 250 },
+    { "column": "geometry_ovr_1", "level": 1, "tolerance_meters": 100 },
+    { "column": "geometry_ovr_2", "level": 2, "tolerance_meters": 25 }
   ]
 }
 ```
@@ -204,6 +274,10 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | `levels`                 |      Yes | Ordered level entries from coarse to fine.                                                                        |
 | `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
 | `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
+| `geometry_overviews` | No | Sparse rendering WKB columns ordered from coarse to fine. |
+| `geometry_overviews[].column` | No | Physical nullable WKB column declared in GeoParquet metadata. |
+| `geometry_overviews[].level` | No | Zero-based index into `levels`, defining the non-null boundary. |
+| `geometry_overviews[].tolerance_meters` | No | Positive spatial simplification tolerance in meters. |
 
 ## 7. Reader guidance (non-normative)
 
@@ -238,6 +312,28 @@ For viewport-driven applications, two complementary spatial filters can apply wi
 * **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
 
 If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
+
+### 7.3 Geometry overview selection
+
+Feature selection and geometry selection are related but independent. A reader
+first selects the row prefix as described in Section 7.1. It then selects the
+first geometry overview, in metadata order, that satisfies both:
+
+```text
+overview.level >= selected_feature_level
+overview.tolerance_meters <= target_gsd
+```
+
+The first condition guarantees that the chosen column is non-null throughout
+the selected row prefix. The second guarantees that its simplification scale is
+no coarser than the requested display scale. If no overview satisfies both
+conditions, a lossless reader selects the primary geometry. A bounded rendering
+reader may instead select the finest overview that covers the prefix, accepting
+its declared simplification tolerance rather than fetching raw WKB. In
+particular, LineString and Polygon streaming readers can use this rule to keep
+the lossless primary column entirely out of their `target_gsd` read path. A
+reader needs to project only the selected physical geometry column and exposes
+it logically under the primary geometry column name.
 
 ## 8. Validation
 

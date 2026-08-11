@@ -6,6 +6,14 @@ export interface Level {
   gsd: number;
 }
 
+export interface GeometryOverview {
+  column: string;
+  /** Index into `CogpMeta.levels`; supplies the non-null boundary. */
+  level: number;
+  /** Maximum spatial simplification error in meters. */
+  tolerance_meters: number;
+}
+
 export interface CogpGenerator {
   name: string;
   version: string;
@@ -14,6 +22,7 @@ export interface CogpGenerator {
 export interface CogpMeta {
   version: string;
   levels: Level[];
+  geometry_overviews?: GeometryOverview[];
   generator?: CogpGenerator;
   [extra: string]: unknown;
 }
@@ -45,6 +54,20 @@ export interface GeoMeta {
   [extra: string]: unknown;
 }
 
+export type GeometryFamily = 'point' | 'line' | 'polygon';
+
+export function geometryFamily(types: readonly string[]): GeometryFamily | undefined {
+  const one = (type: string): GeometryFamily | undefined => {
+    const base = type.split(/\s+/, 1)[0];
+    if (base === 'Point' || base === 'MultiPoint') return 'point';
+    if (base === 'LineString' || base === 'MultiLineString') return 'line';
+    if (base === 'Polygon' || base === 'MultiPolygon') return 'polygon';
+    return undefined;
+  };
+  const family = types[0] ? one(types[0]) : undefined;
+  return family && types.every((type) => one(type) === family) ? family : undefined;
+}
+
 export function parseCogpMeta(json: string): CogpMeta {
   const parsed = JSON.parse(json) as CogpMeta;
   if (typeof parsed.version !== 'string') {
@@ -52,6 +75,47 @@ export function parseCogpMeta(json: string): CogpMeta {
   }
   if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
     throw new Error('cogp metadata: `levels` must be a non-empty array');
+  }
+  if (parsed.geometry_overviews !== undefined) {
+    if (!Array.isArray(parsed.geometry_overviews)) {
+      throw new Error('cogp metadata: `geometry_overviews` must be an array');
+    }
+    let previousLevel = -1;
+    let previousTolerance = Infinity;
+    const columns = new Set<string>();
+    for (const [index, overview] of parsed.geometry_overviews.entries()) {
+      if (typeof overview.column !== 'string' || overview.column.length === 0) {
+        throw new Error(
+          `cogp metadata: geometry_overviews[${index}].column must be a non-empty string`,
+        );
+      }
+      if (columns.has(overview.column)) {
+        throw new Error(`cogp metadata: duplicate geometry overview column \`${overview.column}\``);
+      }
+      columns.add(overview.column);
+      if (!Number.isInteger(overview.level) || overview.level < 0 || overview.level >= parsed.levels.length) {
+        throw new Error(`cogp metadata: geometry_overviews[${index}].level is out of range`);
+      }
+      if (overview.level <= previousLevel) {
+        throw new Error('cogp metadata: geometry overview levels must be strictly increasing');
+      }
+      previousLevel = overview.level;
+      if (!Number.isFinite(overview.tolerance_meters) || overview.tolerance_meters <= 0) {
+        throw new Error(
+          `cogp metadata: geometry_overviews[${index}].tolerance_meters must be positive and finite`,
+        );
+      }
+      if (overview.tolerance_meters >= previousTolerance) {
+        throw new Error(
+          'cogp metadata: geometry overview tolerances must be strictly decreasing',
+        );
+      }
+      previousTolerance = overview.tolerance_meters;
+    }
+    const finalOverview = parsed.geometry_overviews.at(-1);
+    if (finalOverview && finalOverview.level !== parsed.levels.length - 1) {
+      throw new Error('cogp metadata: final geometry overview must cover the final level');
+    }
   }
   const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
   if (major !== 0) {
@@ -96,5 +160,13 @@ export function extractCogpDocument(
   if (!cogpJson) {
     throw new Error('not a COGP file: missing `cogp` key/value metadata');
   }
-  return { cogp: parseCogpMeta(cogpJson), geo: parseGeoMeta(geoJson) };
+  const cogp = parseCogpMeta(cogpJson);
+  const geo = parseGeoMeta(geoJson);
+  const primary = geo.columns[geo.primary_column];
+  if (!primary || !geometryFamily(primary.geometry_types)) {
+    throw new Error(
+      'COGP primary geometry must declare exactly one Point, Line, or Polygon family',
+    );
+  }
+  return { cogp, geo };
 }

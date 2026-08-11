@@ -10,8 +10,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::meta::{
-    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, COGP_METADATA_KEY, COGP_VERSION,
-    GEOPARQUET_VERSION, GEO_METADATA_KEY,
+    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GeometryOverview, Level,
+    COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
@@ -151,9 +151,16 @@ fn validate_happy_path_accepts_well_formed_file() {
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 1000.0 },
-            Level { row_group_end: 2, gsd: 100.0 },
+            Level {
+                row_group_end: 0,
+                gsd: 1000.0,
+            },
+            Level {
+                row_group_end: 2,
+                gsd: 100.0,
+            },
         ],
+        geometry_overviews: vec![],
     };
     write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
     cogp::validate::run(&p).unwrap();
@@ -165,7 +172,11 @@ fn validate_rejects_missing_geo() {
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: 1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: 1.0,
+        }],
+        geometry_overviews: vec![],
     };
     write_file(&p, 1, kv(None, Some(cogp)));
     assert_validate_fails(&p, "geo");
@@ -186,10 +197,17 @@ fn validate_rejects_non_decreasing_gsd() {
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 100.0 },
+            Level {
+                row_group_end: 0,
+                gsd: 100.0,
+            },
             // equal to previous → must be strictly less
-            Level { row_group_end: 1, gsd: 100.0 },
+            Level {
+                row_group_end: 1,
+                gsd: 100.0,
+            },
         ],
+        geometry_overviews: vec![],
     };
     write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "gsd");
@@ -202,9 +220,16 @@ fn validate_rejects_non_increasing_row_group_end() {
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 1, gsd: 100.0 },
-            Level { row_group_end: 1, gsd: 10.0 }, // not strictly greater
+            Level {
+                row_group_end: 1,
+                gsd: 100.0,
+            },
+            Level {
+                row_group_end: 1,
+                gsd: 10.0,
+            }, // not strictly greater
         ],
+        geometry_overviews: vec![],
     };
     write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "row_group_end");
@@ -218,9 +243,16 @@ fn validate_rejects_final_row_group_end_mismatch() {
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 100.0 },
-            Level { row_group_end: 1, gsd: 10.0 },
+            Level {
+                row_group_end: 0,
+                gsd: 100.0,
+            },
+            Level {
+                row_group_end: 1,
+                gsd: 10.0,
+            },
         ],
+        geometry_overviews: vec![],
     };
     write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "num_row_groups");
@@ -232,7 +264,11 @@ fn validate_rejects_negative_gsd() {
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: -1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: -1.0,
+        }],
+        geometry_overviews: vec![],
     };
     write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "positive");
@@ -254,7 +290,11 @@ fn validate_rejects_missing_covering_column_in_schema() {
     });
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: 1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: 1.0,
+        }],
+        geometry_overviews: vec![],
     };
     write_file(&p, 1, kv(Some(geo), Some(cogp)));
     assert_validate_fails(&p, "covering");
@@ -267,7 +307,67 @@ fn validate_rejects_empty_levels() {
     let cogp = CogpMeta {
         version: COGP_VERSION.into(),
         levels: vec![],
+        geometry_overviews: vec![],
     };
     write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "non-empty");
+}
+
+#[test]
+fn validate_rejects_mixed_geometry_families() {
+    let tmp = TempDir::new("mixed-geometry-families");
+    let p = tmp.path().join("bad.parquet");
+    let mut geo = standard_geo();
+    geo.columns.get_mut("geometry").unwrap().geometry_types =
+        vec!["LineString".into(), "Polygon".into()];
+    let cogp = CogpMeta {
+        version: COGP_VERSION.into(),
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: 1.0,
+        }],
+        geometry_overviews: vec![],
+    };
+    write_file(&p, 1, kv(Some(geo), Some(cogp)));
+    assert_validate_fails(&p, "exactly one Point, Line, or Polygon family");
+}
+
+#[test]
+fn validate_rejects_overview_link_to_missing_level() {
+    let tmp = TempDir::new("bad-overview-level");
+    let p = tmp.path().join("bad.parquet");
+    let cogp = CogpMeta {
+        version: COGP_VERSION.into(),
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: 1.0,
+        }],
+        geometry_overviews: vec![GeometryOverview {
+            column: "geometry_ovr_0".into(),
+            level: 1,
+            tolerance_meters: 1.0,
+        }],
+    };
+    write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
+    assert_validate_fails(&p, "out of range");
+}
+
+#[test]
+fn validate_rejects_non_positive_overview_tolerance() {
+    let tmp = TempDir::new("bad-overview-tolerance");
+    let p = tmp.path().join("bad.parquet");
+    let cogp = CogpMeta {
+        version: COGP_VERSION.into(),
+        levels: vec![Level {
+            row_group_end: 0,
+            gsd: 1.0,
+        }],
+        geometry_overviews: vec![GeometryOverview {
+            column: "geometry_ovr_0".into(),
+            level: 0,
+            tolerance_meters: 0.0,
+        }],
+    };
+    write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
+    assert_validate_fails(&p, "tolerance_meters=0 must be positive");
 }

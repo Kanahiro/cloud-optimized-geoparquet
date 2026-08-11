@@ -28,9 +28,14 @@ export interface ViewportResult {
   status: string;
 }
 
+export interface FeaturePropertiesResult {
+  properties: Record<string, unknown>;
+}
+
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetGsd: number };
+  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetGsd: number }
+  | { type: 'readProperties'; url: string; rowIndex: number };
 
 export interface WorkerEnvelope {
   id: number;
@@ -38,5 +43,5 @@ export interface WorkerEnvelope {
 }
 
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | ViewportResult }
+  | { id: number; ok: true; result: OpenResult | ViewportResult | FeaturePropertiesResult }
   | { id: number; ok: false; error: string };
