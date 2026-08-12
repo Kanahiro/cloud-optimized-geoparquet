@@ -551,7 +551,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .map(|candidate| gsds[*candidate])
         .collect();
     eprintln!(
-        "      selected {} of {} candidate level(s) from simplified WKB growth",
+        "      selected {} of {} candidate level(s) from rendering WKB growth",
         selected_candidates.len(),
         candidate_payloads.len()
     );
@@ -568,15 +568,21 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         str_pack(rows, &bboxes, args.row_group_size, level_idx);
     }
 
-    let geometry_overviews: Vec<GeometryOverview> = selected_candidates
-        .iter()
-        .enumerate()
-        .map(|(level, _)| GeometryOverview {
-            column: overview_column_name(&geom_col_name, level),
-            level,
-            tolerance_meters: gsds[level] * args.simplification_tolerance_factor,
-        })
-        .collect();
+    // Point coordinates cannot be simplified, so overview columns would only
+    // duplicate the primary WKB. Their feature hierarchy still comes from
+    // point thinning, and row-group byte budgeting falls back to primary WKB.
+    let geometry_overviews: Vec<GeometryOverview> = match scanned_geometry_family {
+        GeometryFamily::Point => Vec::new(),
+        GeometryFamily::Line | GeometryFamily::Polygon => selected_candidates
+            .iter()
+            .enumerate()
+            .map(|(level, _)| GeometryOverview {
+                column: overview_column_name(&geom_col_name, level),
+                level,
+                tolerance_meters: gsds[level] * args.simplification_tolerance_factor,
+            })
+            .collect(),
+    };
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
     // Replace any pre-existing `bbox` column (and the bbox covering column we
@@ -1117,14 +1123,20 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
             } else {
                 bbox_from_wkb(wkb)?
             };
-            let profile = simplification_profile(wkb, simplification_tolerances)?;
-            let minimum_viable_level = u16::try_from(profile.minimum_viable_level)
-                .map_err(|_| anyhow!("too many simplification levels"))?;
+            let (minimum_viable_level, wkb_sizes) = match kind {
+                GeomKind::Point => (0, vec![wkb.len() as u64; simplification_tolerances.len()]),
+                GeomKind::Line | GeomKind::Polygon => {
+                    let profile = simplification_profile(wkb, simplification_tolerances)?;
+                    let minimum_viable_level = u16::try_from(profile.minimum_viable_level)
+                        .map_err(|_| anyhow!("too many simplification levels"))?;
+                    (minimum_viable_level, profile.wkb_sizes)
+                }
+            };
             Ok(ScannedGeometry {
                 bbox,
                 kind,
                 minimum_viable_level,
-                wkb_sizes: profile.wkb_sizes,
+                wkb_sizes,
             })
         })
         .collect()

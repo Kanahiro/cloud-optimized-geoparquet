@@ -84,13 +84,15 @@ Geometry overviews:
 - `--simplification-tolerance-factor` (default `1`) — multiplies the GSD at
   each selected level to obtain that overview's simplification tolerance.
 - Hierarchy depth is data-derived, not configured. `convert` measures the exact
-  simplified WKB prefix at every candidate GSD, makes that size curve monotonic,
-  and retains the fewest occupied candidates needed to keep adjacent payload
-  growth near the 4× area growth implied by halving linear resolution. The
-  coarsest and finest occupied candidates are always retained.
-- Every selected level has exactly one overview column. The final overview
-  covers the complete feature ladder, so rendering readers need not project raw
-  geometry.
+  rendering WKB prefix at every candidate GSD—simplified WKB for Line/Polygon,
+  primary WKB for Point—makes that size curve monotonic, and retains the fewest
+  occupied candidates needed to keep adjacent payload growth near the 4× area
+  growth implied by halving linear resolution. The coarsest and finest occupied
+  candidates are always retained.
+- Line and Polygon datasets have one overview column per selected level. The
+  final overview covers the complete feature ladder, so rendering readers need
+  not project raw geometry. Point datasets have no overview columns because
+  their coordinates cannot be simplified; readers use the primary WKB.
 - Each overview is non-null through its linked level boundary and entirely
   null afterward. The primary WKB column remains lossless for every row.
 
@@ -100,10 +102,11 @@ Other options:
   Row group boundaries always align with level boundaries.
 - `--row-group-max-bytes` (default `4194304`, 4 MiB) — max cumulative WKB
   payload per row group, measured against the largest non-null geometry
-  overview for each row. The lossless primary WKB is deliberately excluded
-  because rendering readers do not project it. This must be a numeric byte
-  count without suffixes. A single indivisible geometry may exceed the target
-  and receives its own row group.
+  overview for each row. For Point data, which has no overviews, the primary
+  WKB supplies the budget. The lossless primary WKB is excluded only when
+  rendering overviews exist. This must be a numeric byte count without suffixes.
+  A single indivisible geometry may exceed the target and receives its own row
+  group.
 - `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
   PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
   per OGC:CRS84). Override with `degrees` or `meters` explicitly.

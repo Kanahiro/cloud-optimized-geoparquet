@@ -186,11 +186,13 @@ finest occupied candidates are retained. The factor of four corresponds to the
 area growth produced by halving linear resolution, as in a raster overview
 pyramid.
 
-For this calculation, the simplified WKB prefix at candidate `i` is the sum of
-the WKB sizes, simplified independently at candidate `i`'s tolerance, of every
-feature introduced at or before candidate `i`. Producers SHOULD use the prefix
-maximum of this sequence so that hierarchy selection is monotonic even when a
-particular simplification result is anomalously smaller at a finer tolerance.
+For this calculation, the rendering WKB prefix at candidate `i` is the sum of
+the WKB sizes of every feature introduced at or before candidate `i`. Line and
+Polygon WKB is simplified independently at candidate `i`'s tolerance; Point WKB
+is measured from the primary column without simplification. Producers SHOULD
+use the prefix maximum of this sequence so that hierarchy selection is monotonic
+even when a particular simplification result is anomalously smaller at a finer
+tolerance.
 
 ### 5.5 Geometry overview columns
 
@@ -206,7 +208,8 @@ Within one overview column, producers MUST apply one scale-derived spatial
 tolerance consistently to all non-point geometries. Producers MUST derive each
 overview directly from the lossless primary geometry or from an equivalent
 progressive hierarchy; simplification error MUST NOT accumulate by repeatedly
-simplifying the previous overview. Point geometries remain unchanged.
+simplifying the previous overview. Point geometries remain unchanged and SHOULD
+NOT be duplicated into overview columns because no simplification is possible.
 
 Geometry overview entries MUST be ordered by strictly increasing level index
 and strictly decreasing `tolerance_meters`.

@@ -20,6 +20,15 @@ use parquet::file::metadata::KeyValue;
 
 /// Little-endian WKB encoder for the geometry kinds we use in the fixture.
 mod wkb {
+    pub fn point(x: f64, y: f64) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(1);
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v
+    }
+
     pub fn polygon(corners: &[(f64, f64)]) -> Vec<u8> {
         let mut v = Vec::new();
         v.push(1);
@@ -122,6 +131,54 @@ fn write_input(path: &std::path::Path) {
     let file = File::create(path).unwrap();
     let props = parquet::file::properties::WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue {
+        key: GEO_METADATA_KEY.to_string(),
+        value: Some(serde_json::to_string(&geo).unwrap()),
+    });
+    writer.close().unwrap();
+}
+
+fn write_point_input(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+    let ids: Vec<i32> = (0..8).collect();
+    let geoms: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| wkb::point(f64::from(*id), 0.0))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(BinaryArray::from(
+                geoms.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let mut cols = BTreeMap::new();
+    cols.insert(
+        "geometry".to_string(),
+        GeoColumn {
+            encoding: "WKB".into(),
+            geometry_types: vec!["Point".into()],
+            covering: None,
+            bbox: None,
+            crs: None,
+        },
+    );
+    let geo = GeoMeta {
+        version: "1.1.0".into(),
+        primary_column: "geometry".into(),
+        columns: cols,
+    };
+
+    let file = File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.append_key_value_metadata(KeyValue {
         key: GEO_METADATA_KEY.to_string(),
@@ -298,6 +355,37 @@ fn convert_reader_validate_pipeline() {
             );
         }
     }
+}
+
+#[test]
+fn convert_point_uses_primary_wkb_without_overviews() {
+    let tmp = TempDir::new("point-primary-wkb");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.cogp.parquet");
+    write_point_input(&input);
+
+    let mut args = convert_args(&input, &output);
+    args.gsd = vec![100_000.0, 10_000.0, 1_000.0];
+    args.row_group_size = 8;
+    args.row_group_max_bytes = Some(42);
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+
+    let reader = Reader::open(&output).unwrap();
+    assert!(reader.geometry_overviews().is_empty());
+    assert_eq!(reader.geometry_column_for_gsd(1.0), "geometry");
+    assert!(reader.num_row_groups() > 1, "primary WKB must drive the byte budget");
+
+    let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
+    let batches: Vec<RecordBatch> = reader
+        .sync_batch_reader(File::open(&output).unwrap(), &all_row_groups)
+        .unwrap()
+        .map(|batch| batch.unwrap())
+        .collect();
+    let schema = batches[0].schema();
+    assert!(schema.field_with_name("geometry").is_ok());
+    assert!(schema.fields().iter().all(|field| !field.name().starts_with("geometry_ovr_")));
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
 }
 
 #[test]
