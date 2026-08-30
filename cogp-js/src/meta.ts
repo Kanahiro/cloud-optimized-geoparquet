@@ -3,15 +3,8 @@ export const GEO_METADATA_KEY = 'geo';
 
 export interface Level {
   row_group_end: number;
-  gsd: number;
-}
-
-export interface GeometryOverview {
-  column: string;
-  /** Index into `CogpMeta.levels`; supplies the non-null boundary. */
-  level: number;
-  /** Maximum spatial simplification error in meters. */
-  tolerance_meters: number;
+  resolution_meters: number;
+  geometry_column: string;
 }
 
 export interface CogpGenerator {
@@ -22,7 +15,6 @@ export interface CogpGenerator {
 export interface CogpMeta {
   version: string;
   levels: Level[];
-  geometry_overviews?: GeometryOverview[];
   generator?: CogpGenerator;
   [extra: string]: unknown;
 }
@@ -76,45 +68,25 @@ export function parseCogpMeta(json: string): CogpMeta {
   if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
     throw new Error('cogp metadata: `levels` must be a non-empty array');
   }
-  if (parsed.geometry_overviews !== undefined) {
-    if (!Array.isArray(parsed.geometry_overviews)) {
-      throw new Error('cogp metadata: `geometry_overviews` must be an array');
+  let previousResolution = Infinity;
+  let previousRowGroupEnd = -1;
+  for (const [index, level] of parsed.levels.entries()) {
+    if (!Number.isInteger(level.row_group_end) || level.row_group_end < 0) {
+      throw new Error(`cogp metadata: levels[${index}].row_group_end must be a non-negative integer`);
     }
-    let previousLevel = -1;
-    let previousTolerance = Infinity;
-    const columns = new Set<string>();
-    for (const [index, overview] of parsed.geometry_overviews.entries()) {
-      if (typeof overview.column !== 'string' || overview.column.length === 0) {
-        throw new Error(
-          `cogp metadata: geometry_overviews[${index}].column must be a non-empty string`,
-        );
-      }
-      if (columns.has(overview.column)) {
-        throw new Error(`cogp metadata: duplicate geometry overview column \`${overview.column}\``);
-      }
-      columns.add(overview.column);
-      if (!Number.isInteger(overview.level) || overview.level < 0 || overview.level >= parsed.levels.length) {
-        throw new Error(`cogp metadata: geometry_overviews[${index}].level is out of range`);
-      }
-      if (overview.level <= previousLevel) {
-        throw new Error('cogp metadata: geometry overview levels must be strictly increasing');
-      }
-      previousLevel = overview.level;
-      if (!Number.isFinite(overview.tolerance_meters) || overview.tolerance_meters <= 0) {
-        throw new Error(
-          `cogp metadata: geometry_overviews[${index}].tolerance_meters must be positive and finite`,
-        );
-      }
-      if (overview.tolerance_meters >= previousTolerance) {
-        throw new Error(
-          'cogp metadata: geometry overview tolerances must be strictly decreasing',
-        );
-      }
-      previousTolerance = overview.tolerance_meters;
+    if (level.row_group_end <= previousRowGroupEnd) {
+      throw new Error('cogp metadata: level row-group boundaries must be strictly increasing');
     }
-    const finalOverview = parsed.geometry_overviews.at(-1);
-    if (finalOverview && finalOverview.level !== parsed.levels.length - 1) {
-      throw new Error('cogp metadata: final geometry overview must cover the final level');
+    previousRowGroupEnd = level.row_group_end;
+    if (!Number.isFinite(level.resolution_meters) || level.resolution_meters <= 0) {
+      throw new Error(`cogp metadata: levels[${index}].resolution_meters must be positive and finite`);
+    }
+    if (level.resolution_meters >= previousResolution) {
+      throw new Error('cogp metadata: level resolutions must be strictly decreasing');
+    }
+    previousResolution = level.resolution_meters;
+    if (typeof level.geometry_column !== 'string' || level.geometry_column.length === 0) {
+      throw new Error(`cogp metadata: levels[${index}].geometry_column must be a non-empty string`);
     }
   }
   const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
@@ -167,6 +139,19 @@ export function extractCogpDocument(
     throw new Error(
       'COGP primary geometry must declare exactly one Point, Line, or Polygon family',
     );
+  }
+  for (const [index, level] of cogp.levels.entries()) {
+    const geometry = geo.columns[level.geometry_column];
+    if (!geometry) {
+      throw new Error(
+        `COGP levels[${index}].geometry_column \`${level.geometry_column}\` is missing from geo.columns`,
+      );
+    }
+    if (geometry.encoding !== 'WKB') {
+      throw new Error(
+        `COGP levels[${index}].geometry_column \`${level.geometry_column}\` must use WKB encoding`,
+      );
+    }
   }
   return { cogp, geo };
 }

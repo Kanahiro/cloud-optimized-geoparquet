@@ -11,8 +11,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
-use parquet::basic::Compression;
-use parquet::basic::ZstdLevel;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
@@ -26,11 +25,11 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::meta::{
-    geometry_family, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GeometryFamily,
-    GeometryOverview, Level, COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
+    geometry_family, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GeometryFamily, Level,
+    COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
-use crate::wkb_simplify::{simplification_profile, simplify_wkb};
+use crate::wkb_simplify::{first_viable_level, simplify_wkb};
 
 #[derive(Args)]
 pub struct ConvertArgs {
@@ -38,21 +37,23 @@ pub struct ConvertArgs {
     pub input: PathBuf,
     /// Output COGP file
     pub output: PathBuf,
-    /// Comma-separated GSD list, meters, coarse to fine (e.g. 1000,500,100,50).
-    /// Projection-agnostic: each value is the ground sample distance in meters
-    /// at which a level becomes meaningful. If omitted, GSDs are auto-derived
+    /// Comma-separated ground-resolution list, meters, coarse to fine
+    /// (e.g. 1000,500,100,50). Each value is the nominal ground resolution at
+    /// which a level's feature prefix and geometry are intended for rendering.
+    /// If omitted, resolutions are auto-derived
     /// from --webmerc-minzoom..=--webmerc-maxzoom assuming a Web Mercator tile
     /// pyramid (see --webmerc-minzoom/--webmerc-maxzoom/--webmerc-resolution).
-    /// Pass --gsd directly if you target a non-Web-Mercator renderer.
+    /// Pass --resolution directly if you target a non-Web-Mercator renderer.
     #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["webmerc_minzoom", "webmerc_maxzoom"])]
-    pub gsd: Vec<f64>,
-    /// Coarsest Web Mercator zoom level for GSD auto-derivation. Used only
-    /// when --gsd is omitted. Assumes the consumer renders on a Web Mercator
-    /// (EPSG:3857) tile pyramid; for other projections, supply --gsd.
+    pub resolution: Vec<f64>,
+    /// Coarsest Web Mercator zoom level for resolution auto-derivation. Used
+    /// only when --resolution is omitted. Assumes the consumer renders on a
+    /// Web Mercator (EPSG:3857) tile pyramid; otherwise supply --resolution.
     #[arg(long, default_value_t = 0)]
     pub webmerc_minzoom: u32,
-    /// Finest Web Mercator zoom level for GSD auto-derivation. Used only
-    /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
+    /// Finest Web Mercator zoom level for resolution auto-derivation. Used only
+    /// when --resolution is omitted. Same Web Mercator assumption as
+    /// --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
     /// Parquet row group size in rows.
@@ -62,7 +63,7 @@ pub struct ConvertArgs {
     /// overview.
     #[arg(long, default_value = "4194304")]
     pub row_group_max_bytes: Option<usize>,
-    /// Simplification tolerance as a multiple of each overview level's GSD.
+    /// Simplification tolerance as a multiple of each level's resolution.
     /// Every geometry in one overview column uses the same spatial tolerance.
     #[arg(long, default_value_t = 1.0)]
     pub simplification_tolerance_factor: f64,
@@ -76,22 +77,22 @@ pub struct ConvertArgs {
     pub geometry_column: Option<String>,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
     /// derive level visibility thresholds and the point-thinning grid when
-    /// auto-deriving GSDs from
-    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i GSD is the ground
+    /// auto-deriving resolutions from
+    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i resolution is the ground
     /// distance covered by one base unit at zoom i, computed as
     /// `40_075_016 / (base · 2^i)` meters at the equator — i.e. it bakes in
     /// the Web Mercator equatorial circumference and the standard `2^z` tile
     /// pyramid. This controls level granularity, not output coordinate
     /// precision. The default of 1024 is ~4× the typical 256-pixel tile
     /// resolution, so features collapsing within a few subpixels are deferred
-    /// to finer levels. Ignored when --gsd is given (in that case the GSDs are
-    /// taken verbatim and no projection is assumed).
+    /// to finer levels. Ignored when --resolution is given (in that case the
+    /// resolutions are taken verbatim and no projection is assumed).
     #[arg(long, default_value_t = 1024)]
     pub webmerc_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times coarser than `prec` per axis, yielding ~factor² fewer points
     /// per level than a factor of 1. Set to `1` for the finest supported
-    /// thinning grid (one winner per GSD-sized cell).
+    /// thinning grid (one winner per resolution-sized cell).
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
     /// Attribute column deciding which feature wins when several contend for the
@@ -315,24 +316,24 @@ const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
 /// into `webmerc_resolution` units per side. The default of 1024 yields
 /// ~39136 m per unit at zoom 0 — the coarsest level's base visibility unit.
-fn base_unit_gsd_z0(webmerc_resolution: u32) -> f64 {
+fn base_unit_resolution_z0(webmerc_resolution: u32) -> f64 {
     WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
 }
 
-fn web_mercator_gsds(
+fn web_mercator_resolutions(
     webmerc_minzoom: u32,
     webmerc_maxzoom: u32,
     webmerc_resolution: u32,
 ) -> Vec<f64> {
-    let z0 = base_unit_gsd_z0(webmerc_resolution);
+    let z0 = base_unit_resolution_z0(webmerc_resolution);
     (webmerc_minzoom..=webmerc_maxzoom)
         .map(|z| z0 / (1u64 << z) as f64)
         .collect()
 }
 
 pub fn run(args: ConvertArgs) -> Result<()> {
-    let gsds: Vec<f64> = if !args.gsd.is_empty() {
-        args.gsd.clone()
+    let resolutions: Vec<f64> = if !args.resolution.is_empty() {
+        args.resolution.clone()
     } else {
         if args.webmerc_minzoom > args.webmerc_maxzoom {
             bail!(
@@ -353,7 +354,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 args.webmerc_resolution
             );
         }
-        let derived = web_mercator_gsds(
+        let derived = web_mercator_resolutions(
             args.webmerc_minzoom,
             args.webmerc_maxzoom,
             args.webmerc_resolution,
@@ -369,14 +370,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     };
     // `partial_cmp` rather than `<=` / `<` so NaN values also fail the check
     // (NaN compares as `None`, which is not `Some(Greater)`).
-    for w in gsds.windows(2) {
+    for w in resolutions.windows(2) {
         if w[0].partial_cmp(&w[1]) != Some(std::cmp::Ordering::Greater) {
-            bail!("GSD values must be strictly decreasing, got {:?}", gsds);
+            bail!(
+                "resolution values must be strictly decreasing, got {:?}",
+                resolutions
+            );
         }
     }
-    for g in &gsds {
-        if g.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            bail!("GSD values must be positive, got {:?}", gsds);
+    for resolution in &resolutions {
+        if resolution.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            bail!("resolution values must be positive, got {:?}", resolutions);
         }
     }
     if args.point_thinning_factor == 0 {
@@ -456,9 +460,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         }
         explicit => explicit,
     };
-    let simplification_tolerances: Vec<f64> = gsds
+    let simplification_tolerances: Vec<f64> = resolutions
         .iter()
-        .map(|gsd| gsd_in_input_units(*gsd * args.simplification_tolerance_factor, input_units))
+        .map(|resolution| {
+            resolution_in_input_units(
+                *resolution * args.simplification_tolerance_factor,
+                input_units,
+            )
+        })
         .collect();
 
     let n_rows = arrow_meta.metadata().file_metadata().num_rows() as usize;
@@ -491,7 +500,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         bboxes,
         kinds,
         minimum_viable_levels,
-        candidate_wkb_sizes,
         sort_key,
     } = scan_input(
         &args.input,
@@ -531,7 +539,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    eprintln!("[3/4] Assigning features to {} level(s)", gsds.len());
+    eprintln!("[3/4] Assigning features to {} level(s)", resolutions.len());
     let assignment = assign_levels(
         FeatureMeasures {
             bboxes: &bboxes,
@@ -539,27 +547,25 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             minimum_viable_levels: &minimum_viable_levels,
             sort_ranks: &sort_ranks,
         },
-        &gsds,
+        &resolutions,
         input_units,
         args.point_thinning_factor,
     )?;
-    let candidate_payloads = candidate_wkb_payloads(&assignment, &candidate_wkb_sizes)?;
-    let selected_candidates = select_level_hierarchy(&assignment, &candidate_payloads)?;
-    let mut per_level = remap_levels(&assignment, &selected_candidates)?;
-    let gsds: Vec<f64> = selected_candidates
+    let occupied_candidates = occupied_level_candidates(&assignment, resolutions.len())?;
+    let mut per_level = remap_levels(&assignment, &occupied_candidates)?;
+    let resolutions: Vec<f64> = occupied_candidates
         .iter()
-        .map(|candidate| gsds[*candidate])
+        .map(|candidate| resolutions[*candidate])
         .collect();
     eprintln!(
-        "      selected {} of {} candidate level(s) from rendering WKB growth",
-        selected_candidates.len(),
-        candidate_payloads.len()
+        "      retained {} of {} candidate level(s) after removing empty levels",
+        occupied_candidates.len(),
+        resolutions.len()
     );
     for (i, rows) in per_level.iter().enumerate() {
         eprintln!(
-            "      level {i} (gsd={:>10.2} m, WKB prefix={:>9} bytes): {:>9} features",
-            gsds[i],
-            candidate_payloads[selected_candidates[i]],
+            "      level {i} (resolution={:>10.2} m): {:>9} features",
+            resolutions[i],
             rows.len()
         );
     }
@@ -571,16 +577,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // Point coordinates cannot be simplified, so overview columns would only
     // duplicate the primary WKB. Their feature hierarchy still comes from
     // point thinning, and row-group byte budgeting falls back to primary WKB.
-    let geometry_overviews: Vec<GeometryOverview> = match scanned_geometry_family {
+    let overview_columns: Vec<String> = match scanned_geometry_family {
         GeometryFamily::Point => Vec::new(),
-        GeometryFamily::Line | GeometryFamily::Polygon => selected_candidates
+        GeometryFamily::Line | GeometryFamily::Polygon => occupied_candidates
             .iter()
             .enumerate()
-            .map(|(level, _)| GeometryOverview {
-                column: overview_column_name(&geom_col_name, level),
-                level,
-                tolerance_meters: gsds[level] * args.simplification_tolerance_factor,
-            })
+            .map(|(level, _)| overview_column_name(&geom_col_name, level))
             .collect(),
     };
 
@@ -594,9 +596,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
         if drop_names.contains(&f.name().as_str())
-            || geometry_overviews
-                .iter()
-                .any(|overview| overview.column == f.name().as_str())
+            || overview_columns.iter().any(|column| column == f.name())
         {
             eprintln!(
                 "      note: dropping input column `{}` (will be overwritten)",
@@ -608,14 +608,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         keep_col_indices.push(i);
     }
     let overview_type = input_schema.field(geom_col_idx).data_type().clone();
-    for overview in &geometry_overviews {
+    for column in &overview_columns {
         // An overview is NULL for features introduced after its associated
         // level, so these physical columns must be optional.
-        output_fields.push(Arc::new(Field::new(
-            &overview.column,
-            overview_type.clone(),
-            true,
-        )));
+        output_fields.push(Arc::new(Field::new(column, overview_type.clone(), true)));
     }
     output_fields.push(Arc::new(bbox_struct_field()));
     let output_schema = Arc::new(Schema::new(output_fields));
@@ -631,17 +627,25 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             a
         });
 
+    // Keep compression policy internal rather than exposing another conversion
+    // parameter. Brotli 6 made the benchmark file smaller overall, but did not
+    // reduce the bytes fetched for a representative overview range and took
+    // about twice as long to decode. ZSTD 9 is the better default for COGP's
+    // latency-sensitive range-read workload.
+    let compression =
+        Compression::ZSTD(ZstdLevel::try_new(9).expect("ZSTD level 9 is supported by parquet"));
+
     // Disable dictionary encoding for the geometry column (WKB is high-cardinality, dict
     // is pure overhead) and for the bbox struct's float fields (each value is unique).
     let mut props_builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_compression(compression)
         .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
-    for overview in &geometry_overviews {
-        props_builder = props_builder
-            .set_column_dictionary_enabled(ColumnPath::from(overview.column.as_str()), false);
+    for column in &overview_columns {
+        props_builder =
+            props_builder.set_column_dictionary_enabled(ColumnPath::from(column.as_str()), false);
     }
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
@@ -672,12 +676,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_keep = keep_col_indices;
     let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
-    let overview_plan: Vec<(usize, f64)> = geometry_overviews
+    let overview_plan: Vec<(usize, f64)> = overview_columns
         .iter()
-        .map(|overview| {
+        .enumerate()
+        .map(|(level, _)| {
+            let tolerance_meters = resolutions[level] * args.simplification_tolerance_factor;
             (
-                overview.level,
-                gsd_in_input_units(overview.tolerance_meters, input_units),
+                level,
+                resolution_in_input_units(tolerance_meters, input_units),
             )
         })
         .collect();
@@ -723,13 +729,13 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     });
 
     let mut last_level: Option<usize> = None;
-    let mut levels_meta: Vec<Level> = Vec::with_capacity(gsds.len());
-    let render_geometry_columns: Vec<usize> = if geometry_overviews.is_empty() {
+    let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
+    let render_geometry_columns: Vec<usize> = if overview_columns.is_empty() {
         vec![producer_geom_col]
     } else {
-        geometry_overviews
+        overview_columns
             .iter()
-            .map(|overview| output_schema.index_of(&overview.column))
+            .map(|column| output_schema.index_of(column))
             .collect::<std::result::Result<_, _>>()?
     };
     let mut row_group_limiter = RowGroupLimiter::new(args.row_group_size, args.row_group_max_bytes);
@@ -739,7 +745,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 row_group_limiter.flush(&mut writer)?;
                 levels_meta.push(Level {
                     row_group_end: flushed_row_group_end(&writer)?,
-                    gsd: gsds[prev],
+                    resolution_meters: resolutions[prev],
+                    geometry_column: overview_columns.get(prev).unwrap_or(&geom_col_name).clone(),
                 });
             }
         }
@@ -750,7 +757,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         row_group_limiter.flush(&mut writer)?;
         levels_meta.push(Level {
             row_group_end: flushed_row_group_end(&writer)?,
-            gsd: gsds[prev],
+            resolution_meters: resolutions[prev],
+            geometry_column: overview_columns.get(prev).unwrap_or(&geom_col_name).clone(),
         });
     }
     producer
@@ -789,12 +797,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .get(&geom_col_name)
         .expect("primary geometry metadata was inserted")
         .clone();
-    for overview in &geometry_overviews {
+    for column in &overview_columns {
         let mut column_meta = primary_geo.clone();
         // Spatial pruning remains based on the lossless primary geometry.
         // Simplification can contract an overview's bbox.
         column_meta.covering = None;
-        columns.insert(overview.column.clone(), column_meta);
+        columns.insert(column.clone(), column_meta);
     }
     let geo_meta = GeoMeta {
         version: GEOPARQUET_VERSION.to_string(),
@@ -804,7 +812,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let cogp_meta = CogpMeta {
         version: COGP_VERSION.to_string(),
         levels: levels_meta,
-        geometry_overviews,
     };
 
     writer.append_key_value_metadata(KeyValue {
@@ -979,10 +986,6 @@ struct ScanResult {
     /// First level whose simplification result remains independently
     /// renderable. Points are viable throughout the ladder.
     minimum_viable_levels: Vec<u16>,
-    /// Exact simplified WKB length for every row at every candidate level,
-    /// stored level-major. This is the input to deterministic hierarchy
-    /// selection after feature assignment is known.
-    candidate_wkb_sizes: Vec<Vec<u64>>,
     /// The fully materialized `--sort-key` column, when one was requested —
     /// the only column the convert still holds in memory in its entirety.
     sort_key: Option<ArrayRef>,
@@ -992,7 +995,6 @@ struct ScannedGeometry {
     bbox: Bbox,
     kind: GeomKind,
     minimum_viable_level: u16,
-    wkb_sizes: Vec<u64>,
 }
 
 /// Pass 1: stream the file reading only the geometry column (plus, when
@@ -1039,10 +1041,6 @@ fn scan_input(
     let mut bboxes: Vec<Bbox> = Vec::with_capacity(n_rows);
     let mut kinds: Vec<GeomKind> = Vec::with_capacity(n_rows);
     let mut minimum_viable_levels: Vec<u16> = Vec::with_capacity(n_rows);
-    let mut candidate_wkb_sizes: Vec<Vec<u64>> = simplification_tolerances
-        .iter()
-        .map(|_| Vec::with_capacity(n_rows))
-        .collect();
     let mut sort_key_parts: Vec<ArrayRef> = Vec::new();
     let mut row_base = 0usize;
     for batch in reader {
@@ -1061,9 +1059,6 @@ fn scan_input(
             bboxes.push(geometry.bbox);
             kinds.push(geometry.kind);
             minimum_viable_levels.push(geometry.minimum_viable_level);
-            for (level_sizes, size) in candidate_wkb_sizes.iter_mut().zip(geometry.wkb_sizes) {
-                level_sizes.push(size);
-            }
         }
         if let Some(i) = sort_key_idx {
             sort_key_parts.push(batch.column(proj_idx(i)).clone());
@@ -1078,7 +1073,6 @@ fn scan_input(
         bboxes,
         kinds,
         minimum_viable_levels,
-        candidate_wkb_sizes,
         sort_key,
     })
 }
@@ -1123,20 +1117,17 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
             } else {
                 bbox_from_wkb(wkb)?
             };
-            let (minimum_viable_level, wkb_sizes) = match kind {
-                GeomKind::Point => (0, vec![wkb.len() as u64; simplification_tolerances.len()]),
+            let minimum_viable_level = match kind {
+                GeomKind::Point => 0,
                 GeomKind::Line | GeomKind::Polygon => {
-                    let profile = simplification_profile(wkb, simplification_tolerances)?;
-                    let minimum_viable_level = u16::try_from(profile.minimum_viable_level)
-                        .map_err(|_| anyhow!("too many simplification levels"))?;
-                    (minimum_viable_level, profile.wkb_sizes)
+                    let level = first_viable_level(wkb, simplification_tolerances)?;
+                    u16::try_from(level).map_err(|_| anyhow!("too many simplification levels"))?
                 }
             };
             Ok(ScannedGeometry {
                 bbox,
                 kind,
                 minimum_viable_level,
-                wkb_sizes,
             })
         })
         .collect()
@@ -1374,80 +1365,31 @@ fn gather_chunk(
 
 const METERS_PER_DEGREE: f64 = 111_320.0;
 
-fn gsd_in_input_units(gsd: f64, units: InputUnits) -> f64 {
+fn resolution_in_input_units(resolution: f64, units: InputUnits) -> f64 {
     match units {
-        InputUnits::Degrees => gsd / METERS_PER_DEGREE,
-        InputUnits::Meters => gsd,
+        InputUnits::Degrees => resolution / METERS_PER_DEGREE,
+        InputUnits::Meters => resolution,
         InputUnits::Auto => unreachable!("input units must be resolved before conversion"),
     }
 }
 
-/// A COG overview halves linear resolution, so its sample count and expected
-/// payload grow by four. Apply that same invariant to vector WKB prefixes: the
-/// data, rather than a caller-selected column count, decides hierarchy depth.
-const WKB_LEVEL_GROWTH_FACTOR: u64 = 4;
-
-fn candidate_wkb_payloads(
-    assignment: &[u16],
-    candidate_wkb_sizes: &[Vec<u64>],
-) -> Result<Vec<u64>> {
-    if candidate_wkb_sizes.is_empty() {
-        bail!("internal: no candidate WKB sizes");
-    }
-    let mut payloads = Vec::with_capacity(candidate_wkb_sizes.len());
-    for (level, sizes) in candidate_wkb_sizes.iter().enumerate() {
-        if sizes.len() != assignment.len() {
-            bail!("internal: candidate WKB size columns have inconsistent lengths");
-        }
-        let mut payload = 0u64;
-        for (feature_level, size) in assignment.iter().zip(sizes) {
-            if *feature_level as usize <= level {
-                payload = payload
-                    .checked_add(*size)
-                    .ok_or_else(|| anyhow!("simplified WKB payload exceeds u64"))?;
-            }
-        }
-        // RDP output is not formally monotonic for every geometry. Selection
-        // uses the prefix maximum so a finer level can never appear cheaper
-        // solely because its particular simplification happened to be smaller.
-        if let Some(previous) = payloads.last() {
-            payload = payload.max(*previous);
-        }
-        payloads.push(payload);
-    }
-    Ok(payloads)
-}
-
-fn select_level_hierarchy(assignment: &[u16], payloads: &[u64]) -> Result<Vec<usize>> {
-    if assignment.is_empty() || payloads.is_empty() {
+fn occupied_level_candidates(assignment: &[u16], candidate_count: usize) -> Result<Vec<usize>> {
+    if assignment.is_empty() || candidate_count == 0 {
         bail!("internal: cannot build an empty level hierarchy");
     }
-    let mut occupied = vec![false; payloads.len()];
+    let mut occupied = vec![false; candidate_count];
     for level in assignment {
         let level = *level as usize;
-        if level >= payloads.len() {
+        if level >= candidate_count {
             bail!("internal: feature level {level} is outside the candidate ladder");
         }
         occupied[level] = true;
     }
-    let candidates: Vec<usize> = occupied
+    Ok(occupied
         .iter()
         .enumerate()
         .filter_map(|(level, occupied)| occupied.then_some(level))
-        .collect();
-
-    let mut selected = vec![candidates[0]];
-    let mut current = 0usize;
-    while current + 1 < candidates.len() {
-        let limit = payloads[candidates[current]].saturating_mul(WKB_LEVEL_GROWTH_FACTOR);
-        let mut next = current + 1;
-        while next + 1 < candidates.len() && payloads[candidates[next + 1]] <= limit {
-            next += 1;
-        }
-        selected.push(candidates[next]);
-        current = next;
-    }
-    Ok(selected)
+        .collect())
 }
 
 fn remap_levels(assignment: &[u16], selected_candidates: &[usize]) -> Result<Vec<Vec<u32>>> {
@@ -1550,7 +1492,7 @@ struct FeatureMeasures<'a> {
 
 fn assign_levels(
     features: FeatureMeasures<'_>,
-    gsds: &[f64],
+    resolutions: &[f64],
     units: InputUnits,
     point_thinning_factor: u32,
 ) -> Result<Vec<u16>> {
@@ -1567,9 +1509,9 @@ fn assign_levels(
     }
     let mut assigned: Vec<i32> = vec![-1; n];
     let mut remaining: Vec<u32> = (0..n as u32).collect();
-    let last_level = (gsds.len() - 1) as u16;
+    let last_level = (resolutions.len() - 1) as u16;
 
-    let precs: Vec<f64> = gsds
+    let precs: Vec<f64> = resolutions
         .iter()
         .map(|g| match units {
             InputUnits::Degrees => g / METERS_PER_DEGREE,
@@ -1875,8 +1817,8 @@ mod tests {
     }
 
     #[test]
-    fn web_mercator_gsds_monotonic_and_halving() {
-        let g = web_mercator_gsds(0, 4, 1024);
+    fn web_mercator_resolutions_are_monotonic_and_halving() {
+        let g = web_mercator_resolutions(0, 4, 1024);
         assert_eq!(g.len(), 5);
         for w in g.windows(2) {
             assert!(
@@ -1889,37 +1831,15 @@ mod tests {
     }
 
     #[test]
-    fn wkb_growth_selects_the_minimal_level_hierarchy() {
-        let payloads = vec![
-            15, 68, 135, 210, 316, 535, 969, 1_816, 3_421, 6_343, 11_298, 19_339, 32_048, 50_860,
-            75_756, 103_681, 131_293,
-        ];
-        let assignment: Vec<u16> = (0..payloads.len() as u16).collect();
-        assert_eq!(
-            select_level_hierarchy(&assignment, &payloads).unwrap(),
-            vec![0, 1, 3, 5, 7, 9, 11, 14, 16]
-        );
-    }
-
-    #[test]
-    fn wkb_hierarchy_ignores_empty_candidates_and_remaps_forward() {
+    fn empty_candidates_are_removed_and_occupied_candidates_are_preserved() {
         let assignment = vec![0, 2, 2, 4];
-        let payloads = vec![10, 10, 30, 30, 100];
-        let selected = select_level_hierarchy(&assignment, &payloads).unwrap();
-        assert_eq!(selected, vec![0, 2, 4]);
+        assert_eq!(
+            occupied_level_candidates(&assignment, 5).unwrap(),
+            vec![0, 2, 4]
+        );
         assert_eq!(
             remap_levels(&assignment, &[0, 4]).unwrap(),
             vec![vec![0], vec![1, 2, 3]]
-        );
-    }
-
-    #[test]
-    fn candidate_payloads_include_only_the_visible_prefix() {
-        let assignment = vec![0, 1, 2];
-        let sizes = vec![vec![10, 20, 30], vec![8, 18, 28], vec![6, 16, 26]];
-        assert_eq!(
-            candidate_wkb_payloads(&assignment, &sizes).unwrap(),
-            vec![10, 26, 48]
         );
     }
 

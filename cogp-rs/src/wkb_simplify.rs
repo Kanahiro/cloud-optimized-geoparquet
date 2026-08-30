@@ -1,10 +1,12 @@
 //! Experimental scale-based WKB simplification for rendering overview columns.
 //!
 //! The simplifier preserves WKB byte order, type flags, SRID, and retained
-//! ordinates. Distance tests use XY only. Polygon rings keep their closure and
-//! minimum vertex count. A simplified line is viable only when its length
-//! exceeds the active tolerance. This local algorithm does not promise
-//! topology preservation across rings or neighboring features.
+//! ordinates. Distance tests use XY only. Retained XY coordinates are snapped
+//! to a power-of-two grid no coarser than the tolerance so their f64 low bits
+//! compress well; Z/M ordinates remain lossless. Polygon rings keep their closure and minimum
+//! vertex count. A simplified line is viable only when its length exceeds the
+//! active tolerance. This local algorithm does not promise topology
+//! preservation across rings or neighboring features.
 
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -44,23 +46,16 @@ pub fn simplify_wkb(bytes: &[u8], tolerance: f64) -> Result<Vec<u8>> {
     if !simplify_geometry(&mut geometry, tolerance * tolerance) {
         return Ok(bytes.to_vec());
     }
+    quantize_geometry(&mut geometry, quantization_grid(tolerance));
     let mut output = Vec::with_capacity(bytes.len());
     write_geometry(&geometry, &mut output);
     Ok(output)
 }
 
-pub struct SimplificationProfile {
-    /// First coarse-to-fine tolerance at which the geometry remains valid.
-    pub minimum_viable_level: usize,
-    /// Exact encoded WKB length at every candidate tolerance. An invalid
-    /// candidate records the lossless fallback length.
-    pub wkb_sizes: Vec<u64>,
-}
-
-/// Evaluate one geometry across the complete candidate tolerance ladder.
-/// Parsing happens once; each candidate simplifies an independent clone so
-/// approximation error never accumulates between levels.
-pub fn simplification_profile(bytes: &[u8], tolerances: &[f64]) -> Result<SimplificationProfile> {
+/// Return the first coarse-to-fine tolerance at which the geometry remains
+/// independently renderable. Parsing happens once; each candidate simplifies
+/// an independent clone so approximation error never accumulates between levels.
+pub fn first_viable_level(bytes: &[u8], tolerances: &[f64]) -> Result<usize> {
     if tolerances.is_empty() {
         bail!("simplification profile requires at least one tolerance");
     }
@@ -69,24 +64,64 @@ pub fn simplification_profile(bytes: &[u8], tolerances: &[f64]) -> Result<Simpli
     if offset != bytes.len() {
         bail!("trailing bytes after WKB geometry");
     }
-    let mut minimum_viable_level = None;
-    let mut wkb_sizes = Vec::with_capacity(tolerances.len());
     for (level, tolerance) in tolerances.iter().enumerate() {
         if !tolerance.is_finite() || *tolerance <= 0.0 {
             bail!("simplification tolerance must be positive and finite");
         }
         let mut candidate = geometry.clone();
         if simplify_geometry(&mut candidate, tolerance * tolerance) {
-            minimum_viable_level.get_or_insert(level);
-            wkb_sizes.push(geometry_wkb_size(&candidate));
-        } else {
-            wkb_sizes.push(bytes.len() as u64);
+            return Ok(level);
         }
     }
-    Ok(SimplificationProfile {
-        minimum_viable_level: minimum_viable_level.unwrap_or(tolerances.len() - 1),
-        wkb_sizes,
-    })
+    Ok(tolerances.len() - 1)
+}
+
+/// Choose the largest power-of-two grid spacing no greater than the requested
+/// tolerance. Besides staying inside the existing precision budget, this makes
+/// rounded f64 values share zeroed mantissa bits instead of merely sharing
+/// multiples of an arbitrary floating-point value.
+fn quantization_grid(tolerance: f64) -> f64 {
+    let grid = f64::from_bits(tolerance.to_bits() & 0x7ff0_0000_0000_0000);
+    if grid == 0.0 {
+        tolerance
+    } else {
+        grid
+    }
+}
+
+/// Snap rendering-only XY coordinates without changing vertex counts or ring
+/// closure. Keeping the representation as f64 preserves GeoParquet/WKB
+/// compatibility while giving ZSTD highly repetitive low-order bytes.
+fn quantize_geometry(geometry: &mut Geometry, grid: f64) {
+    match &mut geometry.body {
+        Body::Point(point) => quantize_coordinate(point, grid),
+        Body::LineString(points) => quantize_coordinates(points, grid),
+        Body::Polygon(rings) => {
+            for ring in rings {
+                quantize_coordinates(ring, grid);
+            }
+        }
+        Body::Collection(children) => {
+            for child in children {
+                quantize_geometry(child, grid);
+            }
+        }
+    }
+}
+
+fn quantize_coordinates(points: &mut [Coordinate], grid: f64) {
+    for point in points {
+        quantize_coordinate(point, grid);
+    }
+}
+
+fn quantize_coordinate(coordinate: &mut Coordinate, grid: f64) {
+    for ordinate in &mut coordinate.0[..2] {
+        let snapped = (*ordinate / grid).round() * grid;
+        // Canonicalize negative zero as well as the coordinate value. This is
+        // invisible geometrically but avoids two byte patterns for grid zero.
+        *ordinate = if snapped == 0.0 { 0.0 } else { snapped };
+    }
 }
 
 fn simplify_geometry(geometry: &mut Geometry, tolerance2: f64) -> bool {
@@ -152,30 +187,6 @@ fn line_length(points: &[Coordinate]) -> f64 {
             dx.hypot(dy)
         })
         .sum()
-}
-
-fn geometry_wkb_size(geometry: &Geometry) -> u64 {
-    let header = 1 + 4 + u64::from(geometry.srid.is_some()) * 4;
-    header
-        + match &geometry.body {
-            Body::Point(point) => coordinate_bytes(point),
-            Body::LineString(points) => 4 + coordinates_bytes(points),
-            Body::Polygon(rings) => {
-                4 + rings
-                    .iter()
-                    .map(|ring| 4 + coordinates_bytes(ring))
-                    .sum::<u64>()
-            }
-            Body::Collection(children) => 4 + children.iter().map(geometry_wkb_size).sum::<u64>(),
-        }
-}
-
-fn coordinate_bytes(coordinate: &Coordinate) -> u64 {
-    coordinate.0.len() as u64 * 8
-}
-
-fn coordinates_bytes(coordinates: &[Coordinate]) -> u64 {
-    coordinates.iter().map(coordinate_bytes).sum()
 }
 
 /// Ramer-Douglas-Peucker with a minimum output cardinality. Every overview is
@@ -424,6 +435,39 @@ mod tests {
     }
 
     #[test]
+    fn simplified_xy_is_snapped_but_z_is_preserved() {
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 1002, 1); // ISO WKB LineString Z
+        put_u32(&mut wkb, 3, 1);
+        for (x, y, z) in [
+            (0.04, 0.04, 12.345),
+            (1.5, 0.01, 23.456),
+            (2.96, -0.04, 34.567),
+        ] {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+            put_f64(&mut wkb, z, 1);
+        }
+
+        let simplified = simplify_wkb(&wkb, 0.1).unwrap();
+        let mut offset = 0;
+        let parsed = parse_geometry(&simplified, &mut offset).unwrap();
+        let Body::LineString(points) = parsed.body else {
+            panic!("expected linestring")
+        };
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].0, [0.0625, 0.0625, 12.345]);
+        assert_eq!(points[1].0, [2.9375, -0.0625, 34.567]);
+    }
+
+    #[test]
+    fn quantization_grid_is_binary_and_no_coarser_than_tolerance() {
+        assert_eq!(quantization_grid(0.1), 0.0625);
+        assert_eq!(quantization_grid(1024.0), 1024.0);
+        assert!(quantization_grid(1000.0) <= 1000.0);
+    }
+
+    #[test]
     fn line_viability_defers_sub_tolerance_results() {
         let mut wkb = vec![1];
         put_u32(&mut wkb, 2, 1);
@@ -433,15 +477,19 @@ mod tests {
             put_f64(&mut wkb, y, 1);
         }
 
-        let profile = simplification_profile(&wkb, &[1.0, 0.1]).unwrap();
-        assert_eq!(profile.minimum_viable_level, 1);
-        assert_eq!(profile.wkb_sizes[0], wkb.len() as u64);
-        assert_eq!(profile.wkb_sizes[1], wkb.len() as u64);
+        assert_eq!(first_viable_level(&wkb, &[1.0, 0.1]).unwrap(), 1);
     }
 
     #[test]
     fn polygon_ring_remains_closed_and_has_minimum_vertices() {
-        let coordinates = [(0., 0.), (0.5, 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)];
+        let coordinates = [
+            (0.04, 0.04),
+            (0.54, 0.04),
+            (1.04, 0.04),
+            (1.04, 1.04),
+            (0.04, 1.04),
+            (0.04, 0.04),
+        ];
         let mut wkb = vec![1];
         put_u32(&mut wkb, 3, 1);
         put_u32(&mut wkb, 1, 1);
@@ -460,6 +508,7 @@ mod tests {
         assert_eq!(rings.len(), 1);
         assert!(rings[0].len() >= 4);
         assert!(same_xy(&rings[0][0], rings[0].last().unwrap()));
+        assert_eq!(rings[0][0].0[..2], [0.0625, 0.0625]);
         assert!(simplified.len() < wkb.len());
     }
 
@@ -512,9 +561,6 @@ mod tests {
             put_f64(&mut wkb, y, 1);
         }
 
-        let profile = simplification_profile(&wkb, &[10.0, 0.1]).unwrap();
-        assert_eq!(profile.minimum_viable_level, 1);
-        assert_eq!(profile.wkb_sizes.len(), 2);
-        assert!(profile.wkb_sizes[1] <= wkb.len() as u64);
+        assert_eq!(first_viable_level(&wkb, &[10.0, 0.1]).unwrap(), 1);
     }
 }

@@ -17,12 +17,11 @@ import {
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
 import { lruCachingAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
-import { selectGeometryColumnByGsd, selectLevelByGsd } from './level.js';
+import { selectLevelByResolution } from './level.js';
 import {
   type BboxCovering,
   type CogpMeta,
   extractCogpDocument,
-  geometryFamily,
   type GeoMeta,
 } from './meta.js';
 
@@ -73,8 +72,8 @@ function decodeWkb(bytes: Uint8Array): unknown {
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
-  /** Select a scale-specific geometry overview and, by default, its row prefix. */
-  targetGsd?: number;
+  /** Select the level intended for this nominal ground resolution, in meters. */
+  targetResolutionMeters?: number;
   /** Spatial filter; row groups whose covering envelope misses this bbox are skipped. */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
@@ -154,7 +153,6 @@ export class CogpReader {
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
   private readonly bboxPaths: BboxCovering;
-  private readonly extendedGeometry: boolean;
 
   private constructor(
     private readonly file: unknown,
@@ -179,8 +177,6 @@ export class CogpReader {
     // geometry column. Surface a clear error rather than silently falling
     // back to "no spatial filter" when the file is malformed.
     const primaryCol = this.geo.columns[this.geo.primary_column];
-    const family = geometryFamily(primaryCol?.geometry_types ?? []);
-    this.extendedGeometry = family === 'line' || family === 'polygon';
     const covering = primaryCol?.covering;
     if (!covering?.bbox) {
       throw new Error(
@@ -209,32 +205,24 @@ export class CogpReader {
   }
 
   /**
-   * Select a level index per SPEC §7. Pass a target ground-sample distance in
-   * meters; the reader returns the last level whose `gsd >= targetGsd`. If
-   * `targetGsd` is omitted (or coarser than the coarsest level), the finest /
-   * coarsest level is returned respectively.
+   * Select a level index per SPEC §7. The reader returns the last level whose
+   * `resolution_meters` is at least the requested resolution. If omitted, the
+   * finest level is returned.
    */
-  selectLevel(targetGsd?: number): number {
-    if (targetGsd === undefined) return this.levels.length - 1;
-    return selectLevelByGsd(this.levels, targetGsd);
+  selectLevel(targetResolutionMeters?: number): number {
+    if (targetResolutionMeters === undefined) return this.levels.length - 1;
+    return selectLevelByResolution(this.levels, targetResolutionMeters);
   }
 
   /**
-   * Physical WKB column precise enough for the target and complete for the
-   * prefix. Extended-geometry streaming deliberately stays on the finest
-   * complete overview when one exists. Files without overviews use the
-   * lossless primary column.
+   * Physical WKB column declared by the selected level.
    */
-  selectGeometryColumn(targetGsd?: number, maxLevel?: number): string {
-    if (targetGsd === undefined) return this.primaryGeometryColumn;
-    const minimumLevel = maxLevel ?? this.selectLevel(targetGsd);
-    return selectGeometryColumnByGsd(
-      this.cogp.geometry_overviews ?? [],
-      targetGsd,
-      minimumLevel,
-      this.primaryGeometryColumn,
-      this.extendedGeometry,
-    );
+  selectGeometryColumn(targetResolutionMeters?: number, maxLevel?: number): string {
+    if (targetResolutionMeters === undefined) {
+      return this.primaryGeometryColumn;
+    }
+    const level = maxLevel ?? this.selectLevel(targetResolutionMeters);
+    return this.levels[level]?.geometry_column ?? this.primaryGeometryColumn;
   }
 
   /**
@@ -248,7 +236,7 @@ export class CogpReader {
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
-    const maxLevel = opts.maxLevel ?? this.selectLevel(opts.targetGsd);
+    const maxLevel = opts.maxLevel ?? this.selectLevel(opts.targetResolutionMeters);
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
@@ -262,9 +250,11 @@ export class CogpReader {
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
     // struct when you name its root.
-    const selectedGeometry = this.selectGeometryColumn(opts.targetGsd, maxLevel);
+    const selectedGeometry = this.selectGeometryColumn(opts.targetResolutionMeters, maxLevel);
     const overviewNames = new Set(
-      (this.cogp.geometry_overviews ?? []).map((overview) => overview.column),
+      this.levels
+        .map((level) => level.geometry_column)
+        .filter((column) => column !== this.primaryGeometryColumn),
     );
     const primaryRequested = !opts.columns || opts.columns.includes(this.primaryGeometryColumn);
     let columns = opts.columns;

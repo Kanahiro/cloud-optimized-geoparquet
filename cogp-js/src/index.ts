@@ -27,10 +27,9 @@ export type {
   Covering,
   GeoColumn,
   GeoMeta,
-  GeometryOverview,
   Level,
 } from './meta.js';
 
-export { selectGeometryColumnByGsd, selectLevelByGsd } from './level.js';
+export { selectLevelByResolution } from './level.js';
 
 export type { Bbox } from './bbox.js';

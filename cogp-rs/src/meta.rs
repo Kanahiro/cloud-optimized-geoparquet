@@ -10,23 +10,13 @@ pub const GEOPARQUET_VERSION: &str = "1.1.0";
 pub struct CogpMeta {
     pub version: String,
     pub levels: Vec<Level>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub geometry_overviews: Vec<GeometryOverview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
-    pub gsd: f64,
-}
-
-/// A scale-specific WKB column. `level` supplies its non-null row-group
-/// boundary; `tolerance_meters` independently describes its spatial error.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GeometryOverview {
-    pub column: String,
-    pub level: usize,
-    pub tolerance_meters: f64,
+    pub resolution_meters: f64,
+    pub geometry_column: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,27 +103,23 @@ mod tests {
             levels: vec![
                 Level {
                     row_group_end: 0,
-                    gsd: 1000.0,
+                    resolution_meters: 1000.0,
+                    geometry_column: "geometry_ovr_0".into(),
                 },
                 Level {
                     row_group_end: 3,
-                    gsd: 250.0,
+                    resolution_meters: 250.0,
+                    geometry_column: "geometry_ovr_1".into(),
                 },
             ],
-            geometry_overviews: vec![GeometryOverview {
-                column: "geometry_ovr_0".into(),
-                level: 0,
-                tolerance_meters: 250.0,
-            }],
         };
         let s = serde_json::to_string(&m).unwrap();
         let parsed: CogpMeta = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.version, COGP_VERSION);
         assert_eq!(parsed.levels.len(), 2);
         assert_eq!(parsed.levels[0].row_group_end, 0);
-        assert_eq!(parsed.levels[1].gsd, 250.0);
-        assert_eq!(parsed.geometry_overviews[0].level, 0);
-        assert_eq!(parsed.geometry_overviews[0].tolerance_meters, 250.0);
+        assert_eq!(parsed.levels[1].resolution_meters, 250.0);
+        assert_eq!(parsed.levels[0].geometry_column, "geometry_ovr_0");
     }
 
     #[test]

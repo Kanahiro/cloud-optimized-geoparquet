@@ -47,9 +47,9 @@ export function openDataset(url: string): Promise<OpenResult> {
 export function readViewport(
   url: string,
   bbox: ViewportBbox,
-  targetGsd: number,
+  targetResolutionMeters: number,
 ): Promise<ViewportResult> {
-  return call<ViewportResult>({ type: 'readViewport', url, bbox, targetGsd });
+  return call<ViewportResult>({ type: 'readViewport', url, bbox, targetResolutionMeters });
 }
 
 export function readFeatureProperties(

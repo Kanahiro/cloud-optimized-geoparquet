@@ -3,7 +3,7 @@
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
-area and ground sample distance. Bbox reads use covering-column statistics to
+area and target ground resolution. Bbox reads use covering-column statistics to
 prune row groups, then apply an exact per-feature bbox filter to the surviving
 rows.
 
@@ -47,14 +47,11 @@ pnpm --filter cogp-demo build
 ```
 
 The public entry point exports `CogpReader`, metadata parsing helpers,
-`selectLevelByGsd`, `selectGeometryColumnByGsd`, and their associated
-TypeScript types. `readRows({ targetGsd })` projects a single sufficiently
-precise WKB column and returns its decoded value under the primary column name.
-For Polygon-only data, this streaming path never projects the lossless primary
-WKB column when overviews exist: requests finer than the available overviews
-stay on the finest complete overview. A file with no overviews falls back to
-the primary raw WKB column. Omit `targetGsd` when lossless primary geometry is
-required regardless of available overviews.
+`selectLevelByResolution` and the associated TypeScript types.
+`readRows({ targetResolutionMeters })` selects one self-contained level,
+projects its declared `geometry_column`, and returns the decoded value under
+the primary column name. Omit `targetResolutionMeters` when lossless primary
+geometry is required.
 
 For interactive maps, keep viewport projections narrow and fetch full
 properties only for selected features. `rowIndexColumn` adds a stable source
@@ -64,7 +61,7 @@ that one row:
 ```ts
 const rows = await reader.readRows({
   bbox,
-  targetGsd,
+  targetResolutionMeters,
   columns: [reader.primaryGeometryColumn],
   rowIndexColumn: '__row',
 });

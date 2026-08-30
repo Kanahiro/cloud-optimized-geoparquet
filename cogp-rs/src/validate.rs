@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -125,7 +125,8 @@ pub fn run(path: &Path) -> Result<()> {
     }
 
     let mut prev_rge: Option<i64> = None;
-    let mut prev_gsd: Option<f64> = None;
+    let mut prev_resolution: Option<f64> = None;
+    let mut geometry_boundaries: HashMap<&str, i64> = HashMap::new();
     for (i, level) in cogp.levels.iter().enumerate() {
         if level.row_group_end < 0 || (level.row_group_end as usize) >= num_rgs {
             errors.push(format!(
@@ -142,19 +143,32 @@ pub fn run(path: &Path) -> Result<()> {
             }
         }
         prev_rge = Some(level.row_group_end);
-        // partial_cmp so NaN gsd values also fall into the error branch.
-        if level.gsd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            errors.push(format!("levels[{i}].gsd={} must be positive", level.gsd));
+        // partial_cmp so NaN values also fall into the error branch.
+        if level.resolution_meters.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            errors.push(format!(
+                "levels[{i}].resolution_meters={} must be positive",
+                level.resolution_meters
+            ));
         }
-        if let Some(p) = prev_gsd {
-            if level.gsd.partial_cmp(&p) != Some(std::cmp::Ordering::Less) {
+        if let Some(previous) = prev_resolution {
+            if level.resolution_meters.partial_cmp(&previous) != Some(std::cmp::Ordering::Less) {
                 errors.push(format!(
-                    "levels[{i}].gsd={} must be strictly less than previous ({})",
-                    level.gsd, p
+                    "levels[{i}].resolution_meters={} must be strictly less than previous ({previous})",
+                    level.resolution_meters
                 ));
             }
         }
-        prev_gsd = Some(level.gsd);
+        prev_resolution = Some(level.resolution_meters);
+        if level.geometry_column.is_empty() {
+            errors.push(format!(
+                "levels[{i}].geometry_column must be a non-empty string"
+            ));
+        } else {
+            geometry_boundaries
+                .entry(&level.geometry_column)
+                .and_modify(|boundary| *boundary = (*boundary).max(level.row_group_end))
+                .or_insert(level.row_group_end);
+        }
     }
     if let Some(last) = cogp.levels.last() {
         if num_rgs > 0 && last.row_group_end != (num_rgs as i64) - 1 {
@@ -167,84 +181,44 @@ pub fn run(path: &Path) -> Result<()> {
     }
 
     let parquet_schema = metadata.file_metadata().schema_descr();
-    let mut overview_names = HashSet::new();
-    let mut previous_overview_level: Option<usize> = None;
-    let mut previous_overview_tolerance: Option<f64> = None;
-    for (index, overview) in cogp.geometry_overviews.iter().enumerate() {
-        if !overview_names.insert(overview.column.as_str()) {
-            errors.push(format!(
-                "geometry_overviews[{index}].column=`{}` is duplicated",
-                overview.column
-            ));
-        }
-        if let Some(previous) = previous_overview_level {
-            if overview.level <= previous {
-                errors.push(format!(
-                    "geometry_overviews[{index}].level={} must be greater than previous ({previous})",
-                    overview.level
-                ));
-            }
-        }
-        previous_overview_level = Some(overview.level);
-        if overview.tolerance_meters.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            errors.push(format!(
-                "geometry_overviews[{index}].tolerance_meters={} must be positive",
-                overview.tolerance_meters
-            ));
-        }
-        if let Some(previous) = previous_overview_tolerance {
-            if overview.tolerance_meters.partial_cmp(&previous) != Some(std::cmp::Ordering::Less) {
-                errors.push(format!(
-                    "geometry_overviews[{index}].tolerance_meters={} must be less than previous ({previous})",
-                    overview.tolerance_meters
-                ));
-            }
-        }
-        previous_overview_tolerance = Some(overview.tolerance_meters);
-
-        let Some(level) = cogp.levels.get(overview.level) else {
-            errors.push(format!(
-                "geometry_overviews[{index}].level={} is out of range",
-                overview.level
-            ));
-            continue;
-        };
-        match geo.columns.get(&overview.column) {
+    for (geometry_column, boundary) in geometry_boundaries {
+        match geo.columns.get(geometry_column) {
             Some(column) if column.encoding == "WKB" => {}
             Some(column) => errors.push(format!(
-                "geometry overview `{}` must have GeoParquet WKB encoding, got `{}`",
-                overview.column, column.encoding
+                "level geometry column `{geometry_column}` must have GeoParquet WKB encoding, got `{}`",
+                column.encoding
             )),
             None => errors.push(format!(
-                "geometry overview `{}` is missing from `geo.columns`",
-                overview.column
+                "level geometry column `{geometry_column}` is missing from `geo.columns`"
             )),
         }
 
         let parquet_column = (0..parquet_schema.num_columns()).find(|column_index| {
-            parquet_schema.column(*column_index).path().string() == overview.column
+            parquet_schema.column(*column_index).path().string() == geometry_column
         });
         let Some(parquet_column) = parquet_column else {
             errors.push(format!(
-                "geometry overview `{}` is missing from the Parquet schema",
-                overview.column
+                "level geometry column `{geometry_column}` is missing from the Parquet schema"
             ));
             continue;
         };
-        if !parquet_schema
-            .column(parquet_column)
-            .self_type()
-            .is_optional()
+        if geometry_column != primary
+            && !parquet_schema
+                .column(parquet_column)
+                .self_type()
+                .is_optional()
         {
             errors.push(format!(
-                "geometry overview `{}` must be nullable in the Parquet schema",
-                overview.column
+                "non-primary level geometry column `{geometry_column}` must be nullable in the Parquet schema"
             ));
         }
 
+        if geometry_column == primary {
+            continue;
+        }
         for row_group_index in 0..num_rgs {
             let row_group = metadata.row_group(row_group_index);
-            let expected_nulls = if (row_group_index as i64) <= level.row_group_end {
+            let expected_nulls = if (row_group_index as i64) <= boundary {
                 0
             } else {
                 row_group.num_rows() as u64
@@ -256,27 +230,14 @@ pub fn run(path: &Path) -> Result<()> {
             if let Some(actual_nulls) = actual_nulls {
                 if actual_nulls != expected_nulls {
                     errors.push(format!(
-                        "row group {row_group_index} geometry overview `{}` has {actual_nulls} null(s), expected {expected_nulls}",
-                        overview.column
+                        "row group {row_group_index} level geometry column `{geometry_column}` has {actual_nulls} null(s), expected {expected_nulls}"
                     ));
                 }
             } else {
                 warnings.push(format!(
-                    "row group {row_group_index} geometry overview `{}` has no null-count statistics; sparse boundary was not verified",
-                    overview.column
+                    "row group {row_group_index} level geometry column `{geometry_column}` has no null-count statistics; sparse boundary was not verified"
                 ));
             }
-        }
-    }
-    if let (Some(final_overview), Some(final_level_index)) = (
-        cogp.geometry_overviews.last(),
-        cogp.levels.len().checked_sub(1),
-    ) {
-        if final_overview.level != final_level_index {
-            errors.push(format!(
-                "final geometry overview level={} must equal final level index={final_level_index}",
-                final_overview.level
-            ));
         }
     }
 

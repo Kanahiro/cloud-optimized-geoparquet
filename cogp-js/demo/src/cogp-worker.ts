@@ -57,21 +57,21 @@ async function openDataset(url: string): Promise<OpenResult> {
 async function readViewport(
   url: string,
   bbox: ViewportBbox,
-  targetGsd: number,
+  targetResolutionMeters: number,
 ): Promise<ViewportResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
     return { data: { type: 'FeatureCollection', features: [] }, status: '' };
   }
   const geomColumn = ds.reader.primaryGeometryColumn;
-  const maxLevel = ds.reader.selectLevel(targetGsd);
-  const selectedGeometry = ds.reader.selectGeometryColumn(targetGsd, maxLevel);
+  const maxLevel = ds.reader.selectLevel(targetResolutionMeters);
+  const selectedGeometry = ds.reader.selectGeometryColumn(targetResolutionMeters, maxLevel);
   const bytesBefore = ds.transfers.bytes;
   const requestsBefore = ds.transfers.requests;
   const rows = await ds.reader.readRows({
     bbox,
     maxLevel,
-    targetGsd,
+    targetResolutionMeters,
     columns: [geomColumn],
     maxRows: VIEWPORT_MAX_ROWS,
     maxRowWkbBytes: VIEWPORT_MAX_ROW_WKB_BYTES,
@@ -98,7 +98,7 @@ async function readViewport(
   const transferRequests = ds.transfers.requests - requestsBefore;
   return {
     data: { type: 'FeatureCollection', features },
-    status: `Loaded ${features.length} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}, geometry: ${selectedGeometry}, transfer: ${formatBytes(transferredBytes)} / ${transferRequests} requests, total: ${formatBytes(ds.transfers.bytes)}). Updates: ${ds.servedViewports}.`,
+    status: `Loaded ${features.length} features at ${formatResolution(targetResolutionMeters)}/px (level <= ${maxLevel}, geometry: ${selectedGeometry}, transfer: ${formatBytes(transferredBytes)} / ${transferRequests} requests, total: ${formatBytes(ds.transfers.bytes)}). Updates: ${ds.servedViewports}.`,
   };
 }
 
@@ -135,7 +135,8 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
     num_row_groups: reader.numRowGroups,
     levels: reader.levels.map((l, i) => ({
       i,
-      gsd: l.gsd,
+      resolution_meters: l.resolution_meters,
+      geometry_column: l.geometry_column,
       row_group_end: l.row_group_end,
     })),
     crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
@@ -191,10 +192,10 @@ function coerceForGeoJson(value: unknown): unknown {
   return value;
 }
 
-function formatGsd(gsdMeters: number): string {
-  if (gsdMeters >= 1000) return `${(gsdMeters / 1000).toFixed(1)} km`;
-  if (gsdMeters >= 1) return `${gsdMeters.toFixed(1)} m`;
-  return `${(gsdMeters * 100).toFixed(1)} cm`;
+function formatResolution(resolutionMeters: number): string {
+  if (resolutionMeters >= 1000) return `${(resolutionMeters / 1000).toFixed(1)} km`;
+  if (resolutionMeters >= 1) return `${resolutionMeters.toFixed(1)} m`;
+  return `${(resolutionMeters * 100).toFixed(1)} cm`;
 }
 
 function formatBytes(bytes: number): string {
@@ -210,7 +211,7 @@ self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
     if (payload.type === 'open') {
       result = await openDataset(payload.url);
     } else if (payload.type === 'readViewport') {
-      result = await readViewport(payload.url, payload.bbox, payload.targetGsd);
+      result = await readViewport(payload.url, payload.bbox, payload.targetResolutionMeters);
     } else {
       result = await readProperties(payload.url, payload.rowIndex);
     }
