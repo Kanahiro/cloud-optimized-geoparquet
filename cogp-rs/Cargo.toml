@@ -22,6 +22,8 @@ arrow-buffer = "56"
 arrow-schema = "56"
 parquet = { version = "56", default-features = false, features = ["arrow", "snap", "zstd", "brotli", "lz4"] }
 byteorder = "1"
+geo = "0.33"
+i_overlay = "4.5.2"
 rayon = "1"
 
 [features]
