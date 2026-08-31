@@ -3,8 +3,10 @@
 Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` reorders the features of a GeoParquet file across row groups using
-point-grid density thinning, extent-based line/polygon visibility, and
-Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
+point-grid density thinning for points, simplification viability for lines and
+polygons, and Sort-Tile-Recursive (STR) bbox packing inside each level. It
+derives the output hierarchy from the actual simplified WKB payload and emits
+one sparse geometry overview per selected level. `validate` checks the
 structural rules in SPEC §5.
 
 ## Install
@@ -27,10 +29,12 @@ cogp validate output.cogp.parquet
 ```
 
 The output COGP file itself is projection-agnostic — it can be consumed by
-any renderer regardless of projection. The defaults simply pick GSDs tuned
+any renderer regardless of projection. The defaults simply pick resolutions tuned
 for a Web Mercator z0..=z16 tile pyramid (17 levels), since that's the most
-common viewer target. Pass `--gsd` to optimize for a different renderer.
-Works on any GeoParquet 1.x file with a WKB geometry column.
+common viewer target. Pass `--resolution` to optimize for a different renderer.
+The input must be GeoParquet 1.x with a WKB geometry column containing one
+topological family (Point, Line, or Polygon); singular and Multi variants of
+that family may coexist.
 
 ## convert
 
@@ -45,44 +49,64 @@ Examples:
 cogp convert input.parquet output.cogp.parquet \
     --webmerc-minzoom 4 --webmerc-maxzoom 12 --row-group-size 20000
 
-# Optimize for a renderer other than Web Mercator: pass GSDs directly
+# Optimize for a renderer other than Web Mercator: pass resolutions directly
 # (meters, coarse to fine). The defaults still produce a valid COGP file for
-# any consumer — use this only when you want level GSDs tuned to a specific
+# any consumer — use this only when you want level resolutions tuned to a specific
 # pyramid.
 cogp convert input.parquet output.cogp.parquet \
-    --gsd 1000,500,100,50
+    --resolution 1000,500,100,50
 
 # Point dataset already in a projected CRS; thin points more aggressively.
 cogp convert points.parquet points.cogp.parquet \
     --input-units meters --point-thinning-factor 8
 ```
 
-Level selection (mutually exclusive). These only choose the per-level GSDs
+Level selection (mutually exclusive). These only choose the per-level resolutions
 used during conversion; the resulting COGP file is projection-agnostic and
 readable by any renderer regardless of which path you pick.
 
-- `--gsd 1000,500,100,50` — explicit ground sample distances in **meters**,
+- `--resolution 1000,500,100,50` — explicit nominal ground resolutions in **meters**,
   strictly decreasing. Use this to tune levels for a specific renderer (any
   projection — not just non-Web-Mercator).
 - `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `16`) — derive
-  GSDs from a Web Mercator tile pyramid:
-  `GSD(z) = 40_075_016 / (webmerc_resolution · 2^z)` m. This is the default
+  resolutions from a Web Mercator tile pyramid:
+  `resolution(z) = 40_075_016 / (webmerc_resolution · 2^z)` m. This is the default
   because Web Mercator is the most common viewer target, not because the
   output is restricted to it. Empty levels (no features assigned) are
   dropped automatically.
 - `--webmerc-resolution` (default `1024`) — units per tile side used in the
-  Web Mercator GSD formula above. `1024` is ~4× the typical 256-pixel tile
+  Web Mercator resolution formula above. `1024` is ~4× the typical 256-pixel tile
   resolution, so features collapsing within a few subpixels are deferred to
-  finer levels. Controls level granularity; ignored when `--gsd` is given.
+  finer levels. Controls level granularity; ignored when `--resolution` is given.
+
+Geometry overviews:
+
+- `--simplification-tolerance-factor` (default `1`) — multiplies the resolution
+  at each selected level to obtain its internal simplification tolerance.
+- Every requested candidate resolution that introduces at least one feature is
+  retained. Empty candidates are omitted; no additional payload-based thinning
+  is applied.
+- Line and Polygon datasets have one simplified geometry column per selected
+  level. Point levels reference the primary WKB because their coordinates
+  cannot be simplified.
+- Retained XY vertices in each overview are snapped to the largest power-of-two
+  grid no coarser than that overview's tolerance. Coordinates remain f64 WKB,
+  but their zeroed low-order bits compress more effectively with ZSTD. Z/M
+  ordinates and every value in the primary geometry column remain unchanged.
+- Each overview is non-null through its linked level boundary and entirely
+  null afterward. The primary WKB column remains lossless for every row.
 
 Other options:
 
 - `--row-group-size` (default `10000`) — max Parquet row group size in rows.
   Row group boundaries always align with level boundaries.
-- `--row-group-max-bytes` — max estimated encoded Parquet row group size in
-  bytes. This must be a numeric byte count, without suffixes. It is enforced
-  using the Parquet writer's in-progress encoded-size estimate, checked at batch
-  granularity, so an individual row group can exceed the target slightly.
+- `--row-group-max-bytes` (default `4194304`, 4 MiB) — max cumulative WKB
+  payload per row group, measured against the largest non-null geometry
+  overview for each row. For Point data, which has no overviews, the primary
+  WKB supplies the budget. The lossless primary WKB is excluded only when
+  rendering overviews exist. This must be a numeric byte count without suffixes.
+  A single indivisible geometry may exceed the target and receives its own row
+  group.
 - `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
   PROJJSON (`ProjectedCRS` → meters, otherwise degrees; absent / null → degrees
   per OGC:CRS84). Override with `degrees` or `meters` explicitly.
@@ -91,25 +115,16 @@ Other options:
   rendering-grade, not geodesic.
 - `--point-thinning-factor` (default `4`) — point-like features (WKB
   `Point` / `MultiPoint`) thin on a grid this many times coarser per axis
-  than the level GSD, yielding approximately `factor²` fewer points than a
-  factor of `1`. Set to `1` for one winner per GSD-sized cell. Grid thinning
-  applies only to points: lines and
-  polygons are assigned as soon as they meet their visibility threshold,
-  because a bbox center cannot represent an extended geometry's footprint.
-- `--line-visibility-factor` (default `2`) — coarsest level at which a
-  LineString is considered independently meaningful: its bbox diagonal must
-  reach `factor · GSD` of that level. Lines are 1D so a diagonal equal to
-  one GSD is only a hairline. This is a hard cutoff: a line shorter than the
-  threshold is excluded from that level and deferred to a finer one, so a
-  coarse-zoom read never fetches sub-resolution lines. Set to `1` for the least
-  restrictive supported threshold.
-- `--polygon-visibility-factor` (default `4`) — coarsest level at which a
-  Polygon is considered independently meaningful: its bbox diagonal must
-  reach `factor · GSD` of that level. A hard cutoff, like
-  `--line-visibility-factor`: a polygon below the threshold is excluded from
-  that level and deferred to a finer one. The default keeps coarse levels from
-  being crowded by tiny polygons. Set to `1` for the least restrictive supported
-  threshold.
+  than the level resolution, yielding approximately `factor²` fewer points than a
+  factor of `1`. Set to `1` for one winner per resolution-sized cell. Grid thinning
+  applies only to points; a bbox center cannot represent an extended
+  geometry's footprint.
+- Line and Polygon levels are derived from simplification itself. A LineString
+  is deferred while its simplified length does not exceed the level tolerance;
+  a Polygon is deferred while simplification cannot retain a valid exterior
+  ring. Extended geometries do not compete in grid cells. Collapsed polygon
+  interior rings are dropped independently; the lossless final level remains
+  the fallback for a geometry that never survives simplification.
 - `--sort-key` — attribute column that decides which feature wins when several
   points contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is
@@ -133,7 +148,8 @@ The output file:
 - writes a canonical `bbox` struct column (`xmin/ymin/xmax/ymax: f64`) and
   points GeoParquet 1.1 `covering.bbox` at it;
 - emits one or more row groups per level, written in coarse-to-fine order;
-- writes `cogp` metadata listing the `row_group_end` and `gsd` of each level.
+- writes self-contained `cogp` levels containing `row_group_end`,
+  `resolution_meters`, and `geometry_column`.
 
 ## Library use — reading COGP files
 
@@ -166,7 +182,7 @@ use geozero::ToJson;
 let reader = Reader::open("data.cogp.parquet")?;
 let primary = reader.primary_column().to_string();
 
-// Pre-filter row groups using bbox stats + a target GSD/zoom — these
+// Pre-filter row groups using bbox stats + a target resolution/zoom — these
 // only read the cached footer, no Parquet IO.
 let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
 let by_level = reader.row_groups_up_to_level(8);
@@ -228,11 +244,11 @@ let reader = Reader::try_new_async(&mut footer_reader).await?;
 let primary = reader.primary_column().to_string();
 
 // Per request: filter row groups (footer-only, no IO), then stream just
-// the bytes for those row groups. Both bbox and GSD/zoom are honored.
+// the bytes for those row groups. Both bbox and resolution/zoom are honored.
 let rgs: Vec<usize> = {
     let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
-    let by_gsd = reader.row_groups_up_to_gsd(500.0);
-    by_bbox.into_iter().filter(|i| by_gsd.contains(i)).collect()
+    let by_resolution = reader.row_groups_up_to_resolution(500.0);
+    by_bbox.into_iter().filter(|i| by_resolution.contains(i)).collect()
 };
 let per_request_reader = RangeCoalescingReader::try_new(
     ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(head.size),
@@ -274,9 +290,12 @@ Selectors (`&self`, no IO — they only consult the cached footer):
 
 - `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
   `num_row_groups()`, `parquet_metadata()`.
+- `geometry_column_for_resolution(resolution)` — the geometry column declared
+  by the level selected for the target ground resolution.
 - `row_groups_in_level(i)` — one level.
 - `row_groups_up_to_level(i)` — every level up to and including `i`.
-- `row_groups_up_to_gsd(min_gsd)` — every level whose GSD is `>= min_gsd`.
+- `row_groups_up_to_resolution(target)` — every level whose
+  `resolution_meters` is `>= target`.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
   covering-bbox envelope intersects the query, via Parquet column statistics.
 
@@ -298,7 +317,9 @@ Checks SPEC §5:
 - each covering bbox column has Parquet row group min/max statistics;
 - `cogp` metadata is present with a non-empty `levels` array;
 - `row_group_end` values are strictly increasing and end at `num_row_groups - 1`;
-- `gsd` values are positive and strictly decreasing.
+- `resolution_meters` values are positive and strictly decreasing;
+- every `geometry_column` is a declared physical WKB column complete through
+  its referenced row-group prefix.
 
 Exits non-zero on failure.
 

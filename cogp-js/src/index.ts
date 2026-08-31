@@ -3,8 +3,14 @@ export type {
   BboxInput,
   OpenOptions,
   ReadOptions,
+  ReadRowOptions,
 } from './reader.js';
 export type { RangeCoalescingOptions } from './coalescing-buffer.js';
+export {
+  DEFAULT_RANGE_CACHE_MAX_BYTES,
+  lruCachingAsyncBuffer,
+} from './range-cache.js';
+export type { RangeCacheOptions } from './range-cache.js';
 
 export {
   COGP_METADATA_KEY,
@@ -24,6 +30,6 @@ export type {
   Level,
 } from './meta.js';
 
-export { selectLevelByGsd } from './level.js';
+export { selectLevelByResolution } from './level.js';
 
 export type { Bbox } from './bbox.js';

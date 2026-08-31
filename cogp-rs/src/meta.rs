@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 pub const COGP_METADATA_KEY: &str = "cogp";
 pub const GEO_METADATA_KEY: &str = "geo";
-pub const COGP_VERSION: &str = "0.1.0";
+pub const COGP_VERSION: &str = "0.2.0";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +15,8 @@ pub struct CogpMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
-    pub gsd: f64,
+    pub resolution_meters: f64,
+    pub geometry_column: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,33 @@ pub struct GeoColumn {
     pub crs: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryFamily {
+    Point,
+    Line,
+    Polygon,
+}
+
+/// COGP keeps one topological geometry family per file. Singular and Multi
+/// variants belong to the same family; dimensional suffixes such as `Z` and
+/// `ZM` do not change it.
+pub fn geometry_family(geometry_types: &[String]) -> Option<GeometryFamily> {
+    fn one(geometry_type: &str) -> Option<GeometryFamily> {
+        match geometry_type.split_ascii_whitespace().next()? {
+            "Point" | "MultiPoint" => Some(GeometryFamily::Point),
+            "LineString" | "MultiLineString" => Some(GeometryFamily::Line),
+            "Polygon" | "MultiPolygon" => Some(GeometryFamily::Polygon),
+            _ => None,
+        }
+    }
+
+    let family = one(geometry_types.first()?)?;
+    geometry_types
+        .iter()
+        .all(|geometry_type| one(geometry_type) == Some(family))
+        .then_some(family)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Covering {
     pub bbox: BboxCovering,
@@ -56,12 +84,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn geometry_family_accepts_singular_and_multi_but_rejects_mixed_dimensions() {
+        assert_eq!(
+            geometry_family(&["LineString".into(), "MultiLineString Z".into()]),
+            Some(GeometryFamily::Line)
+        );
+        assert_eq!(
+            geometry_family(&["LineString".into(), "Polygon".into()]),
+            None
+        );
+        assert_eq!(geometry_family(&[]), None);
+    }
+
+    #[test]
     fn cogp_meta_roundtrip() {
         let m = CogpMeta {
             version: COGP_VERSION.to_string(),
             levels: vec![
-                Level { row_group_end: 0, gsd: 1000.0 },
-                Level { row_group_end: 3, gsd: 250.0 },
+                Level {
+                    row_group_end: 0,
+                    resolution_meters: 1000.0,
+                    geometry_column: "geometry_ovr_0".into(),
+                },
+                Level {
+                    row_group_end: 3,
+                    resolution_meters: 250.0,
+                    geometry_column: "geometry_ovr_1".into(),
+                },
             ],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -69,7 +118,8 @@ mod tests {
         assert_eq!(parsed.version, COGP_VERSION);
         assert_eq!(parsed.levels.len(), 2);
         assert_eq!(parsed.levels[0].row_group_end, 0);
-        assert_eq!(parsed.levels[1].gsd, 250.0);
+        assert_eq!(parsed.levels[1].resolution_meters, 250.0);
+        assert_eq!(parsed.levels[0].geometry_column, "geometry_ovr_0");
     }
 
     #[test]

@@ -5,7 +5,8 @@ export interface MetadataSummary {
   num_row_groups: number;
   levels: Array<{
     i: number;
-    gsd: number;
+    resolution_meters: number;
+    geometry_column: string;
     row_group_end: number;
   }>;
   crs: unknown;
@@ -28,9 +29,14 @@ export interface ViewportResult {
   status: string;
 }
 
+export interface FeaturePropertiesResult {
+  properties: Record<string, unknown>;
+}
+
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetGsd: number };
+  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetResolutionMeters: number }
+  | { type: 'readProperties'; url: string; rowIndex: number };
 
 export interface WorkerEnvelope {
   id: number;
@@ -38,5 +44,5 @@ export interface WorkerEnvelope {
 }
 
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | ViewportResult }
+  | { id: number; ok: true; result: OpenResult | ViewportResult | FeaturePropertiesResult }
   | { id: number; ok: false; error: string };

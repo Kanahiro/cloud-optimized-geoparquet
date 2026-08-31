@@ -6,7 +6,7 @@ A GeoParquet profile for progressive map rendering and partial access over HTTP 
 
 A COGP file is a valid [GeoParquet 1.1](https://geoparquet.org/) file whose row groups are physically ordered from coarse to fine rendering detail, with file-level metadata describing where each level ends.
 
-COGP is **feature-level**: it reorders features across row groups; it does not simplify, aggregate, or duplicate them. Each source feature appears in exactly one row group, with its geometry preserved verbatim.
+COGP is **feature-level**: it places each source feature in exactly one row group and keeps the primary geometry lossless. Optional scale-specific WKB columns simplify that same row for rendering and become NULL after their linked level boundary.
 
 A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
 
@@ -18,7 +18,7 @@ COGP is informed by several existing cloud-optimized and progressive rendering p
 - Cloud Optimized Point Cloud: remaining a valid LAZ file while adding thinning and multi-resolution level concepts;
 - tippecanoe: design choice to avoid rendering every feature literally at low zoom levels.
 
-COGP applies these ideas at the GeoParquet row group level. Unlike raster overviews or vector tile simplification pipelines, COGP keeps each feature geometry unchanged and places each source feature in exactly one level.
+COGP applies these ideas at the GeoParquet row group and column-chunk levels. Feature rows are never duplicated; rendering overviews reduce vertex detail while the primary geometry remains unchanged.
 
 ## Why
 
@@ -56,7 +56,7 @@ https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
 COGP is particularly well suited to datasets of many small, well-distributed features — such as POIs or building footprints — where dropping later row groups still yields a meaningful overview.
 
-Because COGP does not simplify geometries, datasets dominated by large, complex geometries (coastlines, rivers, road networks, administrative boundaries) have relatively larger per-feature payloads, so the Row Group size should be tuned to optimize progressive streaming. Other COGP benefits — GeoParquet 1.1 compatibility, fast overview rendering, and efficient AoI-based queries — still apply.
+Datasets dominated by large, complex geometries (coastlines, rivers, road networks, administrative boundaries) benefit from optional scale-specific geometry overviews. Each overview declares its spatial tolerance independently from the feature-level boundary it covers; the final overview covers the complete feature ladder so rendering can avoid raw WKB, while the lossless primary geometry remains available for analysis.
 
 ## Specification
 
@@ -101,7 +101,7 @@ A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://git
 
 ## Status and feedback
 
-COGP v0.1 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
+COGP v0.2 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
 
 ## License
 

@@ -34,7 +34,9 @@ const DEFAULT_MAX_OVERFETCH_RATIO = 1.25;
  * group. Waiting until the current microtask finishes exposes that batch
  * without adding a timer delay. Nearby slices are fetched as one ordinary HTTP
  * Range and split back into exact per-caller buffers. The gap limit makes the
- * request-count/extra-byte tradeoff explicit and bounded.
+ * request-count/extra-byte tradeoff explicit and bounded. Completed ranges are
+ * not retained here. A correctly configured HTTP cache may reuse compatible
+ * responses, but differently shaped partial ranges are not assumed reusable.
  */
 export function coalescingAsyncBuffer(
   source: AsyncBufferLike,
@@ -131,7 +133,10 @@ function makeRuns(
   return runs;
 }
 
-async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {
+async function fetchRun(
+  source: AsyncBufferLike,
+  run: SliceRun,
+): Promise<void> {
   try {
     const buffer = await source.slice(run.start, run.end);
     const expected = run.end - run.start;

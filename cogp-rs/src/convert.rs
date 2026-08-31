@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Float64Array, GenericBinaryArray, LargeBinaryArray,
-    LargeStringArray, OffsetSizeTrait, RecordBatch, StringArray, StructArray,
+    new_null_array, Array, ArrayRef, BinaryArray, BinaryBuilder, Float64Array, GenericBinaryArray,
+    LargeBinaryArray, LargeBinaryBuilder, LargeStringArray, OffsetSizeTrait, RecordBatch,
+    StringArray, StructArray,
 };
 use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -10,8 +11,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
-use parquet::basic::Compression;
-use parquet::basic::ZstdLevel;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
@@ -25,10 +25,11 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::meta::{
-    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, COGP_METADATA_KEY, COGP_VERSION,
-    GEOPARQUET_VERSION, GEO_METADATA_KEY,
+    geometry_family, BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GeometryFamily, Level,
+    COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY,
 };
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
+use crate::wkb_simplify::{first_viable_level, simplify_wkb};
 
 #[derive(Args)]
 pub struct ConvertArgs {
@@ -36,29 +37,36 @@ pub struct ConvertArgs {
     pub input: PathBuf,
     /// Output COGP file
     pub output: PathBuf,
-    /// Comma-separated GSD list, meters, coarse to fine (e.g. 1000,500,100,50).
-    /// Projection-agnostic: each value is the ground sample distance in meters
-    /// at which a level becomes meaningful. If omitted, GSDs are auto-derived
+    /// Comma-separated ground-resolution list, meters, coarse to fine
+    /// (e.g. 1000,500,100,50). Each value is the nominal ground resolution at
+    /// which a level's feature prefix and geometry are intended for rendering.
+    /// If omitted, resolutions are auto-derived
     /// from --webmerc-minzoom..=--webmerc-maxzoom assuming a Web Mercator tile
     /// pyramid (see --webmerc-minzoom/--webmerc-maxzoom/--webmerc-resolution).
-    /// Pass --gsd directly if you target a non-Web-Mercator renderer.
+    /// Pass --resolution directly if you target a non-Web-Mercator renderer.
     #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["webmerc_minzoom", "webmerc_maxzoom"])]
-    pub gsd: Vec<f64>,
-    /// Coarsest Web Mercator zoom level for GSD auto-derivation. Used only
-    /// when --gsd is omitted. Assumes the consumer renders on a Web Mercator
-    /// (EPSG:3857) tile pyramid; for other projections, supply --gsd.
+    pub resolution: Vec<f64>,
+    /// Coarsest Web Mercator zoom level for resolution auto-derivation. Used
+    /// only when --resolution is omitted. Assumes the consumer renders on a
+    /// Web Mercator (EPSG:3857) tile pyramid; otherwise supply --resolution.
     #[arg(long, default_value_t = 0)]
     pub webmerc_minzoom: u32,
-    /// Finest Web Mercator zoom level for GSD auto-derivation. Used only
-    /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
+    /// Finest Web Mercator zoom level for resolution auto-derivation. Used only
+    /// when --resolution is omitted. Same Web Mercator assumption as
+    /// --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
     /// Parquet row group size in rows.
     #[arg(long, default_value_t = 10000)]
     pub row_group_size: usize,
-    /// Maximum estimated encoded Parquet row group size in bytes
-    #[arg(long)]
+    /// Maximum cumulative WKB bytes in a row group's largest usable geometry
+    /// overview.
+    #[arg(long, default_value = "4194304")]
     pub row_group_max_bytes: Option<usize>,
+    /// Simplification tolerance as a multiple of each level's resolution.
+    /// Every geometry in one overview column uses the same spatial tolerance.
+    #[arg(long, default_value_t = 1.0)]
+    pub simplification_tolerance_factor: f64,
     /// Coordinate units in the input file. `auto` (default) inspects the GeoParquet
     /// `crs` PROJJSON: `ProjectedCRS` → meters, otherwise degrees. Override with
     /// `degrees` or `meters` if needed.
@@ -69,41 +77,24 @@ pub struct ConvertArgs {
     pub geometry_column: Option<String>,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
     /// derive level visibility thresholds and the point-thinning grid when
-    /// auto-deriving GSDs from
-    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i GSD is the ground
+    /// auto-deriving resolutions from
+    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i resolution is the ground
     /// distance covered by one base unit at zoom i, computed as
     /// `40_075_016 / (base · 2^i)` meters at the equator — i.e. it bakes in
     /// the Web Mercator equatorial circumference and the standard `2^z` tile
     /// pyramid. This controls level granularity, not output coordinate
     /// precision. The default of 1024 is ~4× the typical 256-pixel tile
     /// resolution, so features collapsing within a few subpixels are deferred
-    /// to finer levels. Ignored when --gsd is given (in that case the GSDs are
-    /// taken verbatim and no projection is assumed).
+    /// to finer levels. Ignored when --resolution is given (in that case the
+    /// resolutions are taken verbatim and no projection is assumed).
     #[arg(long, default_value_t = 1024)]
     pub webmerc_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times coarser than `prec` per axis, yielding ~factor² fewer points
     /// per level than a factor of 1. Set to `1` for the finest supported
-    /// thinning grid (one winner per GSD-sized cell).
+    /// thinning grid (one winner per resolution-sized cell).
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
-    /// Line visibility threshold multiplier applied to `prec` when deciding
-    /// the coarsest level at which a LineString first becomes independently
-    /// meaningful. A line is eligible from level `i` once its bbox diagonal
-    /// reaches `factor · prec[i]`. Lines are 1D so a diagonal equal to `prec`
-    /// is only a hairline; the default of `2` defers such short lines to a
-    /// finer level. Set to `1` for the least restrictive supported threshold.
-    #[arg(long, default_value_t = 2)]
-    pub line_visibility_factor: u32,
-    /// Polygon visibility threshold multiplier applied to `prec` when deciding
-    /// the coarsest level at which a Polygon first becomes independently
-    /// meaningful. A polygon is eligible from level `i` once its bbox diagonal
-    /// reaches `factor · prec[i]`. Default of `4` defers polygons whose
-    /// diagonal is under ~4 grid cells to a finer level, so coarse levels aren't
-    /// crowded by tiny polygons. Set to `1` for the least restrictive supported
-    /// threshold.
-    #[arg(long, default_value_t = 4)]
-    pub polygon_visibility_factor: u32,
     /// Attribute column deciding which feature wins when several contend for the
     /// same point-thinning cell. When set it is the primary criterion: the
     /// higher-ranked feature survives to coarser levels, so the more important
@@ -137,11 +128,6 @@ pub enum InputUnits {
     Meters,
 }
 
-/// Upper bound on slice size between byte-limit checks. A fixed cap alone
-/// can't enforce `max_bytes` when per-row payload is large — see the probe
-/// logic in `write_batch_with_row_group_limits`.
-const ROW_GROUP_BYTE_CHECK_MAX_ROWS: usize = 1024;
-
 fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
     let count = writer.flushed_row_groups().len();
     if count == 0 {
@@ -150,47 +136,147 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64
     Ok((count as i64) - 1)
 }
 
-fn write_batch_with_row_group_limits<W: Write + Send>(
-    writer: &mut ArrowWriter<W>,
-    batch: &RecordBatch,
+/// Owns the row-group boundary policy. Parquet's writer still enforces the
+/// hard row count, while this limiter tracks the bytes that rendering readers
+/// can actually project. In particular, lossless primary WKB does not make
+/// overview-backed row groups artificially tiny.
+struct RowGroupLimiter {
     max_rows: usize,
-    max_bytes: Option<usize>,
-) -> Result<()> {
-    let Some(max_bytes) = max_bytes else {
-        writer.write(batch)?;
-        return Ok(());
-    };
+    max_wkb_bytes: Option<usize>,
+    in_progress_wkb_bytes: usize,
+}
 
-    let mut offset = 0;
-    while offset < batch.num_rows() {
-        let buffered_rows = writer.in_progress_rows();
-        let buffered_bytes = writer.in_progress_size();
-        let rows_until_row_limit = max_rows.saturating_sub(buffered_rows).max(1);
-
-        // Predict how many more rows fit in the remaining byte budget by
-        // extrapolating buffered bytes/row. Without a sample (fresh row group)
-        // probe a single row first, so a dataset where one row already exceeds
-        // `max_bytes` (e.g. dense MultiPolygons) cannot inflate the row group
-        // by ~1024× before the next size check.
-        let rows_until_byte_limit = if buffered_rows == 0 || buffered_bytes >= max_bytes {
-            1
-        } else {
-            let bytes_per_row = buffered_bytes.div_ceil(buffered_rows).max(1);
-            ((max_bytes - buffered_bytes) / bytes_per_row).max(1)
-        };
-
-        let rows = (batch.num_rows() - offset)
-            .min(rows_until_row_limit)
-            .min(rows_until_byte_limit)
-            .min(ROW_GROUP_BYTE_CHECK_MAX_ROWS);
-        writer.write(&batch.slice(offset, rows))?;
-        offset += rows;
-
-        if writer.in_progress_rows() > 0 && writer.in_progress_size() >= max_bytes {
-            writer.flush()?;
+impl RowGroupLimiter {
+    fn new(max_rows: usize, max_wkb_bytes: Option<usize>) -> Self {
+        Self {
+            max_rows,
+            max_wkb_bytes,
+            in_progress_wkb_bytes: 0,
         }
     }
-    Ok(())
+
+    fn write<W: Write + Send>(
+        &mut self,
+        writer: &mut ArrowWriter<W>,
+        batch: &RecordBatch,
+        render_geometry_columns: &[usize],
+    ) -> Result<()> {
+        let row_wkb_bytes = render_wkb_bytes_per_row(batch, render_geometry_columns)?;
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            if writer.in_progress_rows() == 0 {
+                self.in_progress_wkb_bytes = 0;
+            }
+            if writer.in_progress_rows() >= self.max_rows
+                || (writer.in_progress_rows() > 0
+                    && self
+                        .max_wkb_bytes
+                        .is_some_and(|max| self.in_progress_wkb_bytes >= max))
+            {
+                self.flush(writer)?;
+                continue;
+            }
+
+            let row_capacity = self.max_rows - writer.in_progress_rows();
+            let available = batch.num_rows() - offset;
+            let rows = match self.max_wkb_bytes {
+                None => available.min(row_capacity),
+                Some(max_bytes) => rows_within_wkb_budget(
+                    &row_wkb_bytes[offset..],
+                    available.min(row_capacity),
+                    max_bytes.saturating_sub(self.in_progress_wkb_bytes),
+                    writer.in_progress_rows() == 0,
+                ),
+            };
+            if rows == 0 {
+                self.flush(writer)?;
+                continue;
+            }
+
+            let added_wkb_bytes = row_wkb_bytes[offset..offset + rows]
+                .iter()
+                .fold(0usize, |total, bytes| total.saturating_add(*bytes));
+            writer.write(&batch.slice(offset, rows))?;
+            offset += rows;
+
+            // ArrowWriter auto-flushes on its row limit. Keep our accounting
+            // synchronized with that implicit boundary.
+            if writer.in_progress_rows() == 0 {
+                self.in_progress_wkb_bytes = 0;
+            } else {
+                self.in_progress_wkb_bytes =
+                    self.in_progress_wkb_bytes.saturating_add(added_wkb_bytes);
+                if self
+                    .max_wkb_bytes
+                    .is_some_and(|max| self.in_progress_wkb_bytes >= max)
+                {
+                    self.flush(writer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush<W: Write + Send>(&mut self, writer: &mut ArrowWriter<W>) -> Result<()> {
+        writer.flush()?;
+        self.in_progress_wkb_bytes = 0;
+        Ok(())
+    }
+}
+
+/// For every row, use the largest non-null overview payload. A row group may
+/// be read at several display scales, so budgeting only the coarsest overview
+/// would leave finer overview fetches unbounded.
+fn render_wkb_bytes_per_row(
+    batch: &RecordBatch,
+    render_geometry_columns: &[usize],
+) -> Result<Vec<usize>> {
+    let mut sizes = vec![0; batch.num_rows()];
+    for &column_index in render_geometry_columns {
+        let column = batch.column(column_index);
+        if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
+            for (row, size) in sizes.iter_mut().enumerate() {
+                if !values.is_null(row) {
+                    *size = (*size).max(values.value(row).len());
+                }
+            }
+        } else if let Some(values) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+            for (row, size) in sizes.iter_mut().enumerate() {
+                if !values.is_null(row) {
+                    *size = (*size).max(values.value(row).len());
+                }
+            }
+        } else {
+            bail!(
+                "render geometry column `{}` is not WKB Binary/LargeBinary",
+                batch.schema().field(column_index).name()
+            );
+        }
+    }
+    Ok(sizes)
+}
+
+fn rows_within_wkb_budget(
+    row_wkb_bytes: &[usize],
+    max_rows: usize,
+    remaining_bytes: usize,
+    empty_row_group: bool,
+) -> usize {
+    let mut rows = 0;
+    let mut bytes = 0usize;
+    for &row_bytes in row_wkb_bytes.iter().take(max_rows) {
+        if bytes.saturating_add(row_bytes) > remaining_bytes {
+            // A single geometry is indivisible. Give it a one-row group so it
+            // cannot force unrelated rows over the target as well.
+            if rows == 0 && empty_row_group {
+                return 1;
+            }
+            break;
+        }
+        bytes = bytes.saturating_add(row_bytes);
+        rows += 1;
+    }
+    rows
 }
 
 /// Inspect the GeoParquet column `crs` PROJJSON value to guess coordinate units.
@@ -230,24 +316,24 @@ const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 /// Ground distance per base unit at the equator at zoom 0, for a tile sliced
 /// into `webmerc_resolution` units per side. The default of 1024 yields
 /// ~39136 m per unit at zoom 0 — the coarsest level's base visibility unit.
-fn base_unit_gsd_z0(webmerc_resolution: u32) -> f64 {
+fn base_unit_resolution_z0(webmerc_resolution: u32) -> f64 {
     WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
 }
 
-fn web_mercator_gsds(
+fn web_mercator_resolutions(
     webmerc_minzoom: u32,
     webmerc_maxzoom: u32,
     webmerc_resolution: u32,
 ) -> Vec<f64> {
-    let z0 = base_unit_gsd_z0(webmerc_resolution);
+    let z0 = base_unit_resolution_z0(webmerc_resolution);
     (webmerc_minzoom..=webmerc_maxzoom)
         .map(|z| z0 / (1u64 << z) as f64)
         .collect()
 }
 
 pub fn run(args: ConvertArgs) -> Result<()> {
-    let gsds: Vec<f64> = if !args.gsd.is_empty() {
-        args.gsd.clone()
+    let resolutions: Vec<f64> = if !args.resolution.is_empty() {
+        args.resolution.clone()
     } else {
         if args.webmerc_minzoom > args.webmerc_maxzoom {
             bail!(
@@ -268,7 +354,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 args.webmerc_resolution
             );
         }
-        let derived = web_mercator_gsds(
+        let derived = web_mercator_resolutions(
             args.webmerc_minzoom,
             args.webmerc_maxzoom,
             args.webmerc_resolution,
@@ -284,14 +370,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     };
     // `partial_cmp` rather than `<=` / `<` so NaN values also fail the check
     // (NaN compares as `None`, which is not `Some(Greater)`).
-    for w in gsds.windows(2) {
+    for w in resolutions.windows(2) {
         if w[0].partial_cmp(&w[1]) != Some(std::cmp::Ordering::Greater) {
-            bail!("GSD values must be strictly decreasing, got {:?}", gsds);
+            bail!(
+                "resolution values must be strictly decreasing, got {:?}",
+                resolutions
+            );
         }
     }
-    for g in &gsds {
-        if g.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            bail!("GSD values must be positive, got {:?}", gsds);
+    for resolution in &resolutions {
+        if resolution.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            bail!("resolution values must be positive, got {:?}", resolutions);
         }
     }
     if args.point_thinning_factor == 0 {
@@ -300,20 +389,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             args.point_thinning_factor
         );
     }
-    if args.line_visibility_factor == 0 {
-        bail!(
-            "--line-visibility-factor must be >= 1 (got {})",
-            args.line_visibility_factor
-        );
-    }
-    if args.polygon_visibility_factor == 0 {
-        bail!(
-            "--polygon-visibility-factor must be >= 1 (got {})",
-            args.polygon_visibility_factor
-        );
-    }
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
+    }
+    if args.row_group_max_bytes == Some(0) {
+        bail!("--row-group-max-bytes must be >= 1");
+    }
+    if args.simplification_tolerance_factor.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        bail!(
+            "--simplification-tolerance-factor must be positive (got {})",
+            args.simplification_tolerance_factor
+        );
     }
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
@@ -349,6 +435,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .index_of(&geom_col_name)
         .with_context(|| format!("geometry column `{geom_col_name}` not found"))?;
     eprintln!("      geometry column: {geom_col_name}");
+    let declared_geometry_family = input_geo
+        .as_ref()
+        .and_then(|geo| geo.columns.get(&geom_col_name))
+        .and_then(|column| geometry_family(&column.geometry_types))
+        .ok_or_else(|| {
+            anyhow!(
+                "geometry column `{geom_col_name}` must declare exactly one Point, Line, or Polygon family"
+            )
+        })?;
 
     let input_units = match args.input_units {
         InputUnits::Auto => {
@@ -365,6 +460,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         }
         explicit => explicit,
     };
+    let simplification_tolerances: Vec<f64> = resolutions
+        .iter()
+        .map(|resolution| {
+            resolution_in_input_units(
+                *resolution * args.simplification_tolerance_factor,
+                input_units,
+            )
+        })
+        .collect();
 
     let n_rows = arrow_meta.metadata().file_metadata().num_rows() as usize;
     if n_rows == 0 {
@@ -395,6 +499,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let ScanResult {
         bboxes,
         kinds,
+        minimum_viable_levels,
         sort_key,
     } = scan_input(
         &args.input,
@@ -402,7 +507,20 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         geom_col_idx,
         covering.as_ref(),
         sort_key_idx,
+        &simplification_tolerances,
     )?;
+    let scanned_geometry_family = match kinds[0] {
+        GeomKind::Point => GeometryFamily::Point,
+        GeomKind::Line => GeometryFamily::Line,
+        GeomKind::Polygon => GeometryFamily::Polygon,
+    };
+    if kinds.iter().any(|kind| *kind != kinds[0])
+        || scanned_geometry_family != declared_geometry_family
+    {
+        bail!(
+            "COGP requires one geometry family per file, and actual WKB must match `geometry_types`"
+        );
+    }
     let existing_bbox_col: Option<String> = covering.map(|p| p.col_name);
 
     let sort_ranks = match &sort_key {
@@ -421,42 +539,33 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    eprintln!("[3/4] Assigning features to {} level(s)", gsds.len());
+    eprintln!("[3/4] Assigning features to {} level(s)", resolutions.len());
     let assignment = assign_levels(
-        &bboxes,
-        &kinds,
-        &gsds,
+        FeatureMeasures {
+            bboxes: &bboxes,
+            kinds: &kinds,
+            minimum_viable_levels: &minimum_viable_levels,
+            sort_ranks: &sort_ranks,
+        },
+        &resolutions,
         input_units,
         args.point_thinning_factor,
-        VisibilityFactors {
-            line: args.line_visibility_factor,
-            polygon: args.polygon_visibility_factor,
-        },
-        &sort_ranks,
     )?;
-    let mut per_level_full: Vec<Vec<u32>> = vec![Vec::new(); gsds.len()];
-    for (idx, level_i) in assignment.iter().enumerate() {
-        per_level_full[*level_i as usize].push(idx as u32);
-    }
-    // SPEC §5.3 requires each level entry to have a real row group end, so a
-    // level with zero features cannot be represented. Drop those and keep the
-    // GSDs that survive.
-    let dropped = per_level_full.iter().filter(|r| r.is_empty()).count();
-    let (mut per_level, gsds): (Vec<Vec<u32>>, Vec<f64>) = per_level_full
-        .into_iter()
-        .zip(gsds.iter().copied())
-        .filter(|(rows, _)| !rows.is_empty())
-        .unzip();
-    if per_level.is_empty() {
-        bail!("no levels received any features; check input data and GSD selection");
-    }
-    if dropped > 0 {
-        eprintln!("      note: dropped {dropped} empty level(s)");
-    }
+    let occupied_candidates = occupied_level_candidates(&assignment, resolutions.len())?;
+    let mut per_level = remap_levels(&assignment, &occupied_candidates)?;
+    let resolutions: Vec<f64> = occupied_candidates
+        .iter()
+        .map(|candidate| resolutions[*candidate])
+        .collect();
+    eprintln!(
+        "      retained {} of {} candidate level(s) after removing empty levels",
+        occupied_candidates.len(),
+        resolutions.len()
+    );
     for (i, rows) in per_level.iter().enumerate() {
         eprintln!(
-            "      level {i} (gsd={:>10.2} m): {:>9} features",
-            gsds[i],
+            "      level {i} (resolution={:>10.2} m): {:>9} features",
+            resolutions[i],
             rows.len()
         );
     }
@@ -464,6 +573,18 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
         str_pack(rows, &bboxes, args.row_group_size, level_idx);
     }
+
+    // Point coordinates cannot be simplified, so overview columns would only
+    // duplicate the primary WKB. Their feature hierarchy still comes from
+    // point thinning, and row-group byte budgeting falls back to primary WKB.
+    let overview_columns: Vec<String> = match scanned_geometry_family {
+        GeometryFamily::Point => Vec::new(),
+        GeometryFamily::Line | GeometryFamily::Polygon => occupied_candidates
+            .iter()
+            .enumerate()
+            .map(|(level, _)| overview_column_name(&geom_col_name, level))
+            .collect(),
+    };
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
     // Replace any pre-existing `bbox` column (and the bbox covering column we
@@ -474,7 +595,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
     let mut keep_col_indices: Vec<usize> = Vec::new();
     for (i, f) in input_schema.fields().iter().enumerate() {
-        if drop_names.contains(&f.name().as_str()) {
+        if drop_names.contains(&f.name().as_str())
+            || overview_columns.iter().any(|column| column == f.name())
+        {
             eprintln!(
                 "      note: dropping input column `{}` (will be overwritten)",
                 f.name()
@@ -483,6 +606,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         }
         output_fields.push(f.clone());
         keep_col_indices.push(i);
+    }
+    let overview_type = input_schema.field(geom_col_idx).data_type().clone();
+    for column in &overview_columns {
+        // An overview is NULL for features introduced after its associated
+        // level, so these physical columns must be optional.
+        output_fields.push(Arc::new(Field::new(column, overview_type.clone(), true)));
     }
     output_fields.push(Arc::new(bbox_struct_field()));
     let output_schema = Arc::new(Schema::new(output_fields));
@@ -498,14 +627,26 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             a
         });
 
+    // Keep compression policy internal rather than exposing another conversion
+    // parameter. Brotli 6 made the benchmark file smaller overall, but did not
+    // reduce the bytes fetched for a representative overview range and took
+    // about twice as long to decode. ZSTD 9 is the better default for COGP's
+    // latency-sensitive range-read workload.
+    let compression =
+        Compression::ZSTD(ZstdLevel::try_new(9).expect("ZSTD level 9 is supported by parquet"));
+
     // Disable dictionary encoding for the geometry column (WKB is high-cardinality, dict
     // is pure overhead) and for the bbox struct's float fields (each value is unique).
     let mut props_builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_compression(compression)
         .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
+    for column in &overview_columns {
+        props_builder =
+            props_builder.set_column_dictionary_enabled(ColumnPath::from(column.as_str()), false);
+    }
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
         props_builder = props_builder.set_column_dictionary_enabled(path, false);
@@ -528,9 +669,24 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_bboxes = Arc::new(bboxes);
     let producer_meta = arrow_meta.clone();
     let producer_input = args.input.clone();
+    let producer_geom_col = keep_col_indices
+        .iter()
+        .position(|index| *index == geom_col_idx)
+        .ok_or_else(|| anyhow!("internal: primary geometry column was dropped"))?;
     let producer_keep = keep_col_indices;
     let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
+    let overview_plan: Vec<(usize, f64)> = overview_columns
+        .iter()
+        .enumerate()
+        .map(|(level, _)| {
+            let tolerance_meters = resolutions[level] * args.simplification_tolerance_factor;
+            (
+                level,
+                resolution_in_input_units(tolerance_meters, input_units),
+            )
+        })
+        .collect();
     let producer = thread::spawn(move || -> Result<()> {
         let chunks: Vec<(usize, &[u32])> = producer_per_level
             .iter()
@@ -544,13 +700,19 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             let gathered = wave
                 .par_iter()
                 .map(|(level_i, chunk)| {
+                    let layout = GatherLayout {
+                        output_schema: &producer_schema,
+                        geometry_col: producer_geom_col,
+                        feature_level: *level_i,
+                        overview_plan: &overview_plan,
+                    };
                     let batches = gather_chunk(
                         &producer_input,
                         &producer_meta,
                         &producer_keep,
                         chunk,
                         &producer_bboxes,
-                        &producer_schema,
+                        &layout,
                     )?;
                     Ok((*level_i, batches))
                 })
@@ -567,31 +729,36 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     });
 
     let mut last_level: Option<usize> = None;
-    let mut levels_meta: Vec<Level> = Vec::with_capacity(gsds.len());
-    let row_group_max_bytes = args.row_group_max_bytes;
+    let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
+    let render_geometry_columns: Vec<usize> = if overview_columns.is_empty() {
+        vec![producer_geom_col]
+    } else {
+        overview_columns
+            .iter()
+            .map(|column| output_schema.index_of(column))
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let mut row_group_limiter = RowGroupLimiter::new(args.row_group_size, args.row_group_max_bytes);
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
-                writer.flush()?;
+                row_group_limiter.flush(&mut writer)?;
                 levels_meta.push(Level {
                     row_group_end: flushed_row_group_end(&writer)?,
-                    gsd: gsds[prev],
+                    resolution_meters: resolutions[prev],
+                    geometry_column: overview_columns.get(prev).unwrap_or(&geom_col_name).clone(),
                 });
             }
         }
-        write_batch_with_row_group_limits(
-            &mut writer,
-            &batch,
-            args.row_group_size,
-            row_group_max_bytes,
-        )?;
+        row_group_limiter.write(&mut writer, &batch, &render_geometry_columns)?;
         last_level = Some(level_i);
     }
     if let Some(prev) = last_level {
-        writer.flush()?;
+        row_group_limiter.flush(&mut writer)?;
         levels_meta.push(Level {
             row_group_end: flushed_row_group_end(&writer)?,
-            gsd: gsds[prev],
+            resolution_meters: resolutions[prev],
+            geometry_column: overview_columns.get(prev).unwrap_or(&geom_col_name).clone(),
         });
     }
     producer
@@ -626,6 +793,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             ]),
             crs: None,
         });
+    let primary_geo = columns
+        .get(&geom_col_name)
+        .expect("primary geometry metadata was inserted")
+        .clone();
+    for column in &overview_columns {
+        let mut column_meta = primary_geo.clone();
+        // Spatial pruning remains based on the lossless primary geometry.
+        // Simplification can contract an overview's bbox.
+        column_meta.covering = None;
+        columns.insert(column.clone(), column_meta);
+    }
     let geo_meta = GeoMeta {
         version: GEOPARQUET_VERSION.to_string(),
         primary_column: geom_col_name.clone(),
@@ -805,21 +983,32 @@ impl<'a> CoverCols<'a> {
 struct ScanResult {
     bboxes: Vec<Bbox>,
     kinds: Vec<GeomKind>,
+    /// First level whose simplification result remains independently
+    /// renderable. Points are viable throughout the ladder.
+    minimum_viable_levels: Vec<u16>,
     /// The fully materialized `--sort-key` column, when one was requested —
     /// the only column the convert still holds in memory in its entirety.
     sort_key: Option<ArrayRef>,
 }
 
+struct ScannedGeometry {
+    bbox: Bbox,
+    kind: GeomKind,
+    minimum_viable_level: u16,
+}
+
 /// Pass 1: stream the file reading only the geometry column (plus, when
 /// present, the covering bbox column and the `--sort-key` column) and reduce
-/// each row to its bbox + geometry kind. Batches are dropped as soon as they
-/// are consumed, so peak memory is one batch plus the per-row outputs.
+/// each row to its bbox, geometry kind, and candidate simplification profile.
+/// Batches are dropped as soon as they are consumed, so geometry memory is one
+/// batch plus fixed-width per-row outputs.
 fn scan_input(
     input: &Path,
     meta: &ArrowReaderMetadata,
     geom_col_idx: usize,
     covering: Option<&CoveringPlan>,
     sort_key_idx: Option<usize>,
+    simplification_tolerances: &[f64],
 ) -> Result<ScanResult> {
     let mut roots: Vec<usize> = vec![geom_col_idx];
     if let Some(p) = covering {
@@ -851,6 +1040,7 @@ fn scan_input(
     let n_rows = meta.metadata().file_metadata().num_rows() as usize;
     let mut bboxes: Vec<Bbox> = Vec::with_capacity(n_rows);
     let mut kinds: Vec<GeomKind> = Vec::with_capacity(n_rows);
+    let mut minimum_viable_levels: Vec<u16> = Vec::with_capacity(n_rows);
     let mut sort_key_parts: Vec<ArrayRef> = Vec::new();
     let mut row_base = 0usize;
     for batch in reader {
@@ -863,10 +1053,12 @@ fn scan_input(
             batch.column(proj_idx(geom_col_idx)).as_ref(),
             cover.as_ref(),
             row_base,
+            simplification_tolerances,
         )?;
-        for (bb, k) in pairs {
-            bboxes.push(bb);
-            kinds.push(k);
+        for geometry in pairs {
+            bboxes.push(geometry.bbox);
+            kinds.push(geometry.kind);
+            minimum_viable_levels.push(geometry.minimum_viable_level);
         }
         if let Some(i) = sort_key_idx {
             sort_key_parts.push(batch.column(proj_idx(i)).clone());
@@ -880,6 +1072,7 @@ fn scan_input(
     Ok(ScanResult {
         bboxes,
         kinds,
+        minimum_viable_levels,
         sort_key,
     })
 }
@@ -888,11 +1081,12 @@ fn scan_geometry_batch(
     geom: &dyn Array,
     cover: Option<&CoverCols>,
     row_base: usize,
-) -> Result<Vec<(Bbox, GeomKind)>> {
+    simplification_tolerances: &[f64],
+) -> Result<Vec<ScannedGeometry>> {
     if let Some(arr) = geom.as_any().downcast_ref::<BinaryArray>() {
-        scan_wkb_rows(arr, cover, row_base)
+        scan_wkb_rows(arr, cover, row_base, simplification_tolerances)
     } else if let Some(arr) = geom.as_any().downcast_ref::<LargeBinaryArray>() {
-        scan_wkb_rows(arr, cover, row_base)
+        scan_wkb_rows(arr, cover, row_base, simplification_tolerances)
     } else {
         bail!(
             "geometry column has unsupported type `{:?}`; only WKB Binary/LargeBinary is supported",
@@ -905,7 +1099,8 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
     arr: &GenericBinaryArray<O>,
     cover: Option<&CoverCols>,
     row_base: usize,
-) -> Result<Vec<(Bbox, GeomKind)>> {
+    simplification_tolerances: &[f64],
+) -> Result<Vec<ScannedGeometry>> {
     (0..arr.len())
         .into_par_iter()
         .map(|i| {
@@ -913,12 +1108,27 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
                 bail!("null geometry at row {}", row_base + i);
             }
             let wkb = arr.value(i);
-            if let Some(c) = cover {
+            let (bbox, kind) = if let Some(c) = cover {
                 if let Some(bb) = c.value(i) {
-                    return Ok((bb, kind_from_wkb(wkb)?));
+                    (bb, kind_from_wkb(wkb)?)
+                } else {
+                    bbox_from_wkb(wkb)?
                 }
-            }
-            bbox_from_wkb(wkb)
+            } else {
+                bbox_from_wkb(wkb)?
+            };
+            let minimum_viable_level = match kind {
+                GeomKind::Point => 0,
+                GeomKind::Line | GeomKind::Polygon => {
+                    let level = first_viable_level(wkb, simplification_tolerances)?;
+                    u16::try_from(level).map_err(|_| anyhow!("too many simplification levels"))?
+                }
+            };
+            Ok(ScannedGeometry {
+                bbox,
+                kind,
+                minimum_viable_level,
+            })
         })
         .collect()
 }
@@ -1050,13 +1260,20 @@ fn row_selection_for(sorted: &[u32]) -> RowSelection {
 /// Returns one batch normally; the chunk is split into several whenever its
 /// variable-width payload approaches the i32 offset budget (see
 /// `SEGMENT_MAX_BYTES`), so arbitrarily fat rows cannot overflow.
+struct GatherLayout<'a> {
+    output_schema: &'a Arc<Schema>,
+    geometry_col: usize,
+    feature_level: usize,
+    overview_plan: &'a [(usize, f64)],
+}
+
 fn gather_chunk(
     input: &Path,
     meta: &ArrowReaderMetadata,
     keep_cols: &[usize],
     chunk: &[u32],
     bboxes: &[Bbox],
-    output_schema: &Arc<Schema>,
+    layout: &GatherLayout<'_>,
 ) -> Result<Vec<RecordBatch>> {
     let mut sorted = chunk.to_vec();
     sorted.sort_unstable();
@@ -1123,28 +1340,116 @@ fn gather_chunk(
             seg_bytes += weights[seg_end];
             seg_end += 1;
         }
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + 1);
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + layout.overview_plan.len() + 1);
         for refs in &col_refs {
             cols.push(interleave(refs, &locs[seg_start..seg_end])?);
+        }
+        let raw_geometry = cols[layout.geometry_col].clone();
+        for (overview_level, tolerance) in layout.overview_plan {
+            if layout.feature_level <= *overview_level {
+                cols.push(simplify_geometry_array(raw_geometry.as_ref(), *tolerance)?);
+            } else {
+                cols.push(new_null_array(raw_geometry.data_type(), raw_geometry.len()));
+            }
         }
         let seg_bboxes: Vec<Bbox> = chunk[seg_start..seg_end]
             .iter()
             .map(|r| bboxes[*r as usize])
             .collect();
         cols.push(Arc::new(build_bbox_struct(&seg_bboxes)?));
-        out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
+        out.push(RecordBatch::try_new(layout.output_schema.clone(), cols)?);
         seg_start = seg_end;
     }
     Ok(out)
 }
 
-/// Per-kind multipliers on `prec` for the visibility (eligibility) threshold.
-/// Points are excluded — they have no extent, so they are always eligible
-/// from level 0 regardless of any factor.
-#[derive(Clone, Copy)]
-struct VisibilityFactors {
-    line: u32,
-    polygon: u32,
+const METERS_PER_DEGREE: f64 = 111_320.0;
+
+fn resolution_in_input_units(resolution: f64, units: InputUnits) -> f64 {
+    match units {
+        InputUnits::Degrees => resolution / METERS_PER_DEGREE,
+        InputUnits::Meters => resolution,
+        InputUnits::Auto => unreachable!("input units must be resolved before conversion"),
+    }
+}
+
+fn occupied_level_candidates(assignment: &[u16], candidate_count: usize) -> Result<Vec<usize>> {
+    if assignment.is_empty() || candidate_count == 0 {
+        bail!("internal: cannot build an empty level hierarchy");
+    }
+    let mut occupied = vec![false; candidate_count];
+    for level in assignment {
+        let level = *level as usize;
+        if level >= candidate_count {
+            bail!("internal: feature level {level} is outside the candidate ladder");
+        }
+        occupied[level] = true;
+    }
+    Ok(occupied
+        .iter()
+        .enumerate()
+        .filter_map(|(level, occupied)| occupied.then_some(level))
+        .collect())
+}
+
+fn remap_levels(assignment: &[u16], selected_candidates: &[usize]) -> Result<Vec<Vec<u32>>> {
+    if selected_candidates.is_empty() {
+        bail!("internal: no selected levels");
+    }
+    let mut per_level = vec![Vec::new(); selected_candidates.len()];
+    for (row, source_level) in assignment.iter().enumerate() {
+        let source_level = *source_level as usize;
+        let output_level = selected_candidates.partition_point(|level| *level < source_level);
+        let rows = per_level.get_mut(output_level).ok_or_else(|| {
+            anyhow!("internal: feature level {source_level} has no selected successor")
+        })?;
+        rows.push(u32::try_from(row).map_err(|_| anyhow!("more than u32::MAX input rows"))?);
+    }
+    Ok(per_level)
+}
+
+fn overview_column_name(primary: &str, index: usize) -> String {
+    format!("{primary}_ovr_{index}")
+}
+
+fn simplify_geometry_array(array: &dyn Array, tolerance: f64) -> Result<ArrayRef> {
+    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+        let simplified: Vec<Option<Vec<u8>>> = (0..values.len())
+            .into_par_iter()
+            .map(|index| {
+                (!values.is_null(index))
+                    .then(|| simplify_wkb(values.value(index), tolerance))
+                    .transpose()
+            })
+            .collect::<Result<_>>()?;
+        let mut builder = BinaryBuilder::new();
+        for value in simplified {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    } else if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        let simplified: Vec<Option<Vec<u8>>> = (0..values.len())
+            .into_par_iter()
+            .map(|index| {
+                (!values.is_null(index))
+                    .then(|| simplify_wkb(values.value(index), tolerance))
+                    .transpose()
+            })
+            .collect::<Result<_>>()?;
+        let mut builder = LargeBinaryBuilder::new();
+        for value in simplified {
+            match value {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    } else {
+        bail!("primary geometry is not a WKB Binary/LargeBinary column")
+    }
 }
 
 /// Per-row tie-break ranks derived from the `--sort-key` attribute column: a
@@ -1168,15 +1473,9 @@ fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> 
 /// grid cells and the highest-priority feature in each cell is assigned. Lines and
 /// polygons are spatially extended: representing either by its bbox center can hide a
 /// feature that contributes visible information across many cells. They therefore do
-/// not compete in cells and are assigned as soon as they pass the visibility gate.
-///
-/// A feature is *eligible* at a level only once its bbox diagonal reaches
-/// `vis_factor · prec` for its kind (see `min_visible`); below that it is excluded and
-/// deferred to a finer level where it becomes independently meaningful. This is a hard
-/// gate, not a tie-break, so the reader does not fetch sub-resolution extended features
-/// at a coarse zoom. It does not impose a density bound on visible lines or polygons.
-/// The trade-off is that a lone sub-threshold feature does not appear at coarser zooms.
-/// Point-kind features have no extent and are eligible from level 0.
+/// not compete in cells. Both enter at the first level where their simplified
+/// geometry remains independently renderable. Point-kind features have no extent
+/// and are eligible from level 0.
 ///
 /// Cells already occupied by a feature assigned at a coarser level are blocked: any
 /// remaining candidate whose center re-projects into such a cell at the current
@@ -1184,25 +1483,35 @@ fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> 
 /// this, a tight cluster would surface one feature per level in the same visual
 /// neighborhood — a coarse winner plus near-identical fine winners around it.
 /// Blocking applies only to points.
+struct FeatureMeasures<'a> {
+    bboxes: &'a [Bbox],
+    kinds: &'a [GeomKind],
+    minimum_viable_levels: &'a [u16],
+    sort_ranks: &'a [u64],
+}
+
 fn assign_levels(
-    bboxes: &[Bbox],
-    kinds: &[GeomKind],
-    gsds: &[f64],
+    features: FeatureMeasures<'_>,
+    resolutions: &[f64],
     units: InputUnits,
     point_thinning_factor: u32,
-    visibility: VisibilityFactors,
-    sort_ranks: &[u64],
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
     const METERS_PER_DEGREE: f64 = 111_320.0;
 
-    let n = bboxes.len();
+    let n = features.bboxes.len();
+    if features.kinds.len() != n
+        || features.minimum_viable_levels.len() != n
+        || features.sort_ranks.len() != n
+    {
+        bail!("internal: per-row assignment inputs have inconsistent lengths");
+    }
     let mut assigned: Vec<i32> = vec![-1; n];
     let mut remaining: Vec<u32> = (0..n as u32).collect();
-    let last_level = (gsds.len() - 1) as u16;
+    let last_level = (resolutions.len() - 1) as u16;
 
-    let precs: Vec<f64> = gsds
+    let precs: Vec<f64> = resolutions
         .iter()
         .map(|g| match units {
             InputUnits::Degrees => g / METERS_PER_DEGREE,
@@ -1212,50 +1521,22 @@ fn assign_levels(
         .collect();
 
     let point_thin_mul = point_thinning_factor as f64;
-    let line_vis_mul = visibility.line as f64;
-    let polygon_vis_mul = visibility.polygon as f64;
 
-    // Coarsest level at which each feature is independently meaningful: its bbox
-    // diagonal ≥ `vis_factor · prec` for the feature's kind. Diagonal — rather
-    // than max(w, h) — so a 45° line is rated by its actual length, not its
-    // axis-aligned shadow. Compared in squared form to avoid a per-row sqrt.
-    // Points have no extent so are eligible from level 0. Used as a hard
-    // eligibility gate in the per-cell selection below.
-    let sq_line_vis: Vec<f64> = precs
-        .iter()
-        .map(|p| (p * line_vis_mul) * (p * line_vis_mul))
-        .collect();
-    let sq_polygon_vis: Vec<f64> = precs
-        .iter()
-        .map(|p| (p * polygon_vis_mul) * (p * polygon_vis_mul))
-        .collect();
-    let min_visible: Vec<u16> = bboxes
+    // Extended geometries use the first candidate at which their actual
+    // simplification result remains renderable. Points are eligible
+    // immediately and are density-thinned below.
+    let min_visible: Vec<u16> = features
+        .kinds
         .par_iter()
-        .zip(kinds.par_iter())
-        .map(|(b, k)| {
-            if *k == GeomKind::Point {
-                return 0u16;
-            }
-            let sq_diag = b.width().powi(2) + b.height().powi(2);
-            if sq_diag <= 0.0 {
-                return 0u16;
-            }
-            let thresholds = match k {
-                GeomKind::Line => &sq_line_vis,
-                GeomKind::Polygon => &sq_polygon_vis,
-                GeomKind::Point => unreachable!(),
-            };
-            for (i, sp) in thresholds.iter().enumerate() {
-                if sq_diag >= *sp {
-                    return i as u16;
-                }
-            }
-            last_level
+        .enumerate()
+        .map(|(row, kind)| match kind {
+            GeomKind::Point => 0,
+            GeomKind::Line | GeomKind::Polygon => features.minimum_viable_levels[row],
         })
         .collect();
 
     let cell_key = |row: u32, prec: f64| -> (i64, i64) {
-        let b = bboxes[row as usize];
+        let b = features.bboxes[row as usize];
         let ep = prec * point_thin_mul;
         ((b.cx() / ep).floor() as i64, (b.cy() / ep).floor() as i64)
     };
@@ -1271,7 +1552,13 @@ fn assign_levels(
             .map(|&row| cell_key(row, *prec))
             .collect();
 
-        let prio = |row: u32| priority(&bboxes[row as usize], sort_ranks[row as usize], row);
+        let prio = |row: u32| {
+            priority(
+                &features.bboxes[row as usize],
+                features.sort_ranks[row as usize],
+                row,
+            )
+        };
 
         // Per-cell point winner map built in parallel: each thread folds into a
         // local HashMap, then reduce merges them keeping the higher-score row
@@ -1284,7 +1571,7 @@ fn assign_levels(
                 if min_visible[row as usize] as usize > level_i {
                     return local;
                 }
-                if kinds[row as usize] != GeomKind::Point {
+                if features.kinds[row as usize] != GeomKind::Point {
                     return local;
                 }
                 let key = cell_key(row, *prec);
@@ -1325,7 +1612,7 @@ fn assign_levels(
         let extended: Vec<u32> = remaining
             .par_iter()
             .filter_map(|&row| {
-                (kinds[row as usize] != GeomKind::Point
+                (features.kinds[row as usize] != GeomKind::Point
                     && min_visible[row as usize] as usize <= level_i)
                     .then_some(row)
             })
@@ -1530,8 +1817,8 @@ mod tests {
     }
 
     #[test]
-    fn web_mercator_gsds_monotonic_and_halving() {
-        let g = web_mercator_gsds(0, 4, 1024);
+    fn web_mercator_resolutions_are_monotonic_and_halving() {
+        let g = web_mercator_resolutions(0, 4, 1024);
         assert_eq!(g.len(), 5);
         for w in g.windows(2) {
             assert!(
@@ -1541,6 +1828,66 @@ mod tests {
         }
         // Web Mercator equatorial circumference / 1024 at z0.
         assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 1024.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_candidates_are_removed_and_occupied_candidates_are_preserved() {
+        let assignment = vec![0, 2, 2, 4];
+        assert_eq!(
+            occupied_level_candidates(&assignment, 5).unwrap(),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            remap_levels(&assignment, &[0, 4]).unwrap(),
+            vec![vec![0], vec![1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn render_wkb_budget_ignores_primary_geometry_when_overviews_exist() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("geometry_ovr_0", DataType::Binary, true),
+            Field::new("geometry_ovr_1", DataType::Binary, true),
+        ]));
+        let raw_a = vec![0u8; 10_000];
+        let raw_b = vec![0u8; 20_000];
+        let coarse_a = vec![0u8; 30];
+        let coarse_b = vec![0u8; 40];
+        let fine_a = vec![0u8; 80];
+        let fine_b = vec![0u8; 60];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![raw_a.as_slice(), raw_b.as_slice()])),
+                Arc::new(BinaryArray::from(vec![
+                    coarse_a.as_slice(),
+                    coarse_b.as_slice(),
+                ])),
+                Arc::new(BinaryArray::from(vec![
+                    fine_a.as_slice(),
+                    fine_b.as_slice(),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            render_wkb_bytes_per_row(&batch, &[1, 2]).unwrap(),
+            vec![80, 60]
+        );
+        assert_eq!(
+            render_wkb_bytes_per_row(&batch, &[0]).unwrap(),
+            vec![10_000, 20_000]
+        );
+    }
+
+    #[test]
+    fn wkb_budget_splits_before_overflow_and_isolates_oversized_rows() {
+        assert_eq!(rows_within_wkb_budget(&[40, 50, 20], 3, 100, true), 2);
+        assert_eq!(rows_within_wkb_budget(&[20], 1, 10, false), 0);
+        assert_eq!(rows_within_wkb_budget(&[120, 5], 2, 100, true), 1);
+        assert_eq!(rows_within_wkb_budget(&[0, 0, 0], 2, 0, true), 2);
     }
 
     #[test]
@@ -1647,16 +1994,15 @@ mod tests {
         let kinds = vec![GeomKind::Point, GeomKind::Point];
         let gsds = vec![100.0, 50.0];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[0, 0],
+                sort_ranks: &[0, 0],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 1,
-                polygon: 1,
-            },
-            &[0, 0],
         )
         .unwrap();
         assert_eq!(out, vec![0, 0]);
@@ -1671,16 +2017,15 @@ mod tests {
         let kinds = vec![GeomKind::Point, GeomKind::Point];
         let gsds = vec![100.0, 10.0];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[0, 0],
+                sort_ranks: &[0, 0],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 1,
-                polygon: 1,
-            },
-            &[0, 0],
         )
         .unwrap();
         let mut sorted = out.clone();
@@ -1697,16 +2042,15 @@ mod tests {
         let kinds = vec![GeomKind::Point, GeomKind::Point];
         let gsds = vec![100.0, 10.0];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[0, 0],
+                sort_ranks: &[1, 5],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 1,
-                polygon: 1,
-            },
-            &[1, 5],
         )
         .unwrap();
         assert_eq!(out, vec![1, 0]);
@@ -1745,53 +2089,62 @@ mod tests {
     }
 
     #[test]
-    fn assign_levels_subthreshold_feature_deferred_to_finer_level() {
-        // A lone polygon below the visibility threshold (diagonal² ≈ 2 vs the
-        // level-0 threshold² of (10·4)² = 1600) is excluded from the coarse
-        // level by the hard gate even though its cell is otherwise empty, and
-        // deferred to the finest level. This is what bounds a coarse-zoom read
-        // by screen density instead of total dataset size.
+    fn assign_levels_defers_polygon_until_simplification_survives() {
         let bboxes = vec![bb(0.0, 0.0, 1.0, 1.0)];
         let kinds = vec![GeomKind::Polygon];
         let gsds = vec![10.0, 0.5];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[1],
+                sort_ranks: &[0],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 2,
-                polygon: 4,
-            },
-            &[0],
         )
         .unwrap();
         assert_eq!(out, vec![1]);
     }
 
     #[test]
-    fn assign_levels_visible_feature_beats_subthreshold_in_same_cell() {
-        // Two polygons in the same level-0 cell (pitch 10): the visible one
-        // (diagonal² = 3200 ≥ 1600) takes level 0; the sub-threshold one
-        // (diagonal² = 2) is gated out of level 0 and deferred to a finer
-        // level, not dropped.
+    fn assign_levels_defers_line_until_simplification_survives() {
+        let bboxes = vec![bb(0.0, 0.0, 0.25, 0.0)];
+        let kinds = vec![GeomKind::Line];
+        let gsds = vec![1.0, 0.1];
+        let out = assign_levels(
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[1],
+                sort_ranks: &[0],
+            },
+            &gsds,
+            InputUnits::Meters,
+            1,
+        )
+        .unwrap();
+        assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn assign_levels_does_not_make_polygons_compete_in_cells() {
         let big = bb(-15.0, -15.0, 25.0, 25.0); // center (5,5)
         let small = bb(1.0, 1.0, 2.0, 2.0); // center (1.5,1.5)
         let bboxes = vec![big, small];
         let kinds = vec![GeomKind::Polygon, GeomKind::Polygon];
         let gsds = vec![10.0, 0.5];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[0, 1],
+                sort_ranks: &[0, 0],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 2,
-                polygon: 4,
-            },
-            &[0, 0],
         )
         .unwrap();
         assert_eq!(out, vec![0, 1]);
@@ -1817,16 +2170,15 @@ mod tests {
         ];
         let gsds = vec![10.0, 1.0];
         let out = assign_levels(
-            &bboxes,
-            &kinds,
+            FeatureMeasures {
+                bboxes: &bboxes,
+                kinds: &kinds,
+                minimum_viable_levels: &[0, 0, 0, 0],
+                sort_ranks: &[0, 0, 0, 0],
+            },
             &gsds,
             InputUnits::Meters,
             1,
-            VisibilityFactors {
-                line: 2,
-                polygon: 4,
-            },
-            &[0, 0, 0, 0],
         )
         .unwrap();
         assert_eq!(out, vec![0, 0, 0, 0]);

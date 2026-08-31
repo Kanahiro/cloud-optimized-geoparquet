@@ -1,6 +1,6 @@
 ---
 title: Cloud Optimized GeoParquet Profile (COGP)
-version: "0.1.0"
+version: "0.2.0"
 status: Draft
 scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
 license: CC BY 4.0
@@ -19,7 +19,7 @@ A COGP file is:
 3. organized so that each level ends at a Parquet row group boundary;
 4. annotated with minimal metadata describing those level boundaries.
 
-COGP is feature-level: it reorders features across row groups; it does not simplify, aggregate, or duplicate them.
+COGP keeps a lossless primary geometry while allowing sparse, scale-specific WKB columns for rendering. Feature rows are reordered but never duplicated.
 
 ## 2. Motivation
 
@@ -39,13 +39,15 @@ The core idea is:
 
 > Earlier row groups contain features that are independently meaningful at coarse display resolutions. Later row groups add features that are only independently meaningful at finer display resolutions.
 
-COGP is a **feature-level progressive subset**, not a geometry-decimation scheme:
+COGP's row layout is a **feature-level progressive subset**:
 
 * each source feature is placed, in full, in exactly one row group;
-* a feature's geometry is preserved verbatim — vertices, bends, and detail within a feature are never removed or simplified by this profile;
+* a feature's primary geometry is preserved verbatim;
 * features are assigned to the coarsest level at which they become independently renderable as whole features.
 
-Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels, and does not produce simplified geometries.
+Unlike a tile pyramid, COGP does not duplicate rows across levels. Level
+geometry columns may contain simplified rendering copies and are sparse outside
+the row prefixes where they apply.
 
 A reader can choose how many leading row groups to load based on its target rendering resolution.
 
@@ -63,17 +65,17 @@ A logical rendering detail level.
 
 Levels are represented by metadata and row group boundaries. This profile does not require a `level`, `zoom`, or `zoomlevel` column in the data.
 
-### 4.2 Ground sample distance (GSD)
+### 4.2 Ground resolution
 
-`gsd` is the approximate smallest ground distance represented as an independently meaningful unit at this level.
-
-The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features are not represented as independently meaningful at this level.
+`resolution_meters` is the nominal ground resolution for which a level's
+feature prefix and geometry representation are intended to be rendered.
 
 The value is always expressed in meters of ground distance at the geographic location of the features, independent of the CRS or units used by the underlying data. For example, a file in EPSG:4326 (degrees) still expresses this value in meters.
 
-For example, a level with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later levels.
-
-Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse level retains its full geometry, including fine internal detail.
+For example, a level with `resolution_meters` equal to `1000` contains the
+feature prefix and geometry representation intended for rendering at an
+approximately 1000-meter ground resolution. Finer detail is deferred to later
+levels.
 
 This may apply to deferring features such as:
 
@@ -82,11 +84,13 @@ This may apply to deferring features such as:
 * a small polygon feature that does not form a meaningful rendered shape;
 * a polygon feature too small to form at least a minimal visible area at the target display scale.
 
-This value is rendering-oriented. It does not guarantee positional accuracy, topological validity, or analytical precision.
+This value is rendering-oriented. It is not a measured geometric error or an
+accuracy guarantee, and it does not guarantee positional accuracy, topological
+validity, or analytical precision.
 
 ## 5. Requirements
 
-A COGP v0.1 file MUST satisfy the following requirements.
+A COGP v0.2 file MUST satisfy the following requirements.
 
 ### 5.1 GeoParquet compatibility
 
@@ -100,9 +104,15 @@ geo.columns[<primary_column>].covering.bbox
 
 where `<primary_column>` is the value of the GeoParquet `primary_column` field.
 
+The primary geometry column's GeoParquet `geometry_types` array MUST be
+non-empty and MUST describe exactly one topological family: Point/MultiPoint,
+LineString/MultiLineString, or Polygon/MultiPolygon. Singular and Multi variants
+of the same family MAY coexist; geometry families MUST NOT be mixed in one COGP
+file. GeometryCollection is not supported by this profile.
+
 Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
 
-For COGP v0.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
+For COGP v0.2, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
 
 ### 5.2 Physical ordering
 
@@ -112,11 +122,21 @@ Earlier row groups MUST contain features that are independently meaningful at co
 
 Later row groups MUST add features that are independently meaningful only at finer render resolutions.
 
-Every source feature MUST appear in exactly one row group. Feature geometry and attributes MUST NOT be simplified or aggregated.
+Every source feature MUST appear in exactly one row group. Its primary geometry
+and attributes MUST NOT be simplified or aggregated. Non-primary level geometry
+columns MAY contain simplified copies.
 
-Level ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
+Level ordering is defined with respect to the primary geometry column.
 
 Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective.
+
+For LineString and Polygon features, producers SHOULD derive the first visible
+level from simplification at the level's rendering tolerance. A LineString
+SHOULD be deferred while its simplified length does not exceed that tolerance;
+a Polygon SHOULD be deferred while simplification cannot retain a valid
+exterior ring. Such features SHOULD NOT be thinned by assigning their bbox
+centers to density-grid cells; the simplified geometry is the more direct
+signal.
 
 Producers SHOULD spatially sort or pack features within each level before forming row groups. Suitable approaches include, but are not limited to, ordering features by a spatial filling curve such as a Hilbert curve, ordering features by Quadkey or another quadtree-derived key, or using a packed spatial index layout such as STR packing.
 
@@ -129,7 +149,8 @@ The file-level metadata MUST contain a non-empty ordered list of level entries.
 Each level entry MUST contain:
 
 * `row_group_end`
-* `gsd`
+* `resolution_meters`
+* `geometry_column`
 
 `row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
 
@@ -141,9 +162,13 @@ The row groups belonging to the second and later levels are the row groups after
 
 The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the levels collectively cover every row group in the file.
 
-`gsd` MUST be a positive JSON number.
+`resolution_meters` MUST be a positive finite JSON number.
 
-`gsd` values MUST be strictly monotonically decreasing from coarse to fine levels.
+`resolution_meters` values MUST be strictly monotonically decreasing from coarse to fine levels.
+
+`geometry_column` MUST be the non-empty name of a physical WKB geometry column
+declared in GeoParquet metadata. It defines the geometry representation a
+renderer uses with this level's row-group prefix.
 
 ### 5.4 Progressive access layout
 
@@ -151,7 +176,42 @@ Producers SHOULD choose row group sizes so that each level prefix can be fetched
 
 Producers SHOULD avoid placing so many bytes or features in an early row group that the first level is no longer useful as a coarse overview.
 
+When simplified level geometry columns are present, producers SHOULD size row
+groups using the geometry column chunks that rendering readers actually project
+rather than the lossless primary WKB column. A producer MAY use the largest
+usable rendering WKB payload as a conservative pre-compression estimate.
+
 This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
+
+Producers SHOULD preserve each requested candidate ground resolution that
+introduces at least one feature. A producer MAY omit candidates to which no
+features are assigned.
+
+### 5.5 Level geometry columns
+
+The geometry column named by each level MUST be non-null from row group `0`
+through that level's `row_group_end`, inclusive. When a non-primary geometry
+column is referenced by multiple levels, it MUST be non-null through the
+greatest `row_group_end` of those levels and MUST be null in every later row
+group.
+
+Within one level geometry column, producers MUST apply one scale-derived
+spatial tolerance consistently to all non-point geometries. Producers MUST
+derive each simplified representation directly from the lossless primary
+geometry or from an equivalent progressive hierarchy; simplification error MUST
+NOT accumulate by repeatedly simplifying the previous representation. Point
+geometries remain unchanged and SHOULD NOT be duplicated into non-primary level
+geometry columns because no simplification is possible.
+Producers MAY snap retained XY vertices to a grid derived from the level's
+spatial tolerance to improve compression. Such quantization MUST apply only to
+non-primary level geometry columns; the primary geometry remains lossless. Producers SHOULD NOT
+quantize Z or M ordinates unless their units and error bounds are independently
+defined.
+
+Non-primary level geometry columns MUST be nullable WKB geometry columns. The
+primary geometry column MAY be referenced directly, which is appropriate for
+Point data or any level that requires lossless geometry. The primary geometry
+MUST remain unchanged and non-null wherever the source geometry is non-null.
 
 ## 6. Metadata
 
@@ -178,19 +238,22 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "levels": [
     {
       "row_group_end": 0,
-      "gsd": 1000
+      "resolution_meters": 1000,
+      "geometry_column": "geometry_ovr_0"
     },
     {
       "row_group_end": 3,
-      "gsd": 500
+      "resolution_meters": 500,
+      "geometry_column": "geometry_ovr_1"
     },
     {
       "row_group_end": 12,
-      "gsd": 100
+      "resolution_meters": 100,
+      "geometry_column": "geometry_ovr_2"
     }
   ]
 }
@@ -203,7 +266,8 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | `version`              |      Yes | Profile metadata version.                                                                                         |
 | `levels`                 |      Yes | Ordered level entries from coarse to fine.                                                                        |
 | `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
-| `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
+| `levels[].resolution_meters` | Yes | Nominal ground resolution for which the level is intended, in meters. |
+| `levels[].geometry_column` | Yes | Physical WKB geometry column to render for this level. |
 
 ## 7. Reader guidance (non-normative)
 
@@ -213,10 +277,14 @@ COGP metadata describes available levels but does not prescribe how a reader use
 
 A renderer can base the choice of level on zoom level, map scale, screen-space error, or any application-specific budget for bytes, features, or latency.
 
-One common strategy is to derive a target ground sample distance from the current display scale and select the finest level whose `gsd` is still coarser than or equal to that target. Because `levels` are ordered from coarse to fine and `gsd` values strictly decrease, this is the last level satisfying:
+One common strategy is to derive a target ground resolution from the current
+display scale and select the finest level whose `resolution_meters` is still
+coarser than or equal to that target. Because `levels` are ordered from coarse
+to fine and `resolution_meters` values strictly decrease, this is the last
+level satisfying:
 
 ```text
-gsd >= target_gsd
+resolution_meters >= target_resolution_meters
 ```
 
 If no level satisfies this condition, the target resolution is coarser than the coarsest level in the file, and the reader can select the first level.
@@ -238,6 +306,17 @@ For viewport-driven applications, two complementary spatial filters can apply wi
 * **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
 
 If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
+
+### 7.3 Geometry column selection
+
+After selecting a level, a rendering reader projects that level's
+`geometry_column`. The column is guaranteed to be non-null throughout the
+selected row prefix, so no second metadata search or precision comparison is
+needed. The reader may expose the selected physical column logically under the
+primary geometry column name.
+
+A reader that requires lossless geometry explicitly projects the GeoParquet
+primary geometry column instead of the level geometry column.
 
 ## 8. Validation
 

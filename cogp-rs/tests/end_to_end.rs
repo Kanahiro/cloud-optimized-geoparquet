@@ -20,6 +20,15 @@ use parquet::file::metadata::KeyValue;
 
 /// Little-endian WKB encoder for the geometry kinds we use in the fixture.
 mod wkb {
+    pub fn point(x: f64, y: f64) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(1);
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v
+    }
+
     pub fn polygon(corners: &[(f64, f64)]) -> Vec<u8> {
         let mut v = Vec::new();
         v.push(1);
@@ -130,21 +139,68 @@ fn write_input(path: &std::path::Path) {
     writer.close().unwrap();
 }
 
+fn write_point_input(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+    let ids: Vec<i32> = (0..8).collect();
+    let geoms: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| wkb::point(f64::from(*id), 0.0))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(BinaryArray::from(
+                geoms.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let mut cols = BTreeMap::new();
+    cols.insert(
+        "geometry".to_string(),
+        GeoColumn {
+            encoding: "WKB".into(),
+            geometry_types: vec!["Point".into()],
+            covering: None,
+            bbox: None,
+            crs: None,
+        },
+    );
+    let geo = GeoMeta {
+        version: "1.1.0".into(),
+        primary_column: "geometry".into(),
+        columns: cols,
+    };
+
+    let file = File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue {
+        key: GEO_METADATA_KEY.to_string(),
+        value: Some(serde_json::to_string(&geo).unwrap()),
+    });
+    writer.close().unwrap();
+}
+
 fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArgs {
     ConvertArgs {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
-        gsd: vec![],
+        resolution: vec![],
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
         row_group_max_bytes: None,
+        simplification_tolerance_factor: 1.0,
         input_units: InputUnits::Degrees,
         geometry_column: None,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
-        line_visibility_factor: 2,
-        polygon_visibility_factor: 4,
         sort_key: None,
         sort_order: SortKeyOrder::Desc,
     }
@@ -167,23 +223,39 @@ fn convert_reader_validate_pipeline() {
     assert_eq!(reader.primary_column(), "geometry");
 
     let cogp = reader.cogp_meta();
+    assert!(cogp
+        .levels
+        .iter()
+        .all(|level| level.geometry_column.starts_with("geometry_ovr_")));
+    assert_eq!(
+        reader.geometry_column_for_resolution(cogp.levels[0].resolution_meters),
+        cogp.levels[0].geometry_column
+    );
+    let finest_level = cogp.levels.last().unwrap();
+    assert_eq!(
+        reader.geometry_column_for_resolution(finest_level.resolution_meters / 2.0),
+        finest_level.geometry_column
+    );
     // levels list constraints (validator already checks these but assert here
     // so the reader's view stays in sync).
     let mut prev_rge: Option<i64> = None;
-    let mut prev_gsd: Option<f64> = None;
+    let mut previous_resolution: Option<f64> = None;
     for l in &cogp.levels {
         if let Some(p) = prev_rge {
             assert!(l.row_group_end > p);
         }
         prev_rge = Some(l.row_group_end);
-        assert!(l.gsd > 0.0);
-        if let Some(p) = prev_gsd {
-            assert!(l.gsd < p);
+        assert!(l.resolution_meters > 0.0);
+        if let Some(previous) = previous_resolution {
+            assert!(l.resolution_meters < previous);
         }
-        prev_gsd = Some(l.gsd);
+        previous_resolution = Some(l.resolution_meters);
     }
     let total_rgs = reader.num_row_groups();
-    assert_eq!(cogp.levels.last().unwrap().row_group_end as usize + 1, total_rgs);
+    assert_eq!(
+        cogp.levels.last().unwrap().row_group_end as usize + 1,
+        total_rgs
+    );
 
     // The profile relies only on row-group statistics; the converter must not
     // add page-level index structures to the output.
@@ -206,16 +278,15 @@ fn convert_reader_validate_pipeline() {
     let up_to_huge = reader.row_groups_up_to_level(999);
     assert_eq!(up_to_huge.end, total_rgs);
 
-    // `row_groups_up_to_gsd` returns levels whose GSD is ≥ min_gsd (i.e.
-    // coarser than the caller's target). Tiny min_gsd → every level
-    // qualifies; huge min_gsd → no level is that coarse.
-    let everything = reader.row_groups_up_to_gsd(1e-12);
-    let nothing = reader.row_groups_up_to_gsd(1e12);
+    // Tiny target resolution includes every level; a huge target has no level
+    // coarse enough to qualify.
+    let everything = reader.row_groups_up_to_resolution(1e-12);
+    let nothing = reader.row_groups_up_to_resolution(1e12);
     assert_eq!(everything.end, total_rgs);
     assert!(nothing.is_empty());
-    // The coarsest level's own GSD must qualify itself.
-    let coarsest_gsd = reader.levels()[0].gsd;
-    let with_coarsest = reader.row_groups_up_to_gsd(coarsest_gsd);
+    // The coarsest level's own resolution must qualify itself.
+    let coarsest_resolution = reader.levels()[0].resolution_meters;
+    let with_coarsest = reader.row_groups_up_to_resolution(coarsest_resolution);
     assert!(!with_coarsest.is_empty());
 
     // The dataset spans roughly [0,0]..[10,4] in degrees; an outside query
@@ -235,11 +306,55 @@ fn convert_reader_validate_pipeline() {
         .collect();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 40, "all input rows must survive convert");
+    // Overview quantization must never leak into the lossless primary column.
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let geometry = batch
+            .column_by_name("geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row);
+            let x0 = f64::from(id % 10);
+            let y0 = f64::from(id / 10);
+            let size = if id % 3 == 0 { 0.05 } else { 0.5 };
+            let expected = wkb::polygon(&[
+                (x0, y0),
+                (x0 + size, y0),
+                (x0 + size, y0 + size),
+                (x0, y0 + size),
+                (x0, y0),
+            ]);
+            assert_eq!(geometry.value(row), expected);
+        }
+    }
 
     // Bbox struct must be present in the output schema and be a non-nullable
     // struct of four f64 children.
     let schema = batches[0].schema();
     let bbox_field = schema.field_with_name("bbox").unwrap();
+    let mut geometry_boundaries = BTreeMap::new();
+    for level in &cogp.levels {
+        geometry_boundaries
+            .entry(level.geometry_column.as_str())
+            .and_modify(|boundary: &mut usize| {
+                *boundary = (*boundary).max(level.row_group_end as usize)
+            })
+            .or_insert(level.row_group_end as usize);
+    }
+    for column in geometry_boundaries.keys() {
+        let field = schema.field_with_name(column).unwrap();
+        assert_eq!(field.data_type(), &DataType::Binary);
+        assert!(field.is_nullable() || *column == reader.primary_column());
+        assert!(reader.geo_meta().columns.contains_key(*column));
+    }
     match bbox_field.data_type() {
         DataType::Struct(fs) => {
             let names: Vec<&str> = fs.iter().map(|f| f.name().as_str()).collect();
@@ -250,16 +365,86 @@ fn convert_reader_validate_pipeline() {
         }
         other => panic!("bbox must be a struct, got {other:?}"),
     }
+
+    // Each level geometry is complete through its greatest referenced boundary
+    // and entirely NULL afterward. This lets a renderer read one projected WKB
+    // column without per-row fallback.
+    for row_group_index in 0..total_rgs {
+        let file = File::open(&output).unwrap();
+        let row_group_batches: Vec<RecordBatch> = reader
+            .sync_batch_reader(file, &[row_group_index])
+            .unwrap()
+            .map(|batch| batch.unwrap())
+            .collect();
+        for (column_name, boundary) in &geometry_boundaries {
+            let (nulls, rows) = row_group_batches
+                .iter()
+                .fold((0, 0), |(nulls, rows), batch| {
+                    let column = batch.column_by_name(column_name).unwrap();
+                    (nulls + column.null_count(), rows + batch.num_rows())
+                });
+            assert_eq!(
+                nulls,
+                if row_group_index <= *boundary {
+                    0
+                } else {
+                    rows
+                },
+                "unexpected sparse layout for {} in row group {row_group_index}",
+                column_name
+            );
+        }
+    }
 }
 
 #[test]
-fn convert_rejects_non_positive_gsd() {
-    let tmp = TempDir::new("badgsd");
+fn convert_point_uses_primary_wkb_without_overviews() {
+    let tmp = TempDir::new("point-primary-wkb");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.cogp.parquet");
+    write_point_input(&input);
+
+    let mut args = convert_args(&input, &output);
+    args.resolution = vec![100_000.0, 10_000.0, 1_000.0];
+    args.row_group_size = 8;
+    args.row_group_max_bytes = Some(42);
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+
+    let reader = Reader::open(&output).unwrap();
+    assert!(reader
+        .levels()
+        .iter()
+        .all(|level| level.geometry_column == "geometry"));
+    assert_eq!(reader.geometry_column_for_resolution(1.0), "geometry");
+    assert!(
+        reader.num_row_groups() > 1,
+        "primary WKB must drive the byte budget"
+    );
+
+    let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
+    let batches: Vec<RecordBatch> = reader
+        .sync_batch_reader(File::open(&output).unwrap(), &all_row_groups)
+        .unwrap()
+        .map(|batch| batch.unwrap())
+        .collect();
+    let schema = batches[0].schema();
+    assert!(schema.field_with_name("geometry").is_ok());
+    assert!(schema
+        .fields()
+        .iter()
+        .all(|field| !field.name().starts_with("geometry_ovr_")));
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+}
+
+#[test]
+fn convert_rejects_non_positive_resolution() {
+    let tmp = TempDir::new("bad-resolution");
     let input = tmp.path().join("input.parquet");
     let output = tmp.path().join("out.parquet");
     write_input(&input);
     let mut args = convert_args(&input, &output);
-    args.gsd = vec![100.0, -1.0];
+    args.resolution = vec![100.0, -1.0];
     let err = cogp::convert::run(args).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -297,11 +482,7 @@ fn convert_reuses_existing_bbox_column() {
     ]);
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new(
-            "bbox",
-            DataType::Struct(bbox_struct_fields.clone()),
-            false,
-        ),
+        Field::new("bbox", DataType::Struct(bbox_struct_fields.clone()), false),
         Field::new("geometry", DataType::Binary, false),
     ]));
 
@@ -346,8 +527,7 @@ fn convert_reuses_existing_bbox_column() {
     let geom_arr: ArrayRef = Arc::new(BinaryArray::from(
         geoms.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
     ));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![id_arr, bbox_arr, geom_arr]).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, bbox_arr, geom_arr]).unwrap();
 
     let mut cols = BTreeMap::new();
     cols.insert(
@@ -406,13 +586,71 @@ fn convert_reuses_existing_bbox_column() {
 }
 
 #[test]
-fn convert_explicit_gsd_path() {
-    let tmp = TempDir::new("explicit-gsd");
+fn convert_explicit_resolution_path() {
+    let tmp = TempDir::new("explicit-resolution");
     let input = tmp.path().join("input.parquet");
     let output = tmp.path().join("out.cogp.parquet");
     write_input(&input);
     let mut args = convert_args(&input, &output);
-    args.gsd = vec![1000.0, 100.0, 10.0];
+    args.resolution = vec![1000.0, 100.0, 10.0];
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
+}
+
+#[test]
+fn convert_respects_render_wkb_row_group_budget() {
+    let tmp = TempDir::new("wkb-budget");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("out.cogp.parquet");
+    write_input(&input);
+
+    let mut args = convert_args(&input, &output);
+    args.resolution = vec![100_000.0];
+    args.row_group_size = 40;
+    args.row_group_max_bytes = Some(200);
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+
+    let reader = Reader::open(&output).unwrap();
+    assert!(
+        reader.num_row_groups() > 1,
+        "WKB budget must split the level"
+    );
+    let overview_names: Vec<&str> = reader
+        .levels()
+        .iter()
+        .map(|level| level.geometry_column.as_str())
+        .collect();
+    for row_group_index in 0..reader.num_row_groups() {
+        let batches: Vec<RecordBatch> = reader
+            .sync_batch_reader(File::open(&output).unwrap(), &[row_group_index])
+            .unwrap()
+            .map(|batch| batch.unwrap())
+            .collect();
+        let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        let mut bytes = 0usize;
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                let largest_overview = overview_names
+                    .iter()
+                    .map(|name| {
+                        batch
+                            .column_by_name(name)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .unwrap()
+                            .value(row)
+                            .len()
+                    })
+                    .max()
+                    .unwrap();
+                bytes += largest_overview;
+            }
+        }
+        assert!(
+            bytes <= 200 || row_count == 1,
+            "row group {row_group_index} has {bytes} render WKB bytes across {row_count} rows"
+        );
+    }
 }
