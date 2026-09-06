@@ -91,6 +91,8 @@ The producer:
   lists using LoD-wide `scale` and `offset` metadata;
 - writes overview integer leaves with Parquet `DELTA_BINARY_PACKED` encoding
   and no dictionary, while retaining ZSTD compression;
+- writes bbox ColumnIndexes plus OffsetIndexes for every column, with
+  row-aligned data pages, so viewport readers can prune within row groups;
 - writes `cogp.levels[].resolution` and the required `lod` for every level.
 
 ## Library use — reading COGP files
@@ -110,9 +112,14 @@ let selected: Vec<usize> = spatial
     .filter(|index| level_prefix.contains(index))
     .collect();
 
-let batches = reader.sync_batch_reader(std::fs::File::open("data.cogp.parquet")?, &selected)?;
+let batches = reader.sync_batch_reader_with_bbox(
+    std::fs::File::open("data.cogp.parquet")?,
+    &selected,
+    [139.0, 35.0, 140.0, 36.0],
+)?;
 for batch in batches {
     let batch = batch?;
+    // Page pruning is conservative; apply the exact bbox predicate to rows.
     // Project/decode `overviews.geometry_type` and `overviews.{lod}` for
     // rendering, or explicitly project primary WKB for lossless analysis.
     let _ = (&batch, lod);
@@ -121,7 +128,9 @@ for batch in batches {
 ```
 
 With the `object_store` feature, `Reader::try_new_async` and
-`Reader::async_batch_stream` support remote range reads. The optional
+`Reader::async_batch_stream_with_bbox` support remote page-pruned range reads.
+Files without usable page indexes remain readable and conservatively select
+all rows in candidate row groups. The optional
 `RangeCoalescingReader` reduces request count while bounding gap overfetch.
 Applications that must never transfer primary WKB should project only the
 selected overview leaves and must not coalesce ranges across WKB chunks.
@@ -133,6 +142,9 @@ Reader selectors include:
 - `row_groups_up_to_resolution(target_resolution)`
 - `lod_for_resolution(target_resolution)`
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])`
+- `row_selection_intersecting_bbox(row_groups, [xmin, ymin, xmax, ymax])`
+- `sync_batch_reader_with_bbox(reader, row_groups, bbox)`
+- `async_batch_stream_with_bbox(reader, row_groups, bbox)` (feature `async`)
 
 ## `validate`
 

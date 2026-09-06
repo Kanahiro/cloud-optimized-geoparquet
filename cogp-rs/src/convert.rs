@@ -705,11 +705,18 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     // Disable dictionary encoding for the geometry column (WKB is high-cardinality, dict
     // is pure overhead) and for the bbox struct's float fields (each value is unique).
+    // Page indexes only help spatial pruning when the narrow bbox leaves have
+    // multiple pages per row group. Bound pages by top-level row count as well
+    // as bytes, and match the write batch so the writer can honor that boundary
+    // closely. Offset indexes are emitted for every column, allowing a bbox
+    // page selection to skip the corresponding overview and attribute pages.
+    const PAGE_INDEX_ROWS: usize = 256;
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_size(args.row_group_size)
+        .set_data_page_row_count_limit(PAGE_INDEX_ROWS)
+        .set_write_batch_size(PAGE_INDEX_ROWS)
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false)
         .set_column_encoding(ColumnPath::from(geom_col_name.as_str()), Encoding::PLAIN)
         // Binary min/max is not useful for spatial pruning and can copy WKB
@@ -737,7 +744,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
-        props_builder = props_builder.set_column_dictionary_enabled(path, false);
+        props_builder = props_builder
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_statistics_enabled(path, EnabledStatistics::Page);
     }
     let props = props_builder.build();
     let out_file = File::create(&args.output)

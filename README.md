@@ -8,7 +8,7 @@ A COGP file is a valid [GeoParquet 1.1](https://geoparquet.org/) file whose row 
 
 COGP is **feature-level**: it reorders features across row groups without aggregating or duplicating rows. Each source feature appears in exactly one row group with lossless primary WKB, while a required `overviews` struct stores simplified, integer XY rendering geometries at several LoDs.
 
-A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
+A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. Bbox PageIndexes can further avoid unrelated pages inside intersecting row groups. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
 
 ## Design influences
 

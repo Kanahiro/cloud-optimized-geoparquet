@@ -4,7 +4,9 @@ TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
 area and ground resolution. Bbox reads use covering-column statistics to prune
-row groups, then apply an exact per-feature bbox filter to the surviving rows.
+row groups and, when present, PageIndex metadata to prune pages inside surviving
+row groups. They then apply an exact per-feature bbox filter to the surviving
+rows; files without page indexes fall back safely to row-group pruning.
 Rendering geometry is decoded from the selected integer XY child of the fixed
 `overviews` struct. The browser projection excludes every WKB column.
 
@@ -28,6 +30,10 @@ await CogpReader.open(url, {
 await CogpReader.open(url, { rangeCoalescing: false });
 await CogpReader.open(url, { rangeCache: false });
 ```
+
+Page pruning trades additional, small range requests for lower transferred
+bytes. `rangeCoalescing` controls that tradeoff; increasing
+`maxOverfetchRatio` generally reduces request count by accepting more bytes.
 
 ## Development
 

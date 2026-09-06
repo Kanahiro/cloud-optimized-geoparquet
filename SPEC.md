@@ -115,6 +115,14 @@ file. GeometryCollection is not supported by this profile.
 
 Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
 
+Producers SHOULD also write a Parquet ColumnIndex and OffsetIndex for each of
+these four bbox leaves. Columns intended for viewport rendering, including the
+`overviews` leaves, SHOULD have an OffsetIndex. This lets a reader translate a
+bbox predicate into row ranges within an intersecting row group and request
+only the corresponding pages from projected columns. Missing page indexes do
+not make a file non-conforming; readers MUST fall back conservatively to row
+group pruning.
+
 The primary WKB column MUST NOT have Parquet column statistics. Binary min/max
 statistics are not useful for spatial pruning and may copy WKB values into the
 footer that every reader must fetch.
@@ -187,6 +195,12 @@ Producers SHOULD size row groups using the `overviews` leaf column chunks that
 rendering readers actually project rather than the lossless primary WKB column.
 A producer MAY use the largest usable overview payload as a conservative
 pre-compression estimate.
+
+When writing page indexes, producers SHOULD bound data pages by row count and
+align page boundaries across bbox and rendering columns. A row group containing
+only one large bbox page cannot be pruned within that row group, while very
+small pages increase index size and range-request count. The precise page size
+is producer-specific.
 
 This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
 
@@ -354,10 +368,20 @@ Two reading styles are both valid:
 
 Implementations typically fetch the Parquet footer to obtain `cogp` metadata and per-row-group statistics, then issue HTTP range requests for the row groups in `0..row_group_end` — in parallel or in order, with rendering either streamed or deferred to completion.
 
-For viewport-driven applications, two complementary spatial filters can apply within the selected prefix:
+For viewport-driven applications, three complementary spatial filters can apply within the selected prefix:
 
 * **Row group pruning.** Using per-row-group min/max statistics of the bbox covering columns (Section 5.1), row groups whose bbox does not intersect the viewport can be skipped, avoiding the range request entirely.
+* **Page pruning.** When bbox ColumnIndexes and projected-column OffsetIndexes
+  are available, evaluate the same four covering predicates against page
+  min/max values and fetch only projected data pages overlapping the resulting
+  conservative row ranges. This is especially useful at fine display
+  resolutions, where a small viewport may intersect a spatially broader row
+  group but only a few of its ordered pages.
 * **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
+
+Page statistics are conservative: a retained page can still contain features
+outside the viewport. Readers MUST still apply the per-feature bbox predicate
+to produce exact query results.
 
 If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
 

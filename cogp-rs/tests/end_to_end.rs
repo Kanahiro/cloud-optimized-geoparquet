@@ -267,17 +267,19 @@ fn convert_reader_validate_pipeline() {
         total_rgs
     );
 
-    // The profile relies only on row-group statistics; the converter must not
-    // add page-level index structures to the output.
-    assert!(reader
-        .parquet_metadata()
-        .row_groups()
-        .iter()
-        .all(|row_group| {
-            row_group.columns().iter().all(|column| {
-                column.column_index_offset().is_none() && column.offset_index_offset().is_none()
-            })
-        }));
+    // Bbox leaves carry page min/max indexes; every column carries an offset
+    // index so a bbox-derived row selection can avoid unrelated data pages.
+    for row_group in reader.parquet_metadata().row_groups() {
+        for column in row_group.columns() {
+            let path = column.column_path().string();
+            assert!(column.offset_index_offset().is_some(), "{path}");
+            if path.starts_with("bbox.") {
+                assert!(column.column_index_offset().is_some(), "{path}");
+            } else {
+                assert!(column.column_index_offset().is_none(), "{path}");
+            }
+        }
+    }
 
     // Selector contracts.
     assert!(reader.row_groups_in_level(reader.levels().len()).is_none());

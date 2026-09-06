@@ -241,7 +241,7 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns, projectedMetadata)) {
+    for await (const batch of this.streamRuns(rgs, columns, projectedMetadata, bbox)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -305,9 +305,11 @@ export class CogpReader {
     rgIndices: number[],
     columns: string[] | undefined,
     metadata: FullFileMetadata,
+    bbox?: Bbox,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
+    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
     for (const run of this.coalescedRuns(rgIndices)) {
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
@@ -321,6 +323,14 @@ export class CogpReader {
         compressors,
       };
       if (columns) readArgs['columns'] = columns;
+      if (filter) {
+        readArgs['filter'] = filter;
+        // hyparquet fetches the four bbox ColumnIndexes, derives conservative
+        // row ranges, then uses each projected leaf's OffsetIndex to request
+        // only data pages overlapping those ranges. Missing indexes degrade to
+        // the existing row-group read without affecting correctness.
+        readArgs['usePageIndex'] = true;
+      }
       yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
     }
   }
@@ -351,6 +361,17 @@ export class CogpReader {
     return n;
   }
 
+}
+
+function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
+  return {
+    $and: [
+      { [paths.xmin.join('.')]: { $lte: bbox.maxX } },
+      { [paths.ymin.join('.')]: { $lte: bbox.maxY } },
+      { [paths.xmax.join('.')]: { $gte: bbox.minX } },
+      { [paths.ymax.join('.')]: { $gte: bbox.minY } },
+    ],
+  };
 }
 
 /**
