@@ -4,7 +4,11 @@ use cogp::{convert, validate};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "cogp", version, about = "Cloud Optimized GeoParquet Profile reference CLI")]
+#[command(
+    name = "cogp",
+    version,
+    about = "Cloud Optimized GeoParquet Profile reference CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

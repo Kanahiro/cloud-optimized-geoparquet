@@ -20,7 +20,7 @@
 //! Geometries stay in their on-disk WKB form in the returned
 //! [`arrow_array::RecordBatch`]es; downstream callers convert them via
 //! [`geozero`](https://crates.io/crates/geozero) — see the README.
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
@@ -43,7 +43,10 @@ pub use parquet::arrow::async_reader::ParquetObjectReader;
 #[cfg(feature = "async")]
 pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
 
-use crate::meta::{CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY};
+use crate::meta::{
+    geometry_family, CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY,
+    OVERVIEWS_COLUMN, OVERVIEWS_ENCODING,
+};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
 /// Cheap to clone (the underlying `ArrowReaderMetadata` is `Arc`-backed) and
@@ -88,6 +91,39 @@ impl Reader {
     /// S3) and wants to skip even the initial range request.
     pub fn from_arrow_metadata(arrow_meta: ArrowReaderMetadata) -> Result<Self> {
         let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata())?;
+        let primary = geo_meta
+            .columns
+            .get(&geo_meta.primary_column)
+            .ok_or_else(|| {
+                anyhow!(
+                    "`geo.columns` is missing primary_column `{}`",
+                    geo_meta.primary_column
+                )
+            })?;
+        if geometry_family(&primary.geometry_types).is_none() {
+            bail!("COGP primary geometry must declare exactly one Point, Line, or Polygon family");
+        }
+        if cogp_meta.overviews.encoding != OVERVIEWS_ENCODING {
+            bail!(
+                "unsupported COGP overviews encoding `{}`",
+                cogp_meta.overviews.encoding
+            );
+        }
+        if arrow_meta
+            .schema()
+            .field_with_name(OVERVIEWS_COLUMN)
+            .is_err()
+        {
+            bail!("COGP file is missing required `{OVERVIEWS_COLUMN}` column");
+        }
+        for (index, level) in cogp_meta.levels.iter().enumerate() {
+            if !cogp_meta.overviews.lods.contains_key(&level.lod) {
+                bail!(
+                    "COGP levels[{index}].lod `{}` is missing from overviews.lods",
+                    level.lod
+                );
+            }
+        }
         Ok(Self {
             arrow_meta,
             geo_meta,
@@ -117,6 +153,18 @@ impl Reader {
 
     pub fn primary_column(&self) -> &str {
         &self.geo_meta.primary_column
+    }
+
+    /// Select the overview LoD declared by the level appropriate for the
+    /// target ground resolution.
+    pub fn lod_for_resolution(&self, target_resolution: f64) -> &str {
+        let level = self
+            .cogp_meta
+            .levels
+            .iter()
+            .rposition(|level| level.resolution >= target_resolution)
+            .unwrap_or(0);
+        &self.cogp_meta.levels[level].lod
     }
 
     pub fn num_row_groups(&self) -> usize {
@@ -149,16 +197,18 @@ impl Reader {
         0..(self.cogp_meta.levels[i].row_group_end + 1) as usize
     }
 
-    /// Row groups for every level whose GSD is `>= min_gsd` (coarser than the
+    /// Row groups for every level whose resolution is `>= target` (coarser than the
     /// caller's target resolution). Use this when you have a target ground
     /// resolution (e.g. screen meters/pixel) and want every level that's
     /// still useful at that scale, plus all coarser overviews.
-    pub fn row_groups_up_to_gsd(&self, min_gsd: f64) -> Range<usize> {
-        let last = self.cogp_meta.levels.iter().rposition(|l| l.gsd >= min_gsd);
-        match last {
-            Some(i) => 0..(self.cogp_meta.levels[i].row_group_end + 1) as usize,
-            None => 0..0,
-        }
+    pub fn row_groups_up_to_resolution(&self, target_resolution: f64) -> Range<usize> {
+        let last = self
+            .cogp_meta
+            .levels
+            .iter()
+            .rposition(|level| level.resolution >= target_resolution)
+            .unwrap_or(0);
+        0..(self.cogp_meta.levels[last].row_group_end + 1) as usize
     }
 
     /// Row groups whose covering-bbox envelope intersects `[xmin, ymin, xmax, ymax]`.
@@ -244,7 +294,7 @@ impl Reader {
     /// `AsyncFileReader`, reusing the cached footer metadata. The Parquet
     /// reader fetches only the byte ranges for the selected row groups, so
     /// pairing this with [`Self::row_groups_intersecting_bbox`] and/or
-    /// [`Self::row_groups_up_to_gsd`] gives you a near-minimal remote read.
+    /// [`Self::row_groups_up_to_resolution`] gives you a near-minimal remote read.
     #[cfg(feature = "async")]
     pub fn async_batch_stream<R: AsyncFileReader + Send + 'static>(
         &self,
@@ -284,23 +334,41 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
 mod tests {
     use super::*;
     use crate::meta::{
-        BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, COGP_VERSION, GEOPARQUET_VERSION,
+        BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, LodMeta, OverviewsMeta, COGP_VERSION,
+        GEOPARQUET_VERSION, OVERVIEWS_ENCODING,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::metadata::KeyValue;
     use std::collections::BTreeMap;
 
-    fn level(row_group_end: i64, gsd: f64) -> Level {
-        Level { row_group_end, gsd }
+    fn level(row_group_end: i64, resolution: f64) -> Level {
+        Level {
+            row_group_end,
+            resolution,
+            lod: format!("l{row_group_end}"),
+        }
     }
 
     /// Construct a `Reader` whose footer carries the supplied COGP levels.
     /// The Arrow schema and row-group count are minimal — only the selector
     /// tests below read them. The construction path itself goes through the
     /// real `from_arrow_metadata`, so the metadata-parse code runs as well.
-    fn reader_with_levels(levels: Vec<Level>) -> Reader {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+    fn reader_with_metadata(levels: Vec<Level>, geometry_types: Vec<String>) -> Reader {
+        let lod_fields = levels
+            .iter()
+            .map(|level| {
+                Field::new(
+                    &level.lod,
+                    DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int32, false),
+            Field::new(OVERVIEWS_COLUMN, DataType::Struct(lod_fields.into()), false),
+        ]));
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
@@ -309,7 +377,7 @@ mod tests {
                 "geometry".to_string(),
                 GeoColumn {
                     encoding: "WKB".into(),
-                    geometry_types: vec![],
+                    geometry_types,
                     covering: Some(Covering {
                         bbox: BboxCovering {
                             xmin: vec!["bbox".into(), "xmin".into()],
@@ -329,6 +397,21 @@ mod tests {
             };
             let cogp = CogpMeta {
                 version: COGP_VERSION.into(),
+                overviews: OverviewsMeta {
+                    encoding: OVERVIEWS_ENCODING.into(),
+                    lods: levels
+                        .iter()
+                        .map(|level| {
+                            (
+                                level.lod.clone(),
+                                LodMeta {
+                                    scale: [1.0; 2],
+                                    offset: [0.0; 2],
+                                },
+                            )
+                        })
+                        .collect(),
+                },
                 levels,
             };
             w.append_key_value_metadata(KeyValue {
@@ -342,6 +425,10 @@ mod tests {
             w.close().unwrap();
         }
         Reader::try_new(bytes::Bytes::from(buf)).unwrap()
+    }
+
+    fn reader_with_levels(levels: Vec<Level>) -> Reader {
+        reader_with_metadata(levels, vec!["Point".into()])
     }
 
     #[test]
@@ -364,24 +451,30 @@ mod tests {
     }
 
     #[test]
-    fn row_groups_up_to_level_empty_when_no_levels() {
-        let r = reader_with_levels(vec![]);
-        assert!(r.row_groups_up_to_level(0).is_empty());
+    fn row_groups_up_to_resolution_picks_last_level_above_target() {
+        let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
+        // target finer than every level → include every level
+        assert_eq!(r.row_groups_up_to_resolution(1.0), 0..10);
+        // target equal to the finest level resolution → include every level
+        assert_eq!(r.row_groups_up_to_resolution(10.0), 0..10);
+        // target between levels 1 and 2 → cut off after level 1
+        assert_eq!(r.row_groups_up_to_resolution(50.0), 0..5);
+        // target finer than the coarsest only
+        assert_eq!(r.row_groups_up_to_resolution(500.0), 0..2);
+        // target coarser than every level → fall back to the coarsest prefix
+        assert_eq!(r.row_groups_up_to_resolution(1e9), 0..2);
     }
 
     #[test]
-    fn row_groups_up_to_gsd_picks_last_level_above_target() {
-        let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
-        // target finer than every level → include every level
-        assert_eq!(r.row_groups_up_to_gsd(1.0), 0..10);
-        // target equal to the finest level GSD → include every level
-        assert_eq!(r.row_groups_up_to_gsd(10.0), 0..10);
-        // target between levels 1 and 2 → cut off after level 1
-        assert_eq!(r.row_groups_up_to_gsd(50.0), 0..5);
-        // target finer than the coarsest only
-        assert_eq!(r.row_groups_up_to_gsd(500.0), 0..2);
-        // target coarser than every level → empty
-        assert!(r.row_groups_up_to_gsd(1e9).is_empty());
+    fn lod_comes_from_selected_level() {
+        let mut levels = vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)];
+        levels[0].lod = "coarse".into();
+        levels[1].lod = "medium".into();
+        levels[2].lod = "fine".into();
+        let r = reader_with_metadata(levels, vec!["LineString".into()]);
+        assert_eq!(r.lod_for_resolution(1000.0), "coarse");
+        assert_eq!(r.lod_for_resolution(50.0), "medium");
+        assert_eq!(r.lod_for_resolution(1.0), "fine");
     }
 
     /// Build a tiny parquet `bytes::Bytes` blob with the given KV metadata
@@ -402,6 +495,10 @@ mod tests {
         let cogp = CogpMeta {
             version: COGP_VERSION.into(),
             levels: vec![],
+            overviews: OverviewsMeta {
+                encoding: OVERVIEWS_ENCODING.into(),
+                lods: BTreeMap::new(),
+            },
         };
         let err = try_open_with_kv(vec![KeyValue {
             key: COGP_METADATA_KEY.into(),

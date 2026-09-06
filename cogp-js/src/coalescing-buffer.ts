@@ -8,6 +8,13 @@ export interface RangeCoalescingOptions {
   maxGapBytes?: number;
   /** Maximum merged bytes / uniquely requested bytes; must be at least 1. */
   maxOverfetchRatio?: number;
+  /** Byte intervals that must neither be requested nor crossed by a merge. */
+  protectedRanges?: readonly ByteRange[];
+}
+
+export interface ByteRange {
+  start: number;
+  end: number;
 }
 
 interface PendingSlice {
@@ -42,6 +49,7 @@ export function coalescingAsyncBuffer(
 ): AsyncBufferLike {
   const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES;
   const maxOverfetchRatio = options.maxOverfetchRatio ?? DEFAULT_MAX_OVERFETCH_RATIO;
+  const protectedRanges = normalizeRanges(options.protectedRanges ?? [], source.byteLength);
   if (!Number.isSafeInteger(maxGapBytes) || maxGapBytes < 0) {
     throw new Error(`maxGapBytes must be a non-negative safe integer, got ${maxGapBytes}`);
   }
@@ -56,7 +64,7 @@ export function coalescingAsyncBuffer(
     flushScheduled = false;
     const batch = pending;
     pending = [];
-    const runs = makeRuns(batch, maxGapBytes, maxOverfetchRatio);
+    const runs = makeRuns(batch, maxGapBytes, maxOverfetchRatio, protectedRanges);
     for (const run of runs) void fetchRun(source, run);
   };
 
@@ -72,6 +80,9 @@ export function coalescingAsyncBuffer(
         );
       }
       if (start === end) return Promise.resolve(new ArrayBuffer(0));
+      if (intersectsAny(start, end, protectedRanges)) {
+        return Promise.reject(new Error(`slice [${start}, ${end}) intersects a protected range`));
+      }
 
       const result = new Promise<ArrayBuffer>((resolve, reject) => {
         pending.push({ start, end, resolve, reject });
@@ -89,6 +100,7 @@ function makeRuns(
   batch: PendingSlice[],
   maxGapBytes: number,
   maxOverfetchRatio: number,
+  protectedRanges: readonly ByteRange[],
 ): SliceRun[] {
   const sorted = batch.sort((a, b) => a.start - b.start || a.end - b.end);
   const runs: SliceRun[] = [];
@@ -114,7 +126,9 @@ function makeRuns(
     // individual request is already larger than either configured budget.
     if (
       gap <= 0 ||
-      (gap <= maxGapBytes && overfetchRatio <= maxOverfetchRatio)
+      (gap <= maxGapBytes
+        && overfetchRatio <= maxOverfetchRatio
+        && !intersectsAny(run.end, slice.start, protectedRanges))
     ) {
       run.end = mergedEnd;
       run.requestedBytes = mergedRequestedBytes;
@@ -129,6 +143,27 @@ function makeRuns(
     }
   }
   return runs;
+}
+
+function normalizeRanges(ranges: readonly ByteRange[], byteLength: number): ByteRange[] {
+  const sorted = ranges.map(({ start, end }) => {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end > byteLength) {
+      throw new Error(`protected range [${start}, ${end}) is outside buffer length ${byteLength}`);
+    }
+    return { start, end };
+  }).sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: ByteRange[] = [];
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+    else merged.push(range);
+  }
+  return merged;
+}
+
+function intersectsAny(start: number, end: number, ranges: readonly ByteRange[]): boolean {
+  if (end <= start) return false;
+  return ranges.some((range) => range.start < end && start < range.end);
 }
 
 async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {

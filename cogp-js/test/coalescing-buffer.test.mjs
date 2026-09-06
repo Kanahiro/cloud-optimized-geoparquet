@@ -78,3 +78,17 @@ test('supports an omitted end and rejects invalid bounds', async () => {
   await assert.rejects(file.slice(-1, 2), /outside buffer/);
   await assert.rejects(file.slice(0, 33), /outside buffer/);
 });
+
+test('never requests or merges across protected ranges', async () => {
+  const { source, calls } = sourceFixture();
+  const file = coalescingAsyncBuffer(source, {
+    maxGapBytes: 100,
+    maxOverfetchRatio: 10,
+    protectedRanges: [{ start: 20, end: 30 }],
+  });
+
+  await Promise.all([file.slice(10, 20), file.slice(30, 40)]);
+  assert.deepEqual(calls, [[10, 20], [30, 40]]);
+  await assert.rejects(file.slice(19, 21), /protected range/);
+  assert.deepEqual(calls, [[10, 20], [30, 40]]);
+});

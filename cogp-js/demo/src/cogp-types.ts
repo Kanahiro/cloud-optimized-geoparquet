@@ -5,7 +5,7 @@ export interface MetadataSummary {
   num_row_groups: number;
   levels: Array<{
     i: number;
-    gsd: number;
+    resolution: number;
     row_group_end: number;
   }>;
   crs: unknown;
@@ -30,7 +30,7 @@ export interface ViewportResult {
 
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetGsd: number };
+  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetResolution: number };
 
 export interface WorkerEnvelope {
   id: number;

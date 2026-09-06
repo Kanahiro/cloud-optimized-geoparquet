@@ -5,6 +5,8 @@ export type {
   ReadOptions,
 } from './reader.js';
 export type { RangeCoalescingOptions } from './coalescing-buffer.js';
+export { rangeCachedAsyncBuffer } from './range-cache.js';
+export type { RangeCacheOptions } from './range-cache.js';
 
 export {
   COGP_METADATA_KEY,
@@ -22,8 +24,11 @@ export type {
   GeoColumn,
   GeoMeta,
   Level,
+  LodMetadata,
+  OverviewsMetadata,
 } from './meta.js';
 
-export { selectLevelByGsd } from './level.js';
+export { selectLevelByGsd, selectLevelByResolution } from './level.js';
+export { decodeOverview } from './overview.js';
 
 export type { Bbox } from './bbox.js';

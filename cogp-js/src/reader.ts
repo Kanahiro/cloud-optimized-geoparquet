@@ -1,7 +1,5 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
 import { compressors } from 'hyparquet-compressors';
-import { DEFAULT_PARSERS } from 'hyparquet/src/convert.js';
-import { wkbToGeojson } from 'hyparquet/src/wkb.js';
 
 import {
   type Bbox,
@@ -13,15 +11,23 @@ import {
   rowGroupIntersects,
 } from './bbox.js';
 import {
+  type ByteRange,
   coalescingAsyncBuffer,
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
-import { selectLevelByGsd } from './level.js';
+import { selectLevelByResolution } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
+import {
+  decodeOverview,
+  projectOverviewMetadata,
+  rootColumnNames,
+  type OverviewFileMetadata,
+} from './overview.js';
+import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
-interface FullFileMetadata extends FileMetadataLike {
+interface FullFileMetadata extends OverviewFileMetadata {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
 }
 
@@ -32,33 +38,14 @@ export interface OpenOptions {
   byteLength?: number;
   /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
   rangeCoalescing?: RangeCoalescingOptions | false;
+  /** In-memory byte-range cache for this reader; enabled by default. */
+  rangeCache?: RangeCacheOptions | false;
 }
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
 // is read by one `parquetReadObjects` call that materializes every row in
 // the run as one array, so peak in-flight memory scales with this value.
 const RUN_MAX_ROWS = 50_000;
-
-// Custom parsers handed to hyparquet so it returns raw WKB bytes for
-// GEOMETRY/GEOGRAPHY columns instead of eagerly building nested-array
-// GeoJSON Geometry objects for every row. We decode WKB ourselves in
-// `readRows` only for rows that survive the bbox filter, which cuts peak
-// memory dramatically for small tile bboxes against dense files. The
-// other (timestamp/date/string/uuid) parsers fall through to hyparquet's
-// defaults — supplying `parsers` replaces the whole table, so we must
-// re-export the rest.
-const LAZY_GEO_PARSERS = {
-  ...DEFAULT_PARSERS,
-  geometryFromBytes: (bytes: Uint8Array | undefined) => bytes,
-  geographyFromBytes: (bytes: Uint8Array | undefined) => bytes,
-};
-
-function decodeWkb(bytes: Uint8Array): unknown {
-  return wkbToGeojson({
-    view: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-    offset: 0,
-  });
-}
 
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
@@ -77,31 +64,34 @@ export interface ReadOptions {
    * are skipped entirely.
    */
   maxRows?: number;
-  /**
-   * Output cap on cumulative WKB byte size of surviving rows' geometry
-   * columns. Measured on the raw on-disk bytes before WKB → GeoJSON decode,
-   * so a single huge polygon is caught even when row counts are tiny. The
-   * check fires per surviving row and is strict: a row whose geometry bytes
-   * would push the cumulative total over the cap is rejected (not decoded,
-   * not returned) and streaming stops. This means a single polygon bigger
-   * than the cap yields zero rows for that read — by design, since the
-   * point of the cap is to prevent shipping that polygon downstream. Only
-   * WKB geometry columns contribute; other heavy columns (long strings,
-   * etc.) are not measured.
-   */
-  maxRowWkbBytes?: number;
 }
 
 export class CogpReader {
   static async open(url: string, opts: OpenOptions = {}): Promise<CogpReader> {
-    const fetchOpts: Record<string, unknown> = { url };
+    // Browser HTTP caches handle many 206 responses poorly. Bypass them and
+    // keep reuse deterministic in the per-reader range cache below.
+    const fetchOpts: Record<string, unknown> = { url, requestInit: { cache: 'no-store' } };
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });
-    const file = opts.rangeCoalescing === false
+    const cached = opts.rangeCache === false
       ? source
-      : coalescingAsyncBuffer(source, opts.rangeCoalescing);
-    return CogpReader.fromAsyncBuffer(file, url);
+      : rangeCachedAsyncBuffer(source, opts.rangeCache);
+    // Fetch exactly the 8-byte trailer first, then exactly the declared
+    // metadata. hyparquet's 512 KiB default tail prefetch can otherwise absorb
+    // the final WKB page before its protected ranges are known.
+    const metadata = (await parquetMetadataAsync(cached as never, {
+      initialFetchSize: 8,
+    })) as unknown as FullFileMetadata;
+    const doc = extractCogpDocument(metadata.key_value_metadata);
+    const configuredRanges = opts.rangeCoalescing === false
+      ? []
+      : opts.rangeCoalescing?.protectedRanges ?? [];
+    const protectedRanges = [...configuredRanges, ...wkbColumnRanges(metadata, doc.geo)];
+    const file = opts.rangeCoalescing === false
+      ? cached
+      : coalescingAsyncBuffer(cached, { ...opts.rangeCoalescing, protectedRanges });
+    return new CogpReader(file, metadata, url);
   }
 
   /**
@@ -114,7 +104,9 @@ export class CogpReader {
     file: { byteLength: number; slice: (start: number, end?: number) => unknown },
     url: string,
   ): Promise<CogpReader> {
-    const metadata = (await parquetMetadataAsync(file as never)) as unknown as FullFileMetadata;
+    const metadata = (await parquetMetadataAsync(file as never, {
+      initialFetchSize: 8,
+    })) as unknown as FullFileMetadata;
     return new CogpReader(file, metadata, url);
   }
 
@@ -126,7 +118,7 @@ export class CogpReader {
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
   private readonly bboxPaths: BboxCovering;
-  /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
+  /** WKB columns are excluded from every browser projection and protected range plan. */
   private readonly geomColumns: readonly string[];
 
   private constructor(
@@ -137,6 +129,12 @@ export class CogpReader {
     const doc = extractCogpDocument(metadata.key_value_metadata);
     this.cogp = doc.cogp;
     this.geo = doc.geo;
+    const finalBoundary = this.cogp.levels[this.cogp.levels.length - 1]!.row_group_end;
+    if (finalBoundary !== metadata.row_groups.length - 1) {
+      throw new Error(
+        `cogp final row_group_end ${finalBoundary} does not cover ${metadata.row_groups.length} row groups`,
+      );
+    }
 
     const offsets: number[] = [];
     let acc = 0;
@@ -184,20 +182,20 @@ export class CogpReader {
 
   /**
    * Select a level index per SPEC §7. Pass a target ground-sample distance in
-   * meters; the reader returns the last level whose `gsd >= targetGsd`. If
-   * `targetGsd` is omitted (or coarser than the coarsest level), the finest /
+   * meters; the reader returns the last level whose `resolution >= targetResolution`. If
+   * `targetResolution` is omitted (or coarser than the coarsest level), the finest /
    * coarsest level is returned respectively.
    */
-  selectLevel(targetGsd?: number): number {
-    if (targetGsd === undefined) return this.levels.length - 1;
-    return selectLevelByGsd(this.levels, targetGsd);
+  selectLevel(targetResolution?: number): number {
+    if (targetResolution === undefined) return this.levels.length - 1;
+    return selectLevelByResolution(this.levels, targetResolution);
   }
 
   /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
    * records. The geometry column carries a GeoJSON Geometry object decoded
-   * from the on-disk WKB; decoding happens lazily after bbox filtering so
-   * rows that miss the query never pay for it.
+   * from the selected integer overview; decoding happens lazily after bbox
+   * filtering so rows that miss the query never pay for it.
    *
    * Row groups whose covering envelope misses the query are skipped entirely
    * (no I/O). Rows in the remaining groups are filtered exactly against each
@@ -205,51 +203,45 @@ export class CogpReader {
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
+    const level = this.levels[maxLevel];
+    if (!level) throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
+    const lodMetadata = this.cogp.overviews.lods[level.lod]!;
+    const projectedMetadata = projectOverviewMetadata(this.metadata, level.lod);
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
-    const maxRowWkbBytes = opts.maxRowWkbBytes;
-    let wkbBytes = 0;
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
     // struct's top-level name in transparently — hyparquet reads the whole
     // struct when you name its root.
-    let columns = opts.columns;
+    const requested = opts.columns ?? rootColumnNames(this.metadata.schema);
+    const wantsGeometry = opts.columns === undefined
+      || opts.columns.includes(this.primaryGeometryColumn)
+      || opts.columns.includes('overviews');
+    let columns = requested.filter(
+      (column) => !this.geomColumns.includes(column) && column !== 'overviews',
+    );
+    if (wantsGeometry) columns.push('overviews');
     if (bbox && columns) {
       const top = this.bboxPaths.xmin[0]!;
       if (!columns.includes(top)) columns = [...columns, top];
     }
     const out: Record<string, unknown>[] = [];
     const paths = bbox ? this.bboxPaths : null;
-    const geomCols = this.geomColumns;
     // Returns true once a cap has been reached, signalling callers to stop
     // iterating the current row group (and the outer stream) immediately
-    // rather than draining the rest of the batch. The geometry-byte check
-    // runs BEFORE WKB → GeoJSON decode so a single huge polygon doesn't
-    // sneak past the cap (decoded GeoJSON can be many MB even when the
-    // caller asked for a small output budget — that's what crashes the
-    // downstream renderer).
-    //
+    // rather than draining the rest of the batch.
     const acceptRow = (row: Record<string, unknown>): boolean => {
-      if (maxRowWkbBytes !== undefined) {
-        let rowWkbBytes = 0;
-        for (const col of geomCols) {
-          const v = row[col];
-          if (v instanceof Uint8Array) rowWkbBytes += v.byteLength;
-        }
-        if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
-        wkbBytes += rowWkbBytes;
-      }
-      for (const col of geomCols) {
-        const v = row[col];
-        if (v instanceof Uint8Array) row[col] = decodeWkb(v);
+      if (wantsGeometry) {
+        row[this.primaryGeometryColumn] = decodeOverview(row['overviews'], lodMetadata);
+        delete row['overviews'];
       }
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns)) {
+    for await (const batch of this.streamRuns(rgs, columns, projectedMetadata)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -306,12 +298,13 @@ export class CogpReader {
   /**
    * Materialize consecutive row-group runs in order. Each run is capped at
    * `RUN_MAX_ROWS`, bounding peak memory while allowing hyparquet to combine
-   * adjacent column-chunk reads. Byte-range reuse is delegated to the HTTP
-   * cache instead of retaining decoded row objects in the JS heap.
+   * adjacent column-chunk reads. Byte-range reuse is handled by the reader's
+   * bounded cache instead of retaining decoded row objects in the JS heap.
    */
   private async *streamRuns(
     rgIndices: number[],
     columns: string[] | undefined,
+    metadata: FullFileMetadata,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
@@ -322,11 +315,10 @@ export class CogpReader {
       const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
       const readArgs: Record<string, unknown> = {
         file: this.file,
-        metadata: this.metadata,
+        metadata,
         rowStart,
         rowEnd,
         compressors,
-        parsers: LAZY_GEO_PARSERS,
       };
       if (columns) readArgs['columns'] = columns;
       yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
@@ -359,6 +351,43 @@ export class CogpReader {
     return n;
   }
 
+}
+
+/**
+ * Locate physical WKB chunks once, from the footer, and turn them into hard
+ * transport barriers. Projection keeps them out of the Parquet plan; these
+ * barriers additionally prevent request coalescing from transferring them as
+ * an unrequested gap between useful chunks.
+ */
+function wkbColumnRanges(metadata: FullFileMetadata, geo: GeoMeta): ByteRange[] {
+  const wkbColumns = new Set(
+    Object.entries(geo.columns)
+      .filter(([, column]) => column?.encoding === 'WKB')
+      .map(([name]) => name),
+  );
+  const ranges: ByteRange[] = [];
+  for (const rowGroup of metadata.row_groups) {
+    for (const column of rowGroup.columns) {
+      const meta = column.meta_data as (typeof column.meta_data & {
+        data_page_offset?: bigint;
+        dictionary_page_offset?: bigint;
+        total_compressed_size?: bigint;
+      });
+      if (!meta || !wkbColumns.has(meta.path_in_schema?.[0] ?? '')) continue;
+      const offset = meta.dictionary_page_offset ?? meta.data_page_offset;
+      const size = meta.total_compressed_size;
+      if (offset === undefined || size === undefined) {
+        throw new Error('WKB column chunk is missing physical offset metadata');
+      }
+      const start = Number(offset);
+      const end = Number(offset + size);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+        throw new Error('WKB column chunk offset exceeds the browser safe-integer range');
+      }
+      ranges.push({ start, end });
+    }
+  }
+  return ranges;
 }
 
 function normalizeBbox(input?: BboxInput): Bbox | undefined {
