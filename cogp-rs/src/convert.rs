@@ -60,8 +60,10 @@ pub struct ConvertArgs {
     /// --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
-    /// Parquet row group size in rows.
-    #[arg(long, default_value_t = 10000)]
+    /// Target point-equivalent resolution-grid cells per Parquet row group.
+    /// A point occupies one cell; a line or polygon consumes its bbox cell occupancy.
+    /// For Point data this is also the row limit.
+    #[arg(long, default_value_t = 10_000)]
     pub row_group_size: usize,
     /// Maximum cumulative coordinate bytes in a row group's largest usable
     /// geometry overview.
@@ -157,6 +159,11 @@ impl RowGroupLimiter {
             max_overview_bytes,
             in_progress_overview_bytes: 0,
         }
+    }
+
+    fn start_level(&mut self, max_rows: usize) {
+        debug_assert_eq!(self.in_progress_overview_bytes, 0);
+        self.max_rows = max_rows;
     }
 
     fn write<W: Write + Send>(
@@ -593,16 +600,40 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         occupied_candidates.len(),
         resolutions.len()
     );
-    for (i, rows) in per_level.iter().enumerate() {
+    let row_group_plans = per_level
+        .iter()
+        .enumerate()
+        .map(|(level, rows)| {
+            spatial_row_group_plan(
+                rows,
+                &bboxes,
+                &kinds,
+                resolutions[level],
+                input_units,
+                args.row_group_size,
+            )
+        })
+        .collect::<Vec<_>>();
+    let row_group_sizes = row_group_plans
+        .iter()
+        .map(|plan| plan.max_rows)
+        .collect::<Vec<_>>();
+    for (level, rows) in per_level.iter().enumerate() {
+        let plan = row_group_plans[level];
         eprintln!(
-            "      level {i} (resolution={:>10.2} m): {:>9} features",
-            resolutions[i],
-            rows.len()
+            "      level {level} (resolution={:>10.2} m): {:>9} features, {:>5} rows/group \
+             (bbox cells mean={:.1}, p50={:.0}, p90={:.0})",
+            resolutions[level],
+            rows.len(),
+            row_group_sizes[level],
+            plan.mean_cells,
+            plan.median_cells,
+            plan.p90_cells,
         );
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(rows, &bboxes, args.row_group_size, level_idx);
+        str_pack(rows, &bboxes, row_group_sizes[level_idx], level_idx);
     }
 
     let dataset_bbox = bboxes
@@ -718,9 +749,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // main thread flushes finished batches through the parquet writer. Chunks
     // are independent, so the producer gathers them in rayon-parallel waves of
     // one chunk per worker; each wave is sent in order once complete. Resident
-    // memory is bounded by one wave of `row_group_size`-row chunks plus the
-    // channel, never the whole table. The barrier per wave costs little
-    // because chunks are equal-sized and similarly priced.
+    // memory is bounded by one wave of row-group-sized chunks plus the channel,
+    // never the whole table. The barrier per wave costs little because chunks
+    // within a level are equal-sized and similarly priced.
     let (tx, rx) = sync_channel::<(usize, RecordBatch)>(2);
     let producer_schema = output_schema.clone();
     let producer_bboxes = Arc::new(bboxes);
@@ -732,14 +763,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("internal: primary geometry column was dropped"))?;
     let producer_keep = keep_col_indices;
     let producer_per_level = per_level;
-    let producer_row_group_size = args.row_group_size;
+    let producer_row_group_sizes = row_group_sizes.clone();
     let producer_overview_plan = overview_plan.clone();
     let producer = thread::spawn(move || -> Result<()> {
         let chunks: Vec<(usize, &[u32])> = producer_per_level
             .iter()
             .enumerate()
             .flat_map(|(level_i, rows)| {
-                rows.chunks(producer_row_group_size)
+                rows.chunks(producer_row_group_sizes[level_i])
                     .map(move |chunk| (level_i, chunk))
             })
             .collect();
@@ -778,7 +809,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut last_level: Option<usize> = None;
     let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
     let render_geometry_columns = vec![output_schema.index_of(OVERVIEWS_COLUMN)?];
-    let mut row_group_limiter = RowGroupLimiter::new(args.row_group_size, args.row_group_max_bytes);
+    let mut row_group_limiter = RowGroupLimiter::new(row_group_sizes[0], args.row_group_max_bytes);
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
@@ -788,6 +819,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     resolution: resolutions[prev],
                     lod: overview_plan[prev].id.clone(),
                 });
+                row_group_limiter.start_level(row_group_sizes[level_i]);
             }
         }
         row_group_limiter.write(&mut writer, &batch, &render_geometry_columns)?;
@@ -1452,6 +1484,56 @@ fn resolution_in_input_units(resolution: f64, units: InputUnits) -> f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SpatialRowGroupPlan {
+    max_rows: usize,
+    mean_cells: f64,
+    median_cells: f64,
+    p90_cells: f64,
+}
+
+/// A point occupies one resolution-grid cell, so the configured cell budget is
+/// also its row limit. Lines and polygons consume the number of cells covered
+/// by their bbox; using the bbox rather than geometry length or area matches
+/// the envelope that controls row-group pruning.
+fn spatial_row_group_plan(
+    rows: &[u32],
+    bboxes: &[Bbox],
+    kinds: &[GeomKind],
+    resolution: f64,
+    units: InputUnits,
+    cell_budget: usize,
+) -> SpatialRowGroupPlan {
+    debug_assert!(!rows.is_empty());
+    let grid = resolution_in_input_units(resolution, units);
+    let mut cells = rows
+        .iter()
+        .map(|row| {
+            let row = *row as usize;
+            match kinds[row] {
+                GeomKind::Point => 1.0,
+                GeomKind::Line | GeomKind::Polygon => bbox_grid_cells(&bboxes[row], grid),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mean_cells = cells.iter().sum::<f64>() / cells.len() as f64;
+    cells.sort_unstable_by(f64::total_cmp);
+    let median_cells = cells[(cells.len() - 1) / 2];
+    let p90_cells = cells[(cells.len() - 1) * 9 / 10];
+    let max_rows = ((cell_budget as f64 / mean_cells).floor() as usize).clamp(1, cell_budget);
+    SpatialRowGroupPlan {
+        max_rows,
+        mean_cells,
+        median_cells,
+        p90_cells,
+    }
+}
+
+fn bbox_grid_cells(bbox: &Bbox, grid: f64) -> f64 {
+    let axis_cells = |min: f64, max: f64| ((max - min) / grid).ceil().max(1.0);
+    axis_cells(bbox.xmin, bbox.xmax) * axis_cells(bbox.ymin, bbox.ymax)
+}
+
 fn occupied_level_candidates(assignment: &[u16], candidate_count: usize) -> Result<Vec<usize>> {
     if assignment.is_empty() || candidate_count == 0 {
         bail!("internal: cannot build an empty level hierarchy");
@@ -1978,6 +2060,42 @@ mod tests {
         }
         // Web Mercator equatorial circumference / 1024 at z0.
         assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 1024.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spatial_row_group_plan_uses_cell_budget_as_the_point_row_limit() {
+        let bboxes = vec![bb(0.0, 0.0, 0.0, 0.0), bb(100.0, 100.0, 100.0, 100.0)];
+        let kinds = vec![GeomKind::Point; 2];
+        let plan =
+            spatial_row_group_plan(&[0, 1], &bboxes, &kinds, 10.0, InputUnits::Meters, 5_000);
+        assert_eq!(plan.max_rows, 5_000);
+        assert_eq!(plan.mean_cells, 1.0);
+    }
+
+    #[test]
+    fn spatial_row_group_plan_scales_lines_by_bbox_cell_occupancy() {
+        let bboxes = vec![bb(0.0, 0.0, 20.0, 20.0)];
+        let kinds = vec![GeomKind::Line];
+        let plan = spatial_row_group_plan(&[0], &bboxes, &kinds, 10.0, InputUnits::Meters, 4_000);
+        assert_eq!(plan.max_rows, 1_000);
+        assert_eq!(plan.mean_cells, 4.0);
+    }
+
+    #[test]
+    fn spatial_row_group_plan_scales_rows_by_bbox_cell_occupancy() {
+        let bboxes = vec![bb(0.0, 0.0, 20.0, 20.0), bb(30.0, 0.0, 50.0, 20.0)];
+        let kinds = vec![GeomKind::Polygon; 2];
+        let plan =
+            spatial_row_group_plan(&[0, 1], &bboxes, &kinds, 10.0, InputUnits::Meters, 4_000);
+        assert_eq!(plan.mean_cells, 4.0);
+        assert_eq!(plan.median_cells, 4.0);
+        assert_eq!(plan.p90_cells, 4.0);
+        assert_eq!(plan.max_rows, 1_000);
+    }
+
+    #[test]
+    fn bbox_grid_cells_counts_sub_grid_width_as_one_cell() {
+        assert_eq!(bbox_grid_cells(&bb(0.0, 0.0, 20.0, 1.0), 10.0), 2.0);
     }
 
     #[test]

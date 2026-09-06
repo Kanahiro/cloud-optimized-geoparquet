@@ -64,7 +64,11 @@ Other important options:
 
 - `--simplification-tolerance-factor` — simplification tolerance as a multiple
   of each level resolution; default `1`.
-- `--row-group-size` — maximum rows per Parquet row group; default `10000`.
+- `--row-group-size` — target number of point-equivalent resolution-grid cells
+  per Parquet row group; default `10000`. A point consumes one cell. For each
+  line or polygon level, the row limit is derived by dividing this budget by
+  the mean bbox occupancy on that level's resolution grid. The value is
+  therefore also the row limit for point data.
 - `--row-group-max-bytes` — approximate maximum uncompressed bytes of the
   largest usable overview representation in a row group; default 4 MiB.
 - `--input-units auto|degrees|meters` — coordinate-unit handling. `auto`
