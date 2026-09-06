@@ -216,7 +216,10 @@ Every key in `cogp.overviews.lods` MUST name exactly one `<lod>` child, and
 every `<lod>` child MUST have corresponding metadata. `geometry_type` uses the
 base OGC WKB type codes: `1` Point, `2` LineString, `3` Polygon, `4`
 MultiPoint, `5` MultiLineString, and `6` MultiPolygon. GeometryCollection is
-not permitted.
+not permitted. A row's `geometry_type` MUST describe every non-null LoD in
+that row. In particular, a producer whose polygon repair can split a Polygon
+at some resolutions MUST encode all of that row's polygon LoDs as MultiPolygon;
+an unsplit Polygon is represented as a one-member MultiPolygon in those LoDs.
 
 `x` and `y` are parallel flattened coordinate arrays and MUST have equal
 lengths. A coordinate is decoded using the LoD metadata:

@@ -1429,6 +1429,7 @@ fn gather_chunk(
             raw_geometry.as_ref(),
             layout.feature_level,
             layout.overview_plan,
+            &chunk[seg_start..seg_end],
         )?));
         let seg_bboxes: Vec<Bbox> = chunk[seg_start..seg_end]
             .iter()
@@ -1490,7 +1491,11 @@ fn build_overviews_array(
     array: &dyn Array,
     feature_level: usize,
     plan: &[OverviewPlan],
+    source_rows: &[u32],
 ) -> Result<StructArray> {
+    if source_rows.len() != array.len() {
+        bail!("internal: overview source-row mapping length mismatch");
+    }
     let bytes_at = |index: usize| -> Option<&[u8]> {
         if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
             (!values.is_null(index)).then(|| values.value(index))
@@ -1514,13 +1519,32 @@ fn build_overviews_array(
                     return Ok(None);
                 }
                 bytes_at(index)
-                    .map(|bytes| quantized_overview(bytes, overview.tolerance, overview.offset))
+                    .map(|bytes| {
+                        quantized_overview(bytes, overview.tolerance, overview.offset).with_context(
+                            || {
+                                format!(
+                                    "building {} overview for input row {} (feature level {})",
+                                    overview.id, source_rows[index], feature_level
+                                )
+                            },
+                        )
+                    })
                     .transpose()
             })
             .collect::<Result<_>>()?;
         for (geometry_type, value) in geometry_types.iter_mut().zip(&values) {
-            if geometry_type.is_none() {
-                *geometry_type = value.as_ref().map(|value| value.geometry_type);
+            let Some(value) = value else {
+                continue;
+            };
+            match *geometry_type {
+                Some(expected) if expected != value.geometry_type => {
+                    bail!(
+                        "overview geometry type changed across LoDs from {expected} to {}",
+                        value.geometry_type
+                    );
+                }
+                None => *geometry_type = Some(value.geometry_type),
+                Some(_) => {}
             }
         }
         lod_arrays.push(Arc::new(build_lod_array(&values)));

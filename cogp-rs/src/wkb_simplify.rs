@@ -3,9 +3,10 @@
 //! Every LoD is derived independently from primary WKB. Retained XY coordinates
 //! are snapped to a power-of-two grid no coarser than the tolerance, polygon
 //! rings retain closure and minimum cardinality, and invalid polygon results are
-//! cleaned after quantization. Z/M exist only in the lossless primary geometry;
-//! the overview contract intentionally emits XY alone. No shared-edge topology
-//! is promised across neighboring features.
+//! cleaned after quantization. Polygon-family overviews always use MultiPolygon
+//! so repair cannot change the shared type between LoDs. Z/M exist only in the
+//! lossless primary geometry; the overview contract intentionally emits XY
+//! alone. No shared-edge topology is promised across neighboring features.
 
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -79,15 +80,20 @@ pub fn quantized_overview(
     offset: [f64; 2],
 ) -> Result<QuantizedOverview> {
     validate_tolerance(tolerance)?;
-    let source = parse_complete_geometry(bytes)?;
+    let mut source = parse_complete_geometry(bytes)?;
+    strip_to_xy(&mut source);
+    let scale = quantization_grid(tolerance);
     let geometry = match build_overview(&source, tolerance) {
         OverviewOutcome::Built(geometry) => geometry,
-        // The finest overview must remain usable without reading primary WKB.
-        // Preserve the source shape when simplification cannot safely produce
-        // one; integer quantization is still applied below.
-        OverviewOutcome::NotViable | OverviewOutcome::PreserveSource => source,
+        // A feature can reach the finest level without being viable at that
+        // level (for example, a sub-pixel polygon). Its required overview must
+        // still be independently renderable without falling back to WKB.
+        OverviewOutcome::NotViable | OverviewOutcome::PreserveSource => {
+            rendering_fallback(&source, scale).ok_or_else(|| {
+                anyhow::anyhow!("geometry cannot be represented as a valid rendering overview")
+            })?
+        }
     };
-    let scale = quantization_grid(tolerance);
     flatten_quantized(&geometry, scale, offset)
 }
 
@@ -100,8 +106,13 @@ fn flatten_quantized(
     if !(1..=6).contains(&kind) {
         bail!("GeometryCollection is not supported in COGP overviews");
     }
+    // Polygon repair can split a ring at one grid size but not another. Since
+    // geometry_type is shared by every LoD, encode the entire polygon family
+    // as MultiPolygon (with one member when unsplit) so its interpretation can
+    // never vary between levels.
+    let overview_kind = if kind == 3 { 6 } else { kind };
     let mut overview = QuantizedOverview {
-        geometry_type: kind as i8,
+        geometry_type: overview_kind as i8,
         x: Vec::new(),
         y: Vec::new(),
         part_ends: Vec::new(),
@@ -151,6 +162,9 @@ fn flatten_quantized(
                 push_coordinates(&mut overview, ring, scale, offset)?;
                 overview.part_ends.push(i32::try_from(overview.x.len())?);
             }
+            overview
+                .polygon_ends
+                .push(i32::try_from(overview.part_ends.len())?);
         }
         (4, Body::Collection(points)) => {
             for point in points {
@@ -195,7 +209,8 @@ pub fn first_viable_level(bytes: &[u8], tolerances: &[f64]) -> Result<usize> {
     if tolerances.is_empty() {
         bail!("simplification profile requires at least one tolerance");
     }
-    let geometry = parse_complete_geometry(bytes)?;
+    let mut geometry = parse_complete_geometry(bytes)?;
+    strip_to_xy(&mut geometry);
     for (level, tolerance) in tolerances.iter().enumerate() {
         validate_tolerance(*tolerance)?;
         if matches!(
@@ -230,6 +245,23 @@ fn parse_complete_geometry(bytes: &[u8]) -> Result<Geometry> {
     Ok(geometry)
 }
 
+/// Rendering overviews deliberately omit Z and M. Removing them before
+/// simplification also lets polygon repair operate on exactly the XY topology
+/// that browsers will receive, instead of validating a different dimensional
+/// representation and discarding the extra ordinates afterward.
+fn strip_to_xy(geometry: &mut Geometry) {
+    fn strip_coordinate(coordinate: &mut Coordinate) {
+        coordinate.0.truncate(2);
+    }
+
+    match &mut geometry.body {
+        Body::Point(point) => strip_coordinate(point),
+        Body::LineString(points) => points.iter_mut().for_each(strip_coordinate),
+        Body::Polygon(rings) => rings.iter_mut().flatten().for_each(strip_coordinate),
+        Body::Collection(children) => children.iter_mut().for_each(strip_to_xy),
+    }
+}
+
 /// Build one overview using only the source geometry and requested tolerance.
 /// Keeping viability and materialization behind this interface prevents them
 /// from disagreeing about post-quantization polygon collapse.
@@ -260,9 +292,12 @@ fn build_geometry(source: &Geometry, tolerance2: f64, grid: f64) -> OverviewOutc
     }
 
     // Retrying with smaller distance tolerances retains more source vertices
-    // without changing the output grid. The first failed viability check still
-    // defers the feature; retries are only for post-quantization cleaning loss.
+    // without changing the output grid. Prefer a valid simplified ring over
+    // repairing a self-intersection after the fact: an even-odd repair can
+    // legitimately discard a lobe and make the rendered shape look broken.
+    // The first failed simplification viability check still defers the feature.
     const RETRY_TOLERANCE2_SCALES: [f64; 4] = [1.0, 0.25, 0.0625, 0.0];
+    let mut last_candidate = None;
     for (attempt, scale) in RETRY_TOLERANCE2_SCALES.into_iter().enumerate() {
         let mut candidate = source.clone();
         if !simplify_geometry(&mut candidate, tolerance2 * scale) {
@@ -272,14 +307,22 @@ fn build_geometry(source: &Geometry, tolerance2: f64, grid: f64) -> OverviewOutc
             continue;
         }
         quantize_geometry(&mut candidate, grid);
+        if rendering_geometry_is_valid(&candidate) {
+            return OverviewOutcome::Built(candidate);
+        }
+        last_candidate = Some(candidate);
+    }
+
+    // At zero simplification tolerance, any remaining defect was introduced
+    // by the fixed output grid (or was already present in the source). Repair
+    // only here, after retaining every source vertex that the grid can express.
+    if let Some(mut candidate) = last_candidate {
         let before_cleaning = candidate.clone();
         if clean_geometry(&mut candidate, grid) {
             return OverviewOutcome::Built(candidate);
         }
-        if attempt == 0 {
-            if let Some(revived) = revive_tiny_polygon(&before_cleaning, source, grid) {
-                return OverviewOutcome::Built(revived);
-            }
+        if let Some(revived) = revive_tiny_polygon(&before_cleaning, source, grid) {
+            return OverviewOutcome::Built(revived);
         }
     }
     OverviewOutcome::PreserveSource
@@ -303,7 +346,12 @@ fn flatten_multipolygon_children(children: Vec<Geometry>) -> Vec<Geometry> {
 /// rectangle. Restrict that approximation to truly tiny XY polygons so a
 /// cleaning defect can never turn a substantial feature into a placeholder.
 fn revive_tiny_polygon(candidate: &Geometry, source: &Geometry, grid: f64) -> Option<Geometry> {
-    const MAX_AREA_IN_GRID_CELLS: f64 = 4.0;
+    // Up to 8×8 output cells is still a small rendering symbol at the target
+    // LoD. Administrative datasets contain thin rings whose signed source area
+    // is several cells even though every lobe collapses onto the same grid
+    // lines; rejecting those polygons makes an otherwise valid file impossible
+    // to render or even produce.
+    const MAX_AREA_IN_GRID_CELLS: f64 = 64.0;
 
     let (Body::Polygon(candidate_rings), Body::Polygon(source_rings)) =
         (&candidate.body, &source.body)
@@ -414,6 +462,87 @@ fn quantize_coordinate(coordinate: &mut Coordinate, grid: f64) {
     }
 }
 
+/// Preserve as much source shape as the target grid permits when ordinary
+/// simplification cannot produce a viable required overview. Topology is still
+/// cleaned after snapping, and sub-grid lines/polygons receive a one-cell
+/// rendering surrogate rather than an empty or invalid coordinate sequence.
+fn rendering_fallback(source: &Geometry, grid: f64) -> Option<Geometry> {
+    if let Body::Collection(source_children) = &source.body {
+        let mut children = source_children
+            .iter()
+            .filter_map(|child| rendering_fallback(child, grid))
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            return None;
+        }
+        if geometry_kind(source.raw_type) == 6 {
+            children = flatten_multipolygon_children(children);
+        }
+        let mut fallback = source.clone();
+        fallback.body = Body::Collection(children);
+        return Some(fallback);
+    }
+
+    let mut fallback = source.clone();
+    quantize_geometry(&mut fallback, grid);
+    if clean_geometry(&mut fallback, grid) {
+        return Some(fallback);
+    }
+
+    match &source.body {
+        Body::LineString(_) => revive_short_line(source, grid),
+        Body::Polygon(_) => revive_tiny_polygon(&fallback, source, grid),
+        Body::Point(_) | Body::Collection(_) => None,
+    }
+}
+
+fn revive_short_line(source: &Geometry, grid: f64) -> Option<Geometry> {
+    let Body::LineString(points) = &source.body else {
+        return None;
+    };
+    if points.len() < 2 || line_length(points) == 0.0 {
+        return None;
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for point in points {
+        if point.0.len() < 2 || !point.0[0].is_finite() || !point.0[1].is_finite() {
+            return None;
+        }
+        min_x = min_x.min(point.0[0]);
+        min_y = min_y.min(point.0[1]);
+        max_x = max_x.max(point.0[0]);
+        max_y = max_y.max(point.0[1]);
+    }
+
+    let center_x = ((min_x + max_x) * 0.5 / grid).round();
+    let center_y = ((min_y + max_y) * 0.5 / grid).round();
+    let (end_x, end_y) = if max_x - min_x >= max_y - min_y {
+        (center_x + 1.0, center_y)
+    } else {
+        (center_x, center_y + 1.0)
+    };
+    let coordinate =
+        |x: f64, y: f64| Coordinate(vec![canonical_zero(x * grid), canonical_zero(y * grid)]);
+    let mut revived = source.clone();
+    revived.body = Body::LineString(vec![
+        coordinate(center_x, center_y),
+        coordinate(end_x, end_y),
+    ]);
+    Some(revived)
+}
+
+fn canonical_zero(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
 fn simplify_geometry(geometry: &mut Geometry, tolerance2: f64) -> bool {
     match &mut geometry.body {
         Body::Point(_) => true,
@@ -515,7 +644,38 @@ fn clean_geometry(geometry: &mut Geometry, grid: f64) -> bool {
             }
             true
         }
-        Body::Point(_) | Body::LineString(_) => true,
+        Body::LineString(points) => {
+            points.dedup_by(|right, left| same_xy(left, right));
+            points.len() >= 2 && line_length(points) > 0.0
+        }
+        Body::Point(_) => true,
+    }
+}
+
+fn rendering_geometry_is_valid(geometry: &Geometry) -> bool {
+    match &geometry.body {
+        Body::Point(point) => {
+            point.0.len() >= 2 && point.0[0].is_finite() && point.0[1].is_finite()
+        }
+        Body::LineString(points) => {
+            points.len() >= 2
+                && points
+                    .iter()
+                    .all(|point| point.0.len() >= 2 && point.0[..2].iter().all(|v| v.is_finite()))
+                && line_length(points) > 0.0
+        }
+        Body::Polygon(rings) => {
+            !rings.is_empty()
+                && rings.iter().all(|ring| {
+                    ring.len() >= 4
+                        && same_xy(&ring[0], ring.last().expect("ring is non-empty"))
+                        && signed_area2(&ring[..ring.len() - 1]) != 0.0
+                })
+                && polygon_xy(rings).is_valid()
+        }
+        Body::Collection(children) => {
+            !children.is_empty() && children.iter().all(rendering_geometry_is_valid)
+        }
     }
 }
 
@@ -986,6 +1146,28 @@ mod tests {
     }
 
     #[test]
+    fn finest_overview_revives_a_sub_grid_line() {
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 2, 1);
+        put_u32(&mut wkb, 2, 1);
+        for (x, y) in [(0.0, 0.0), (0.25, 0.0)] {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+        }
+
+        let overview = quantized_overview(&wkb, 1.0, [0.0, 0.0]).unwrap();
+        assert_eq!(overview.geometry_type, 2);
+        assert_eq!(overview.x.len(), 2);
+        assert!(overview
+            .x
+            .iter()
+            .zip(&overview.y)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
     fn polygon_ring_remains_closed_and_has_minimum_vertices() {
         let coordinates = [
             (0.04, 0.04),
@@ -1051,6 +1233,10 @@ mod tests {
         let mut offset = 0;
         let parsed = parse_geometry(&simplified, &mut offset).unwrap();
         assert_valid_polygonal_geometry(&parsed);
+        assert_eq!(geometry_kind(parsed.raw_type), 3);
+
+        let overview = quantized_overview(&wkb, 5.0, [0.0, 0.0]).unwrap();
+        assert_valid_quantized_multipolygon(&overview);
     }
 
     #[test]
@@ -1092,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_polygon_collapsed_by_quantization_is_revived_as_a_grid_cell() {
+    fn quantization_retry_keeps_a_tiny_polygon_visible() {
         let coordinates = [
             (0.0, 0.0),
             (1.0, 0.49),
@@ -1116,10 +1302,62 @@ mod tests {
         let Body::Polygon(rings) = parsed.body else {
             panic!("expected polygon")
         };
-        assert_eq!(rings[0].len(), 5);
-        assert_eq!(signed_area2(&rings[0]).abs() / 2.0, 1.0);
+        assert!(rings[0].len() >= 4);
+        assert!(signed_area2(&rings[0]).abs() > 0.0);
         assert_ne!(simplified, wkb);
         assert_eq!(first_viable_level(&wkb, &[1.0, 0.1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn polygon_type_and_topology_are_stable_across_overview_levels() {
+        let coordinates = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)];
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 3, 1);
+        put_u32(&mut wkb, 1, 1);
+        put_u32(&mut wkb, coordinates.len() as u32, 1);
+        for (x, y) in coordinates {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+        }
+
+        // The coarse level needs a one-cell fallback while the fine level can
+        // retain the source polygon. Both must use the shared MultiPolygon
+        // interpretation expected by the browser decoder.
+        let coarse = quantized_overview(&wkb, 10.0, [0.0, 0.0]).unwrap();
+        let fine = quantized_overview(&wkb, 0.1, [0.0, 0.0]).unwrap();
+        assert_valid_quantized_multipolygon(&coarse);
+        assert_valid_quantized_multipolygon(&fine);
+        assert_eq!(coarse.geometry_type, fine.geometry_type);
+    }
+
+    #[test]
+    fn invalid_thin_polygon_still_has_a_rendering_overview() {
+        let coordinates = [
+            (141.050830337, 45.3),
+            (141.050767613, 45.300359973),
+            (141.051285305, 45.301426333),
+            (141.05255808, 45.301483694),
+            (141.052563087, 45.301543441),
+            (141.05055153, 45.301463667),
+            (141.05055345, 45.301396721),
+            (141.051186667, 45.301422775),
+            (141.050676978, 45.300365919),
+            (141.050741388, 45.3),
+            (141.051271855, 45.296986108),
+            (141.051354112, 45.296994387),
+            (141.050830337, 45.3),
+        ];
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 3, 1);
+        put_u32(&mut wkb, 1, 1);
+        put_u32(&mut wkb, coordinates.len() as u32, 1);
+        for (x, y) in coordinates {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+        }
+
+        let overview = quantized_overview(&wkb, 38.22 / 111_320.0, [141.0, 45.0]).unwrap();
+        assert_valid_quantized_multipolygon(&overview);
     }
 
     fn assert_valid_polygonal_geometry(geometry: &Geometry) {
@@ -1133,6 +1371,36 @@ mod tests {
             }
             _ => panic!("expected polygonal geometry"),
         }
+    }
+
+    fn assert_valid_quantized_multipolygon(overview: &QuantizedOverview) {
+        assert_eq!(overview.geometry_type, 6);
+        assert_eq!(overview.x.len(), overview.y.len());
+        assert!(!overview.polygon_ends.is_empty());
+
+        let mut coordinate_start = 0;
+        let mut ring_start = 0;
+        for &polygon_end in &overview.polygon_ends {
+            let polygon_end = polygon_end as usize;
+            assert!(polygon_end > ring_start && polygon_end <= overview.part_ends.len());
+            let mut rings = Vec::new();
+            for &part_end in &overview.part_ends[ring_start..polygon_end] {
+                let part_end = part_end as usize;
+                assert!(part_end > coordinate_start && part_end <= overview.x.len());
+                rings.push(
+                    overview.x[coordinate_start..part_end]
+                        .iter()
+                        .zip(&overview.y[coordinate_start..part_end])
+                        .map(|(&x, &y)| Coordinate(vec![x as f64, y as f64]))
+                        .collect(),
+                );
+                coordinate_start = part_end;
+            }
+            assert!(polygon_xy(&rings).is_valid());
+            ring_start = polygon_end;
+        }
+        assert_eq!(coordinate_start, overview.x.len());
+        assert_eq!(ring_start, overview.part_ends.len());
     }
 
     #[test]
