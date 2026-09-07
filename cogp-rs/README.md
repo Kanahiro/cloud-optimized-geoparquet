@@ -142,9 +142,8 @@ Reader selectors include:
 - `row_groups_up_to_resolution(target_resolution)`
 - `lod_for_resolution(target_resolution)`
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])`
-- `row_selection_intersecting_bbox(row_groups, [xmin, ymin, xmax, ymax])`
 - `sync_batch_reader_with_bbox(reader, row_groups, bbox)`
-- `async_batch_stream_with_bbox(reader, row_groups, bbox)` (feature `async`)
+- `async_batch_stream_with_bbox(reader, row_groups, bbox).await` (feature `async`)
 
 ## `validate`
 

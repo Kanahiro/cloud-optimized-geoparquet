@@ -36,6 +36,8 @@ export type BboxInput = Bbox | readonly [number, number, number, number];
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
+  /** Additional HTTP options. Browser caching is always forced to `no-store`. */
+  requestInit?: Omit<RequestInit, 'cache'>;
   /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
   rangeCoalescing?: RangeCoalescingOptions | false;
   /** In-memory byte-range cache for this reader; enabled by default. */
@@ -70,7 +72,10 @@ export class CogpReader {
   static async open(url: string, opts: OpenOptions = {}): Promise<CogpReader> {
     // Browser HTTP caches handle many 206 responses poorly. Bypass them and
     // keep reuse deterministic in the per-reader range cache below.
-    const fetchOpts: Record<string, unknown> = { url, requestInit: { cache: 'no-store' } };
+    const fetchOpts: Record<string, unknown> = {
+      url,
+      requestInit: { ...opts.requestInit, cache: 'no-store' } satisfies RequestInit,
+    };
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });

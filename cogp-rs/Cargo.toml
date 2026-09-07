@@ -25,6 +25,7 @@ byteorder = "1"
 geo = "0.33"
 i_overlay = "4.5.2"
 rayon = "1"
+thrift = { version = "0.17", default-features = false }
 
 [features]
 default = []

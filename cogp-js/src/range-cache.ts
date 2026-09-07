@@ -1,25 +1,27 @@
 import type { AsyncBufferLike } from './coalescing-buffer.js';
 
 export interface RangeCacheOptions {
-  /** Maximum bytes retained by this reader. Defaults to 64 MiB. */
+  /** Maximum compressed bytes retained by one reader. Defaults to 64 MiB. */
   maxBytes?: number;
 }
 
 interface CacheEntry {
-  readonly bytes: number;
-  readonly promise: Promise<ArrayBuffer>;
+  start: number;
+  end: number;
+  bytes: number;
   settled: boolean;
+  promise: Promise<ArrayBuffer>;
 }
 
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 
 /**
- * Cache successful byte-range reads for the lifetime of one AsyncBuffer.
+ * Cache successful byte ranges for the lifetime of one AsyncBuffer.
  *
- * Promise values are cached as well as completed values, so duplicate reads
- * share an in-flight request. Entries use LRU eviction once they settle; an
- * in-flight entry is never evicted because doing so could duplicate network
- * work at the point where the browser is already busiest.
+ * Entries are containment-aware: a cached range can satisfy any smaller
+ * slice inside it. Promise values are inserted immediately so duplicate
+ * in-flight reads share the same request. Settled entries follow LRU order;
+ * in-flight entries may temporarily exceed the budget but are never evicted.
  */
 export function rangeCachedAsyncBuffer(
   source: AsyncBufferLike,
@@ -30,16 +32,44 @@ export function rangeCachedAsyncBuffer(
     throw new Error(`maxBytes must be a non-negative safe integer, got ${maxBytes}`);
   }
 
-  const entries = new Map<string, CacheEntry>();
+  // Set insertion order is the LRU list: hits are removed and re-added.
+  const entries = new Set<CacheEntry>();
   let cachedBytes = 0;
 
-  const evictSettledEntries = (): void => {
+  const remove = (entry: CacheEntry): void => {
+    if (!entries.delete(entry)) return;
+    cachedBytes -= entry.bytes;
+  };
+
+  const touch = (entry: CacheEntry): void => {
+    entries.delete(entry);
+    entries.add(entry);
+  };
+
+  const evict = (): void => {
     if (cachedBytes <= maxBytes) return;
-    for (const [key, entry] of entries) {
+    for (const entry of entries.values()) {
       if (!entry.settled) continue;
-      entries.delete(key);
-      cachedBytes -= entry.bytes;
+      remove(entry);
       if (cachedBytes <= maxBytes) return;
+    }
+  };
+
+  const findContainer = (start: number, end: number): CacheEntry | undefined => {
+    let best: CacheEntry | undefined;
+    for (const entry of entries.values()) {
+      if (entry.start > start || end > entry.end) continue;
+      if (!best || entry.bytes < best.bytes) best = entry;
+    }
+    if (best) touch(best);
+    return best;
+  };
+
+  const fetchWithoutCaching = (start: number, end: number): Promise<ArrayBuffer> => {
+    try {
+      return Promise.resolve(source.slice(start, end));
+    } catch (error) {
+      return Promise.reject(error);
     }
   };
 
@@ -56,45 +86,55 @@ export function rangeCachedAsyncBuffer(
       }
       if (start === end) return Promise.resolve(new ArrayBuffer(0));
 
-      const bytes = end - start;
-      if (maxBytes === 0 || bytes > maxBytes) return Promise.resolve(source.slice(start, end));
-
-      const key = `${start},${end}`;
-      const cached = entries.get(key);
-      if (cached) {
-        // Map insertion order doubles as the LRU list.
-        entries.delete(key);
-        entries.set(key, cached);
-        return cached.promise;
+      const container = findContainer(start, end);
+      if (container) {
+        return container.promise.then(buffer =>
+          buffer.slice(start - container.start, end - container.start),
+        );
       }
 
-      const entry: CacheEntry = {
-        bytes,
-        settled: false,
-        promise: Promise.resolve(source.slice(start, end)),
-      };
-      entries.set(key, entry);
-      cachedBytes += bytes;
+      const bytes = end - start;
+      if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end);
 
-      void entry.promise.then(
-        buffer => {
-          entry.settled = true;
-          if (buffer.byteLength < bytes) {
-            entries.delete(key);
-            cachedBytes -= bytes;
-            return;
+      let fetched: Promise<ArrayBuffer>;
+      try {
+        fetched = Promise.resolve(source.slice(start, end));
+      } catch (error) {
+        return Promise.reject(error);
+      }
+
+      let entry!: CacheEntry;
+      const promise = fetched.then(buffer => {
+        if (buffer.byteLength < bytes) {
+          throw new Error(
+            `source returned ${buffer.byteLength} bytes for [${start}, ${end}), expected ${bytes}`,
+          );
+        }
+        entry.settled = true;
+        // A newly completed superset makes older contained entries redundant.
+        for (const other of entries.values()) {
+          if (
+            other !== entry &&
+            other.settled &&
+            start <= other.start &&
+            other.end <= end
+          ) {
+            remove(other);
           }
-          evictSettledEntries();
-        },
-        () => {
-          // Failed reads must be retryable.
-          if (entries.get(key) === entry) {
-            entries.delete(key);
-            cachedBytes -= bytes;
-          }
-        },
-      );
-      return entry.promise;
+        }
+        evict();
+        return buffer.byteLength === bytes ? buffer : buffer.slice(0, bytes);
+      }).catch(error => {
+        remove(entry);
+        throw error;
+      });
+      entry = { start, end, bytes, settled: false, promise };
+      entries.add(entry);
+      cachedBytes += bytes;
+      evict();
+
+      // Never expose the cached ArrayBuffer itself to mutable callers.
+      return promise.then(buffer => buffer.slice(0));
     },
   };
 }

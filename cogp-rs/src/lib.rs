@@ -1,5 +1,6 @@
 pub mod convert;
 pub mod meta;
+mod page_index;
 #[cfg(feature = "async")]
 mod range_coalescing;
 pub mod reader;

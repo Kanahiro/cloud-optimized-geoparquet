@@ -22,11 +22,9 @@
 //! [`geozero`](https://crates.io/crates/geozero) — see the README.
 use anyhow::{anyhow, bail, Context, Result};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+    ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::page_index::index::Index;
 use parquet::file::reader::ChunkReader;
 use parquet::file::statistics::Statistics;
 use std::fs::File;
@@ -73,8 +71,7 @@ impl Reader {
     /// The reader is consumed for the footer read; it is **not** stored — pass
     /// a fresh reader to [`Self::sync_batch_reader`] per request.
     pub fn try_new<R: ChunkReader + 'static>(reader: R) -> Result<Self> {
-        let options = ArrowReaderOptions::new().with_page_index(true);
-        let arrow_meta = ArrowReaderMetadata::load(&reader, options)?;
+        let arrow_meta = ArrowReaderMetadata::load(&reader, Default::default())?;
         Self::from_arrow_metadata(arrow_meta)
     }
 
@@ -85,8 +82,7 @@ impl Reader {
     /// stream consumes the reader by value.
     #[cfg(feature = "async")]
     pub async fn try_new_async<R: AsyncFileReader>(reader: &mut R) -> Result<Self> {
-        let options = ArrowReaderOptions::new().with_page_index(true);
-        let arrow_meta = ArrowReaderMetadata::load_async(reader, options).await?;
+        let arrow_meta = ArrowReaderMetadata::load_async(reader, Default::default()).await?;
         Self::from_arrow_metadata(arrow_meta)
     }
 
@@ -282,78 +278,6 @@ impl Reader {
         out
     }
 
-    /// Build a conservative page-level row selection for a bbox query.
-    ///
-    /// The four covering predicates are evaluated against bbox page min/max
-    /// indexes. Pages that provably cannot intersect are excluded; missing or
-    /// malformed indexes are retained so this optimization cannot introduce
-    /// false negatives. Callers must still apply an exact per-feature filter.
-    pub fn row_selection_intersecting_bbox(
-        &self,
-        row_groups: &[usize],
-        bbox: [f64; 4],
-    ) -> RowSelection {
-        let metadata = self.arrow_meta.metadata();
-        let total_rows = row_groups
-            .iter()
-            .filter_map(|&rg| metadata.row_groups().get(rg))
-            .map(|rg| rg.num_rows() as usize)
-            .sum();
-        let mut keep = vec![true; total_rows];
-
-        let Some((xmin_i, ymin_i, xmax_i, ymax_i)) = self.bbox_column_indexes() else {
-            return selection_from_bitmap(&keep);
-        };
-        let (Some(column_indexes), Some(offset_indexes)) =
-            (metadata.column_index(), metadata.offset_index())
-        else {
-            return selection_from_bitmap(&keep);
-        };
-
-        let [qxmin, qymin, qxmax, qymax] = bbox;
-        let mut base = 0;
-        for &rg_i in row_groups {
-            let Some(rg) = metadata.row_groups().get(rg_i) else {
-                continue;
-            };
-            let rows = rg.num_rows() as usize;
-            let Some(rg_columns) = column_indexes.get(rg_i) else {
-                base += rows;
-                continue;
-            };
-            let Some(rg_offsets) = offset_indexes.get(rg_i) else {
-                base += rows;
-                continue;
-            };
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(xmin_i),
-                rg_offsets.get(xmin_i),
-                |min, _| min > qxmax,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(ymin_i),
-                rg_offsets.get(ymin_i),
-                |min, _| min > qymax,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(xmax_i),
-                rg_offsets.get(xmax_i),
-                |_, max| max < qxmin,
-            );
-            prune_double_pages(
-                &mut keep[base..base + rows],
-                rg_columns.get(ymax_i),
-                rg_offsets.get(ymax_i),
-                |_, max| max < qymin,
-            );
-            base += rows;
-        }
-        selection_from_bitmap(&keep)
-    }
-
     /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
     /// reusing the cached footer metadata (no second footer parse).
     pub fn sync_batch_reader<R: ChunkReader + 'static>(
@@ -366,7 +290,12 @@ impl Reader {
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
 
-    /// Build a sync reader with row-group and page-level bbox pruning.
+    /// Build a sync reader with Row Group and Page-level bbox pruning.
+    ///
+    /// PageIndexes are fetched lazily for the four covering bbox leaves of the
+    /// Row Groups that survive footer-level pruning. Files without PageIndexes
+    /// fall back to reading those complete Row Groups. The result remains a
+    /// conservative candidate set, so callers must apply an exact row filter.
     pub fn sync_batch_reader_with_bbox<R: ChunkReader + 'static>(
         &self,
         reader: R,
@@ -374,13 +303,24 @@ impl Reader {
         bbox: [f64; 4],
     ) -> Result<ParquetRecordBatchReader> {
         let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let selection = self.row_selection_intersecting_bbox(&row_groups, bbox);
+        let selection = match self.bbox_column_indexes() {
+            Some(columns) => crate::page_index::read_sync(
+                &reader,
+                self.arrow_meta.metadata(),
+                &row_groups,
+                columns,
+                bbox,
+            )?,
+            None => None,
+        };
         let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        Ok(builder
-            .with_row_groups(row_groups)
-            .with_row_selection(selection)
-            .build()?)
+            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone())
+                .with_row_groups(row_groups);
+        let builder = match selection {
+            Some(selection) => builder.with_row_selection(selection),
+            None => builder,
+        };
+        Ok(builder.build()?)
     }
 
     /// Build an async [`ParquetRecordBatchStream`] against a fresh
@@ -399,25 +339,43 @@ impl Reader {
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
 
-    /// Build an async stream with row-group and page-level bbox pruning.
+    /// Build an async stream with Row Group and Page-level bbox pruning.
+    ///
+    /// Only the bbox PageIndexes for candidate Row Groups are requested. The
+    /// reader's vectored-range implementation controls concurrency and range
+    /// coalescing. Missing indexes conservatively fall back to complete groups.
     #[cfg(feature = "async")]
-    pub fn async_batch_stream_with_bbox<R: AsyncFileReader + Send + 'static>(
+    pub async fn async_batch_stream_with_bbox<R: AsyncFileReader + Send + 'static>(
         &self,
-        reader: R,
+        mut reader: R,
         row_groups: &[usize],
         bbox: [f64; 4],
     ) -> Result<ParquetRecordBatchStream<R>> {
         let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
-        let selection = self.row_selection_intersecting_bbox(&row_groups, bbox);
+        let selection = match self.bbox_column_indexes() {
+            Some(columns) => {
+                crate::page_index::read_async(
+                    &mut reader,
+                    self.arrow_meta.metadata(),
+                    &row_groups,
+                    columns,
+                    bbox,
+                )
+                .await?
+            }
+            None => None,
+        };
         let builder =
-            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        Ok(builder
-            .with_row_groups(row_groups)
-            .with_row_selection(selection)
-            .build()?)
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone())
+                .with_row_groups(row_groups);
+        let builder = match selection {
+            Some(selection) => builder.with_row_selection(selection),
+            None => builder,
+        };
+        Ok(builder.build()?)
     }
 
-    fn bbox_column_indexes(&self) -> Option<(usize, usize, usize, usize)> {
+    fn bbox_column_indexes(&self) -> Option<[usize; 4]> {
         let covering = self
             .geo_meta
             .columns
@@ -429,12 +387,12 @@ impl Reader {
             let dotted = path.join(".");
             (0..schema.num_columns()).find(|&i| schema.column(i).path().string() == dotted)
         };
-        Some((
+        Some([
             find(&covering.bbox.xmin)?,
             find(&covering.bbox.ymin)?,
             find(&covering.bbox.xmax)?,
             find(&covering.bbox.ymax)?,
-        ))
+        ])
     }
 
     fn bbox_candidate_row_groups(&self, row_groups: &[usize], bbox: [f64; 4]) -> Vec<usize> {
@@ -445,60 +403,6 @@ impl Reader {
             .filter(|rg| candidates.binary_search(rg).is_ok())
             .collect()
     }
-}
-
-fn prune_double_pages(
-    keep: &mut [bool],
-    index: Option<&Index>,
-    offsets: Option<&parquet::file::page_index::offset_index::OffsetIndexMetaData>,
-    misses: impl Fn(f64, f64) -> bool,
-) {
-    let (Some(Index::DOUBLE(index)), Some(offsets)) = (index, offsets) else {
-        return;
-    };
-    let locations = offsets.page_locations();
-    for (page_i, stats) in index.indexes.iter().enumerate() {
-        let (Some(min), Some(max), Some(location)) = (
-            stats.min().copied(),
-            stats.max().copied(),
-            locations.get(page_i),
-        ) else {
-            continue;
-        };
-        if !misses(min, max) {
-            continue;
-        }
-        let Ok(start) = usize::try_from(location.first_row_index) else {
-            continue;
-        };
-        let end = locations
-            .get(page_i + 1)
-            .and_then(|page| usize::try_from(page.first_row_index).ok())
-            .unwrap_or(keep.len())
-            .min(keep.len());
-        if start <= end && start < keep.len() {
-            keep[start..end].fill(false);
-        }
-    }
-}
-
-fn selection_from_bitmap(keep: &[bool]) -> RowSelection {
-    let mut selectors = Vec::new();
-    let mut start = 0;
-    while start < keep.len() {
-        let selected = keep[start];
-        let mut end = start + 1;
-        while end < keep.len() && keep[end] == selected {
-            end += 1;
-        }
-        selectors.push(if selected {
-            RowSelector::select(end - start)
-        } else {
-            RowSelector::skip(end - start)
-        });
-        start = end;
-    }
-    RowSelection::from(selectors)
 }
 
 fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)> {
