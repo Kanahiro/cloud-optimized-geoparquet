@@ -1,6 +1,7 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
 import { compressors } from 'hyparquet-compressors';
 import { DEFAULT_PARSERS } from 'hyparquet/src/convert.js';
+import { prefetchPageIndexes } from 'hyparquet/src/plan.js';
 import { wkbToGeojson } from 'hyparquet/src/wkb.js';
 
 import {
@@ -18,6 +19,7 @@ import {
 } from './coalescing-buffer.js';
 import { selectLevelByGsd } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
+import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
@@ -25,19 +27,35 @@ interface FullFileMetadata extends FileMetadataLike {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
 }
 
+type PageIndexPlan = Awaited<ReturnType<typeof prefetchPageIndexes>>;
+
 export type BboxInput = Bbox | readonly [number, number, number, number];
 
 export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
+  /** Additional HTTP options. Browser caching is always forced to `no-store`. */
+  requestInit?: Omit<RequestInit, 'cache'>;
   /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
   rangeCoalescing?: RangeCoalescingOptions | false;
+  /** In-memory compressed range cache; enabled with a 64 MiB limit by default. */
+  rangeCache?: RangeCacheOptions | false;
 }
 
-// Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
+// Cap on cumulative `num_rows` packed into a single decode batch. A batch
 // is read by one `parquetReadObjects` call that materializes every row in
-// the run as one array, so peak in-flight memory scales with this value.
-const RUN_MAX_ROWS = 50_000;
+// the batch as one array, so peak in-flight memory scales with this value.
+const DECODE_BATCH_MAX_ROWS = 50_000;
+
+// PageIndex planning is I/O-bound and much lighter than decoding. Looking
+// ahead across several RowGroups removes per-group round trips while keeping
+// speculative index reads bounded when maxRows stops a broad query early.
+const PAGE_INDEX_WINDOW_MAX_GROUPS = 16;
+
+// Bbox reads have already been narrowed to selected pages, so a small amount
+// of decode concurrency is safe and lets ranges from adjacent RowGroups share
+// an HTTP batch. Full-file reads remain serial to avoid multiplying memory use.
+const BBOX_DECODE_CONCURRENCY = 4;
 
 // Custom parsers handed to hyparquet so it returns raw WKB bytes for
 // GEOMETRY/GEOGRAPHY columns instead of eagerly building nested-array
@@ -73,7 +91,7 @@ export interface ReadOptions {
    * provided the value reflects rows actually returned to the caller, not
    * the pre-filter row-group size. The check fires per surviving row, so
    * the returned count never exceeds `maxRows`. Already-dispatched row
-   * group fetches (runs coalesced upstream) still complete, but later runs
+   * batch fetches already dispatched upstream still complete, but later batches
    * are skipped entirely.
    */
   maxRows?: number;
@@ -97,10 +115,14 @@ export class CogpReader {
     const fetchOpts: Record<string, unknown> = { url };
     if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
+    fetchOpts['requestInit'] = { ...opts.requestInit, cache: 'no-store' } satisfies RequestInit;
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });
-    const file = opts.rangeCoalescing === false
+    const coalesced = opts.rangeCoalescing === false
       ? source
       : coalescingAsyncBuffer(source, opts.rangeCoalescing);
+    const file = opts.rangeCache === false
+      ? coalesced
+      : rangeCachedAsyncBuffer(coalesced, opts.rangeCache);
     return CogpReader.fromAsyncBuffer(file, url);
   }
 
@@ -249,7 +271,7 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns)) {
+    for await (const batch of this.streamBatches(rgs, columns, bbox)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -304,51 +326,98 @@ export class CogpReader {
   }
 
   /**
-   * Materialize consecutive row-group runs in order. Each run is capped at
-   * `RUN_MAX_ROWS`, bounding peak memory while allowing hyparquet to combine
-   * adjacent column-chunk reads. Byte-range reuse is delegated to the HTTP
-   * cache instead of retaining decoded row objects in the JS heap.
+   * Plan PageIndexes in bounded I/O windows, then materialize consecutive
+   * RowGroups in separately bounded decode batches. Keeping those boundaries
+   * independent avoids turning the memory limit into an HTTP round-trip limit.
    */
-  private async *streamRuns(
+  private async *streamBatches(
     rgIndices: number[],
     columns: string[] | undefined,
+    bbox?: Bbox,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
-    for (const run of this.coalescedRuns(rgIndices)) {
-      const startRg = run[0]!;
-      const endRg = run[run.length - 1]!;
-      const rowStart = this.rowOffsets[startRg]!;
-      const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
-      const readArgs: Record<string, unknown> = {
-        file: this.file,
-        metadata: this.metadata,
-        rowStart,
-        rowEnd,
-        compressors,
-        parsers: LAZY_GEO_PARSERS,
-      };
-      if (columns) readArgs['columns'] = columns;
-      yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+    // Keep the four spatial predicates together: hyparquet uses this one
+    // expression for PageIndex pruning and exact row filtering. PageIndexes
+    // are fetched lazily only for bbox reads and only for candidate row groups.
+    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    const indexWindows: number[][] = [];
+    if (bbox) {
+      for (let i = 0; i < rgIndices.length; i += PAGE_INDEX_WINDOW_MAX_GROUPS) {
+        indexWindows.push(rgIndices.slice(i, i + PAGE_INDEX_WINDOW_MAX_GROUPS));
+      }
+    } else {
+      indexWindows.push(rgIndices);
+    }
+
+    for (const window of indexWindows) {
+      const pageIndexPlan = bbox
+        ? await this.prefetchPageIndexPlan(window, columns, bbox)
+        : undefined;
+      const batches = this.decodeBatches(window);
+      const concurrency = bbox ? BBOX_DECODE_CONCURRENCY : 1;
+      for (let i = 0; i < batches.length; i += concurrency) {
+        // Await a complete wave so every rejection is observed. This also
+        // prevents a fast batch from continuously running ahead of a slow one.
+        const wave = await Promise.all(
+          batches.slice(i, i + concurrency).map(batch =>
+            this.readBatch(batch, columns, filter, pageIndexPlan),
+          ),
+        );
+        for (const rows of wave) yield rows;
+      }
     }
   }
 
-  private coalescedRuns(indices: number[]): Array<number[]> {
-    const runs: Array<number[]> = [];
+  private async readBatch(
+    batch: number[],
+    columns: string[] | undefined,
+    filter: Record<string, unknown> | undefined,
+    pageIndexPlan: PageIndexPlan | undefined,
+  ): Promise<Record<string, unknown>[]> {
+    const startRg = batch[0]!;
+    const endRg = batch[batch.length - 1]!;
+    const rowStart = this.rowOffsets[startRg]!;
+    const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
+    const readArgs: Record<string, unknown> = {
+      file: this.file,
+      metadata: this.metadata,
+      rowStart,
+      rowEnd,
+      filter,
+      usePageIndex: false,
+      compressors,
+      parsers: LAZY_GEO_PARSERS,
+    };
+    if (pageIndexPlan) {
+      readArgs['pageRangesByGroup'] = pageIndexPlan.pageRangesByGroup;
+      readArgs['pageLocationsByGroup'] = pageIndexPlan.pageLocationsByGroup;
+    }
+    if (columns) readArgs['columns'] = columns;
+    if (!filter) delete readArgs['filter'];
+    return parquetReadObjects(readArgs as never) as Promise<Record<string, unknown>[]>;
+  }
+
+  private decodeBatches(indices: number[]): Array<number[]> {
+    const batches: Array<number[]> = [];
     let i = 0;
     while (i < indices.length) {
-      const run: number[] = [indices[i]!];
+      const batch: number[] = [indices[i]!];
       let acc = Number(this.metadata.row_groups[indices[i]!]?.num_rows ?? 0);
       let j = i + 1;
-      while (j < indices.length && indices[j]! === indices[j - 1]! + 1 && acc < RUN_MAX_ROWS) {
-        run.push(indices[j]!);
+      while (
+        j < indices.length &&
+        indices[j]! === indices[j - 1]! + 1 &&
+        acc < DECODE_BATCH_MAX_ROWS
+      ) {
+        batch.push(indices[j]!);
         acc += Number(this.metadata.row_groups[indices[j]!]?.num_rows ?? 0);
         j++;
       }
-      runs.push(run);
+      batches.push(batch);
       i = j;
     }
-    return runs;
+    return batches;
   }
 
   private sumRowsInRange(start: number, end: number): number {
@@ -359,6 +428,38 @@ export class CogpReader {
     return n;
   }
 
+  private async prefetchPageIndexPlan(
+    rgIndices: number[],
+    columns: string[] | undefined,
+    bbox: Bbox,
+  ): Promise<PageIndexPlan> {
+    const firstRg = rgIndices[0]!;
+    const lastRg = rgIndices[rgIndices.length - 1]!;
+    const rowStart = this.rowOffsets[firstRg]!;
+    const rowEnd = this.rowOffsets[lastRg]! +
+      Number(this.metadata.row_groups[lastRg]?.num_rows ?? 0);
+    return prefetchPageIndexes({
+      file: this.file,
+      metadata: this.metadata,
+      filter: bboxFilter(this.bboxPaths, bbox),
+      rowStart,
+      rowEnd,
+      columns,
+      parsers: LAZY_GEO_PARSERS,
+    } as never);
+  }
+
+}
+
+function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
+  return {
+    $and: [
+      { [paths.xmin.join('.')]: { $lte: bbox.maxX } },
+      { [paths.ymin.join('.')]: { $lte: bbox.maxY } },
+      { [paths.xmax.join('.')]: { $gte: bbox.minX } },
+      { [paths.ymax.join('.')]: { $gte: bbox.minY } },
+    ],
+  };
 }
 
 function normalizeBbox(input?: BboxInput): Bbox | undefined {

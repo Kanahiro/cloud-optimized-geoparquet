@@ -4,10 +4,12 @@ export interface AsyncBufferLike {
 }
 
 export interface RangeCoalescingOptions {
-  /** Maximum unrequested gap included to eliminate one range request. */
+  /** Maximum single unrequested gap included in a merged request. */
   maxGapBytes?: number;
-  /** Maximum merged bytes / uniquely requested bytes; must be at least 1. */
-  maxOverfetchRatio?: number;
+  /** Maximum cumulative unrequested bytes included in one merged request. */
+  maxExtraBytes?: number;
+  /** Maximum byte length of a merged request. Individual source reads may be larger. */
+  maxRequestBytes?: number;
 }
 
 interface PendingSlice {
@@ -20,12 +22,13 @@ interface PendingSlice {
 interface SliceRun {
   start: number;
   end: number;
-  requestedBytes: number;
+  extraBytes: number;
   slices: PendingSlice[];
 }
 
-const DEFAULT_MAX_GAP_BYTES = 128 * 1024;
-const DEFAULT_MAX_OVERFETCH_RATIO = 1.25;
+const DEFAULT_MAX_GAP_BYTES = 32 * 1024;
+const DEFAULT_MAX_EXTRA_BYTES = 128 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 
 /**
  * Batch concurrent AsyncBuffer slices into nearby contiguous reads.
@@ -33,21 +36,21 @@ const DEFAULT_MAX_OVERFETCH_RATIO = 1.25;
  * Parquet page pruning can issue one small slice per physical column and row
  * group. Waiting until the current microtask finishes exposes that batch
  * without adding a timer delay. Nearby slices are fetched as one ordinary HTTP
- * Range and split back into exact per-caller buffers. The gap limit makes the
- * request-count/extra-byte tradeoff explicit and bounded.
+ * Range and split back into exact per-caller buffers. Three absolute byte
+ * budgets bound the tradeoff: a single hole, all holes in one request, and
+ * the merged request itself. Absolute limits remain predictable for both tiny
+ * PageIndex reads and large data pages; a ratio does not.
  */
 export function coalescingAsyncBuffer(
   source: AsyncBufferLike,
   options: RangeCoalescingOptions = {},
 ): AsyncBufferLike {
   const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES;
-  const maxOverfetchRatio = options.maxOverfetchRatio ?? DEFAULT_MAX_OVERFETCH_RATIO;
-  if (!Number.isSafeInteger(maxGapBytes) || maxGapBytes < 0) {
-    throw new Error(`maxGapBytes must be a non-negative safe integer, got ${maxGapBytes}`);
-  }
-  if (!Number.isFinite(maxOverfetchRatio) || maxOverfetchRatio < 1) {
-    throw new Error(`maxOverfetchRatio must be a finite number >= 1, got ${maxOverfetchRatio}`);
-  }
+  const maxExtraBytes = options.maxExtraBytes ?? DEFAULT_MAX_EXTRA_BYTES;
+  const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
+  validateByteBudget('maxGapBytes', maxGapBytes, true);
+  validateByteBudget('maxExtraBytes', maxExtraBytes, true);
+  validateByteBudget('maxRequestBytes', maxRequestBytes, false);
 
   let pending: PendingSlice[] = [];
   let flushScheduled = false;
@@ -56,7 +59,7 @@ export function coalescingAsyncBuffer(
     flushScheduled = false;
     const batch = pending;
     pending = [];
-    const runs = makeRuns(batch, maxGapBytes, maxOverfetchRatio);
+    const runs = makeRuns(batch, maxGapBytes, maxExtraBytes, maxRequestBytes);
     for (const run of runs) void fetchRun(source, run);
   };
 
@@ -88,7 +91,8 @@ export function coalescingAsyncBuffer(
 function makeRuns(
   batch: PendingSlice[],
   maxGapBytes: number,
-  maxOverfetchRatio: number,
+  maxExtraBytes: number,
+  maxRequestBytes: number,
 ): SliceRun[] {
   const sorted = batch.sort((a, b) => a.start - b.start || a.end - b.end);
   const runs: SliceRun[] = [];
@@ -98,37 +102,44 @@ function makeRuns(
       runs.push({
         start: slice.start,
         end: slice.end,
-        requestedBytes: slice.end - slice.start,
+        extraBytes: 0,
         slices: [slice],
       });
       continue;
     }
 
-    const gap = slice.start - run.end;
+    const gap = Math.max(0, slice.start - run.end);
     const mergedEnd = Math.max(run.end, slice.end);
     const mergedSpan = mergedEnd - run.start;
-    const addedRequestedBytes = Math.max(0, slice.end - Math.max(slice.start, run.end));
-    const mergedRequestedBytes = run.requestedBytes + addedRequestedBytes;
-    const overfetchRatio = mergedSpan / mergedRequestedBytes;
+    const mergedExtraBytes = run.extraBytes + gap;
     // Overlapping ranges never add transfer bytes, so merge them even when an
     // individual request is already larger than either configured budget.
     if (
-      gap <= 0 ||
-      (gap <= maxGapBytes && overfetchRatio <= maxOverfetchRatio)
+      gap === 0 ||
+      (gap <= maxGapBytes &&
+        mergedExtraBytes <= maxExtraBytes &&
+        mergedSpan <= maxRequestBytes)
     ) {
       run.end = mergedEnd;
-      run.requestedBytes = mergedRequestedBytes;
+      run.extraBytes = mergedExtraBytes;
       run.slices.push(slice);
     } else {
       runs.push({
         start: slice.start,
         end: slice.end,
-        requestedBytes: slice.end - slice.start,
+        extraBytes: 0,
         slices: [slice],
       });
     }
   }
   return runs;
+}
+
+function validateByteBudget(name: string, value: number, allowZero: boolean): void {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
+    const requirement = allowZero ? 'a non-negative' : 'a positive';
+    throw new Error(`${name} must be ${requirement} safe integer, got ${value}`);
+  }
 }
 
 async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {

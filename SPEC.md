@@ -1,6 +1,6 @@
 ---
 title: Cloud Optimized GeoParquet Profile (COGP)
-version: "0.1.0"
+version: "0.1.1"
 status: Draft
 scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
 license: CC BY 4.0
@@ -86,7 +86,7 @@ This value is rendering-oriented. It does not guarantee positional accuracy, top
 
 ## 5. Requirements
 
-A COGP v0.1 file MUST satisfy the following requirements.
+A COGP v0.1.1 file MUST satisfy the following requirements.
 
 ### 5.1 GeoParquet compatibility
 
@@ -102,7 +102,7 @@ where `<primary_column>` is the value of the GeoParquet `primary_column` field.
 
 Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
 
-For COGP v0.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
+For COGP v0.1.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
 
 ### 5.2 Physical ordering
 
@@ -178,7 +178,7 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "levels": [
     {
       "row_group_end": 0,

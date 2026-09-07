@@ -48,9 +48,9 @@ https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
 ## Sample data
 
-- [pois.cogp.parquet](https://cogp-demo.spatialty.io/pois.cogp.parquet) (OpenStreetMap)
-- [segments.cogp.parquet](https://cogp-demo.spatialty.io/segments.cogp.parquet) (OvertureMaps)
-- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/buildings.cogp.parquet) (OvertureMaps)
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/buildings.cogp.parquet) (OvertureMaps)
 
 ## When COGP works well
 
@@ -101,7 +101,7 @@ A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://git
 
 ## Status and feedback
 
-COGP v0.1 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
+COGP v0.1.1 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
 
 ## License
 

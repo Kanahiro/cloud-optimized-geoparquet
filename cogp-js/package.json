@@ -1,6 +1,6 @@
 {
   "name": "cogp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cloud Optimized GeoParquet Profile (COGP) reader for the web.",
   "license": "MIT",
   "type": "module",

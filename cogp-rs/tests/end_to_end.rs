@@ -138,6 +138,8 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
+        page_row_count: Some(2),
+        dictionary_page_size_limit: None,
         row_group_max_bytes: None,
         input_units: InputUnits::Degrees,
         geometry_column: None,
@@ -183,19 +185,28 @@ fn convert_reader_validate_pipeline() {
         prev_gsd = Some(l.gsd);
     }
     let total_rgs = reader.num_row_groups();
-    assert_eq!(cogp.levels.last().unwrap().row_group_end as usize + 1, total_rgs);
+    assert_eq!(
+        cogp.levels.last().unwrap().row_group_end as usize + 1,
+        total_rgs
+    );
 
-    // The profile relies only on row-group statistics; the converter must not
-    // add page-level index structures to the output.
-    assert!(reader
-        .parquet_metadata()
-        .row_groups()
-        .iter()
-        .all(|row_group| {
-            row_group.columns().iter().all(|column| {
-                column.column_index_offset().is_none() && column.offset_index_offset().is_none()
+    // Page layout writes offset indexes for every projected leaf, while only
+    // the four bbox leaves need Page-level min/max column indexes.
+    for row_group in reader.parquet_metadata().row_groups() {
+        assert!(row_group
+            .columns()
+            .iter()
+            .all(|column| column.offset_index_offset().is_some()));
+        let bbox_indexes = row_group
+            .columns()
+            .iter()
+            .filter(|column| {
+                column.column_path().parts().first().map(String::as_str) == Some("bbox")
+                    && column.column_index_offset().is_some()
             })
-        }));
+            .count();
+        assert_eq!(bbox_indexes, 4);
+    }
 
     // Selector contracts.
     assert!(reader.row_groups_in_level(reader.levels().len()).is_none());
@@ -280,6 +291,18 @@ fn convert_rejects_zero_thinning_factor() {
     assert!(format!("{err}").contains("point-thinning-factor"));
 }
 
+#[test]
+fn convert_rejects_zero_dictionary_page_size_limit() {
+    let tmp = TempDir::new("zerodictionarypage");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("out.parquet");
+    write_input(&input);
+    let mut args = convert_args(&input, &output);
+    args.dictionary_page_size_limit = Some(0);
+    let err = cogp::convert::run(args).unwrap_err();
+    assert!(format!("{err}").contains("dictionary-page-size-limit"));
+}
+
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead
 /// of recomputing per-feature bboxes from WKB. The reuse path also drops
 /// the original column from the output.
@@ -297,11 +320,7 @@ fn convert_reuses_existing_bbox_column() {
     ]);
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new(
-            "bbox",
-            DataType::Struct(bbox_struct_fields.clone()),
-            false,
-        ),
+        Field::new("bbox", DataType::Struct(bbox_struct_fields.clone()), false),
         Field::new("geometry", DataType::Binary, false),
     ]));
 
@@ -346,8 +365,7 @@ fn convert_reuses_existing_bbox_column() {
     let geom_arr: ArrayRef = Arc::new(BinaryArray::from(
         geoms.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
     ));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![id_arr, bbox_arr, geom_arr]).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, bbox_arr, geom_arr]).unwrap();
 
     let mut cols = BTreeMap::new();
     cols.insert(
@@ -386,9 +404,8 @@ fn convert_reuses_existing_bbox_column() {
     cogp::convert::run(convert_args(&input, &output)).unwrap();
     cogp::validate::run(&output).unwrap();
 
-    // Output must still have exactly one `bbox` column (the writer's own) —
-    // the input one was dropped and the new one was inserted. The id column
-    // must survive intact.
+    // Output must still have exactly one `bbox` column (the writer's own), at
+    // the same top-level position and with the same logical field types.
     let reader = Reader::open(&output).unwrap();
     let rgs: Vec<usize> = (0..reader.num_row_groups()).collect();
     let f = File::open(&output).unwrap();
@@ -398,6 +415,14 @@ fn convert_reuses_existing_bbox_column() {
         .map(|b| b.unwrap())
         .collect();
     let schema = batches[0].schema();
+    assert_eq!(
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "bbox", "geometry"]
+    );
     assert!(schema.field_with_name("id").is_ok());
     assert!(schema.field_with_name("bbox").is_ok());
     assert!(schema.field_with_name("geometry").is_ok());
