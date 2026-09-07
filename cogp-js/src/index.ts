@@ -5,6 +5,8 @@ export type {
   ReadOptions,
 } from './reader.js';
 export type { RangeCoalescingOptions } from './coalescing-buffer.js';
+export { rangeCachedAsyncBuffer } from './range-cache.js';
+export type { RangeCacheOptions } from './range-cache.js';
 
 export {
   COGP_METADATA_KEY,

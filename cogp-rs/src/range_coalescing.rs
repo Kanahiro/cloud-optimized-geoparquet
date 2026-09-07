@@ -2,7 +2,7 @@
 //!
 //! `object_store` coalesces vectored reads with a fixed one-megabyte gap. This
 //! adapter deliberately calls the wrapped reader's single-range operation so
-//! that its two explicit budgets are the only coalescing policy applied.
+//! that its three explicit byte budgets are the only coalescing policy applied.
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -15,25 +15,29 @@ use parquet::file::metadata::ParquetMetaData;
 use std::ops::Range;
 use std::sync::Arc;
 
-const DEFAULT_MAX_GAP_BYTES: u64 = 128 * 1024;
-const DEFAULT_MAX_OVERFETCH_RATIO: f64 = 1.25;
+const DEFAULT_MAX_GAP_BYTES: u64 = 32 * 1024;
+const DEFAULT_MAX_EXTRA_BYTES: u64 = 128 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PARALLEL_REQUESTS: usize = 10;
 
 /// Controls when adjacent byte ranges are fetched as one request.
 ///
-/// A merge must satisfy both limits. Overlapping ranges are always combined
-/// because doing so introduces no extra transfer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A merge must satisfy the maximum single gap, cumulative extra bytes, and
+/// merged request size. Overlapping ranges are always combined because doing
+/// so introduces no extra transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RangeCoalescingOptions {
     max_gap_bytes: u64,
-    max_overfetch_ratio: f64,
+    max_extra_bytes: u64,
+    max_request_bytes: u64,
 }
 
 impl Default for RangeCoalescingOptions {
     fn default() -> Self {
         Self {
             max_gap_bytes: DEFAULT_MAX_GAP_BYTES,
-            max_overfetch_ratio: DEFAULT_MAX_OVERFETCH_RATIO,
+            max_extra_bytes: DEFAULT_MAX_EXTRA_BYTES,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 }
@@ -44,8 +48,13 @@ impl RangeCoalescingOptions {
         self
     }
 
-    pub fn with_max_overfetch_ratio(mut self, ratio: f64) -> Self {
-        self.max_overfetch_ratio = ratio;
+    pub fn with_max_extra_bytes(mut self, bytes: u64) -> Self {
+        self.max_extra_bytes = bytes;
+        self
+    }
+
+    pub fn with_max_request_bytes(mut self, bytes: u64) -> Self {
+        self.max_request_bytes = bytes;
         self
     }
 
@@ -53,16 +62,17 @@ impl RangeCoalescingOptions {
         self.max_gap_bytes
     }
 
-    pub fn max_overfetch_ratio(&self) -> f64 {
-        self.max_overfetch_ratio
+    pub fn max_extra_bytes(&self) -> u64 {
+        self.max_extra_bytes
+    }
+
+    pub fn max_request_bytes(&self) -> u64 {
+        self.max_request_bytes
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.max_overfetch_ratio.is_finite() || self.max_overfetch_ratio < 1.0 {
-            bail!(
-                "max_overfetch_ratio must be a finite number >= 1, got {}",
-                self.max_overfetch_ratio
-            );
+        if self.max_request_bytes == 0 {
+            bail!("max_request_bytes must be positive");
         }
         Ok(())
     }
@@ -153,7 +163,7 @@ where
 #[derive(Debug)]
 struct Run {
     range: Range<u64>,
-    requested_bytes: u64,
+    extra_bytes: u64,
 }
 
 fn make_merged_ranges(
@@ -170,29 +180,32 @@ fn make_merged_ranges(
     let mut runs: Vec<Run> = Vec::new();
     for range in sorted {
         let Some(run) = runs.last_mut() else {
-            let requested_bytes = range.end - range.start;
             runs.push(Run {
                 range,
-                requested_bytes,
+                extra_bytes: 0,
             });
             continue;
         };
 
         let gap = range.start.saturating_sub(run.range.end);
         let merged_end = run.range.end.max(range.end);
-        let added_requested = range.end.saturating_sub(range.start.max(run.range.end));
-        let requested_bytes = run.requested_bytes + added_requested;
         let merged_span = merged_end - run.range.start;
-        let ratio = merged_span as f64 / requested_bytes as f64;
         let overlaps = range.start <= run.range.end;
+        let merged_extra = run.extra_bytes.checked_add(gap);
 
-        if overlaps || (gap <= options.max_gap_bytes && ratio <= options.max_overfetch_ratio) {
+        if overlaps
+            || (gap <= options.max_gap_bytes
+                && merged_extra.is_some_and(|extra| extra <= options.max_extra_bytes)
+                && merged_span <= options.max_request_bytes)
+        {
             run.range.end = merged_end;
-            run.requested_bytes = requested_bytes;
+            if let Some(extra) = merged_extra {
+                run.extra_bytes = extra;
+            }
         } else {
             runs.push(Run {
-                requested_bytes: range.end - range.start,
                 range,
+                extra_bytes: 0,
             });
         }
     }
@@ -235,18 +248,28 @@ fn slice_merged_range(
 mod tests {
     use super::*;
 
-    fn options(gap: u64, ratio: f64) -> RangeCoalescingOptions {
+    fn options(gap: u64, extra: u64, request: u64) -> RangeCoalescingOptions {
         RangeCoalescingOptions::default()
             .with_max_gap_bytes(gap)
-            .with_max_overfetch_ratio(ratio)
+            .with_max_extra_bytes(extra)
+            .with_max_request_bytes(request)
     }
 
     #[test]
-    fn merges_only_within_both_budgets() {
+    fn merges_only_within_all_budgets() {
         let ranges = vec![0..10, 15..25, 31..41, 200..210];
         assert_eq!(
-            make_merged_ranges(&ranges, options(100, 1.25)).unwrap(),
+            make_merged_ranges(&ranges, options(100, 5, 100)).unwrap(),
             vec![0..25, 31..41, 200..210]
+        );
+    }
+
+    #[test]
+    fn caps_merged_request_size() {
+        let ranges = vec![0..10, 15..25];
+        assert_eq!(
+            make_merged_ranges(&ranges, options(8, 100, 20)).unwrap(),
+            ranges
         );
     }
 
@@ -254,16 +277,16 @@ mod tests {
     fn overlapping_ranges_always_merge() {
         let ranges = vec![20..40, 10..30, 25..26];
         assert_eq!(
-            make_merged_ranges(&ranges, options(0, 1.0)).unwrap(),
+            make_merged_ranges(&ranges, options(0, 0, 1)).unwrap(),
             vec![10..40]
         );
     }
 
     #[test]
-    fn rejects_invalid_ratio() {
+    fn rejects_zero_max_request_bytes() {
         assert!(RangeCoalescingReader::try_new(
             (),
-            RangeCoalescingOptions::default().with_max_overfetch_ratio(0.9)
+            RangeCoalescingOptions::default().with_max_request_bytes(0)
         )
         .is_err());
     }
