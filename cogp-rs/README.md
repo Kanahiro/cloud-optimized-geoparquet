@@ -77,8 +77,16 @@ readable by any renderer regardless of which path you pick.
 
 Other options:
 
-- `--row-group-size` (default `10000`) — max Parquet row group size in rows.
+- `--row-group-size` (default `65536`) — max Parquet row group size in rows.
+- `--page-row-count` — enables PageIndex layout with at most this many
+  top-level rows per data page. The converter spatially packs page intervals
+  within each row group and writes Page-level statistics for the four `bbox`
+  leaves. If omitted, the legacy row-group-only layout is retained.
   Row group boundaries always align with level boundaries.
+- `--dictionary-page-size-limit` — best-effort byte limit for dictionary pages.
+  Smaller limits bound the compulsory dictionary read when a sparse PageIndex
+  query projects a high-cardinality column. Low-cardinality dictionaries remain
+  smaller than the limit naturally. If omitted, Parquet's 1 MiB default is used.
 - `--row-group-max-bytes` — max estimated encoded Parquet row group size in
   bytes. This must be a numeric byte count, without suffixes. It is enforced
   using the Parquet writer's in-progress encoded-size estimate, checked at batch
@@ -172,10 +180,14 @@ let by_bbox = reader.row_groups_intersecting_bbox([139.0, 35.0, 140.0, 36.0]);
 let by_level = reader.row_groups_up_to_level(8);
 let rgs: Vec<usize> = by_bbox.into_iter().filter(|i| by_level.contains(i)).collect();
 
-// Per request: discard row groups whose bbox misses the query.
-// Test each returned feature bbox for an exact filter.
+// Per request: prune Row Groups, then lazily read bbox PageIndexes and skip
+// non-intersecting Pages. Test each returned feature bbox for an exact filter.
 let file = File::open("data.cogp.parquet")?;
-let batches = reader.sync_batch_reader(file, &rgs)?;
+let batches = reader.sync_batch_reader_with_bbox(
+    file,
+    &rgs,
+    [139.0, 35.0, 140.0, 36.0],
+)?;
 
 for batch in batches {
     let batch = batch?;
@@ -237,10 +249,17 @@ let rgs: Vec<usize> = {
 let per_request_reader = RangeCoalescingReader::try_new(
     ParquetObjectReader::new(store.clone(), path.clone()).with_file_size(head.size),
     RangeCoalescingOptions::default()
-        .with_max_gap_bytes(128 * 1024)
-        .with_max_overfetch_ratio(1.25),
+        .with_max_gap_bytes(16 * 1024)
+        .with_max_extra_bytes(64 * 1024)
+        .with_max_request_bytes(2 * 1024 * 1024),
 )?;
-let mut stream = reader.async_batch_stream(per_request_reader, &rgs)?;
+let mut stream = reader
+    .async_batch_stream_with_bbox(
+        per_request_reader,
+        &rgs,
+        [139.0, 35.0, 140.0, 36.0],
+    )
+    .await?;
 
 while let Some(batch) = stream.next().await {
     let _batch = batch?;
@@ -264,10 +283,11 @@ Construction (parses and caches the footer):
 Remote range coalescing (`feature = "async"):
 
 - `RangeCoalescingReader::new(reader)` — wrap a cloneable `AsyncFileReader`
-  using the defaults: a 128 KiB maximum gap and 1.25 maximum overfetch ratio.
+  using the defaults: a 32 KiB maximum gap, 128 KiB cumulative extra bytes,
+  and a 2 MiB maximum merged request.
 - `RangeCoalescingReader::try_new(reader, options)` — configure
-  `max_gap_bytes` and `max_overfetch_ratio`. Both constraints must permit a
-  merge; overlapping ranges always merge. This adapter bypasses
+  `max_gap_bytes`, `max_extra_bytes`, and `max_request_bytes`. All constraints
+  must permit a merge; overlapping ranges always merge. This adapter bypasses
   `object_store`'s fixed one-megabyte `get_ranges` coalescing policy.
 
 Selectors (`&self`, no IO — they only consult the cached footer):
@@ -283,8 +303,16 @@ Selectors (`&self`, no IO — they only consult the cached footer):
 Per-request reads (hand in a fresh sync / async reader; footer is reused):
 
 - `sync_batch_reader(reader, &row_groups)` — `ParquetRecordBatchReader`.
+- `sync_batch_reader_with_bbox(reader, &row_groups, bbox)` — lazily fetches
+  bbox PageIndexes and applies a conservative Page-level `RowSelection`.
 - `async_batch_stream(reader, &row_groups)` — `ParquetRecordBatchStream`
   (`feature = "async"`).
+- `async_batch_stream_with_bbox(reader, &row_groups, bbox)` — asynchronous
+  PageIndex pruning (`feature = "async"`).
+
+The bbox methods fall back to complete candidate Row Groups when PageIndexes
+are absent. Page pruning is conservative; callers must still perform exact
+per-feature bbox intersection checks.
 
 ## validate
 

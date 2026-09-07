@@ -53,9 +53,20 @@ pub struct ConvertArgs {
     /// when --gsd is omitted. Same Web Mercator assumption as --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
-    /// Parquet row group size in rows.
-    #[arg(long, default_value_t = 10000)]
+    /// Maximum Parquet row group size in rows.
+    #[arg(long, default_value_t = 65_536)]
     pub row_group_size: usize,
+    /// Maximum top-level rows per Parquet data page. When set, the converter
+    /// writes PageIndexes for the bbox leaves and spatially packs each page
+    /// within its row group. Omit it to retain the legacy row-group-only layout.
+    #[arg(long)]
+    pub page_row_count: Option<usize>,
+    /// Best-effort maximum dictionary page size in bytes for dictionary-encoded
+    /// columns. Smaller values bound the compulsory dictionary read for sparse
+    /// PageIndex queries; low-cardinality dictionaries naturally remain smaller.
+    /// Omit this option to retain Parquet's 1 MiB default.
+    #[arg(long)]
+    pub dictionary_page_size_limit: Option<usize>,
     /// Maximum estimated encoded Parquet row group size in bytes
     #[arg(long)]
     pub row_group_max_bytes: Option<usize>,
@@ -315,6 +326,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
     }
+    if args.page_row_count == Some(0) {
+        bail!("--page-row-count must be >= 1");
+    }
+    if args.dictionary_page_size_limit == Some(0) {
+        bail!("--dictionary-page-size-limit must be >= 1");
+    }
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
         File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
@@ -463,6 +480,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
         str_pack(rows, &bboxes, args.row_group_size, level_idx);
+        if let Some(page_row_count) = args.page_row_count {
+            str_pack_pages(
+                rows,
+                &bboxes,
+                args.row_group_size,
+                page_row_count,
+                level_idx,
+            );
+        }
     }
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
@@ -473,18 +499,29 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .collect();
     let mut output_fields: Vec<Arc<Field>> = Vec::new();
     let mut keep_col_indices: Vec<usize> = Vec::new();
+    let mut bbox_output_idx: Option<usize> = None;
     for (i, f) in input_schema.fields().iter().enumerate() {
         if drop_names.contains(&f.name().as_str()) {
             eprintln!(
                 "      note: dropping input column `{}` (will be overwritten)",
                 f.name()
             );
+            // Reinsert the canonical bbox at the first replaced column so an
+            // existing conforming schema keeps its top-level field order.
+            if bbox_output_idx.is_none() {
+                bbox_output_idx = Some(output_fields.len());
+                output_fields.push(Arc::new(bbox_struct_field()));
+            }
             continue;
         }
         output_fields.push(f.clone());
         keep_col_indices.push(i);
     }
-    output_fields.push(Arc::new(bbox_struct_field()));
+    let bbox_output_idx = bbox_output_idx.unwrap_or_else(|| {
+        let idx = output_fields.len();
+        output_fields.push(Arc::new(bbox_struct_field()));
+        idx
+    });
     let output_schema = Arc::new(Schema::new(output_fields));
 
     let dataset_bbox = bboxes
@@ -504,11 +541,27 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_offset_index_disabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
+    if let Some(dictionary_page_size_limit) = args.dictionary_page_size_limit {
+        props_builder = props_builder.set_dictionary_page_size_limit(dictionary_page_size_limit);
+    }
     for child in ["xmin", "ymin", "xmax", "ymax"] {
         let path = ColumnPath::from(vec!["bbox".to_string(), child.to_string()]);
-        props_builder = props_builder.set_column_dictionary_enabled(path, false);
+        props_builder = props_builder.set_column_dictionary_enabled(path.clone(), false);
+        if args.page_row_count.is_some() {
+            props_builder =
+                props_builder.set_column_statistics_enabled(path, EnabledStatistics::Page);
+        }
+    }
+    if let Some(page_row_count) = args.page_row_count {
+        // Matching the write batch to the row limit lets the writer honor the
+        // boundary closely even for narrow columns. Offset indexes remain on
+        // for every leaf so a bbox PageIndex selection maps to projected data.
+        props_builder = props_builder
+            .set_data_page_row_count_limit(page_row_count)
+            .set_write_batch_size(page_row_count);
+    } else {
+        props_builder = props_builder.set_offset_index_disabled(true);
     }
     let props = props_builder.build();
     let out_file = File::create(&args.output)
@@ -529,6 +582,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_meta = arrow_meta.clone();
     let producer_input = args.input.clone();
     let producer_keep = keep_col_indices;
+    let producer_bbox_output_idx = bbox_output_idx;
     let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
     let producer = thread::spawn(move || -> Result<()> {
@@ -551,6 +605,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                         chunk,
                         &producer_bboxes,
                         &producer_schema,
+                        producer_bbox_output_idx,
                     )?;
                     Ok((*level_i, batches))
                 })
@@ -1057,6 +1112,7 @@ fn gather_chunk(
     chunk: &[u32],
     bboxes: &[Bbox],
     output_schema: &Arc<Schema>,
+    bbox_output_idx: usize,
 ) -> Result<Vec<RecordBatch>> {
     let mut sorted = chunk.to_vec();
     sorted.sort_unstable();
@@ -1123,15 +1179,22 @@ fn gather_chunk(
             seg_bytes += weights[seg_end];
             seg_end += 1;
         }
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + 1);
-        for refs in &col_refs {
-            cols.push(interleave(refs, &locs[seg_start..seg_end])?);
-        }
         let seg_bboxes: Vec<Bbox> = chunk[seg_start..seg_end]
             .iter()
             .map(|r| bboxes[*r as usize])
             .collect();
-        cols.push(Arc::new(build_bbox_struct(&seg_bboxes)?));
+        let bbox: ArrayRef = Arc::new(build_bbox_struct(&seg_bboxes)?);
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + 1);
+        let mut kept = col_refs.iter();
+        for output_idx in 0..=n_cols {
+            if output_idx == bbox_output_idx {
+                cols.push(bbox.clone());
+            } else {
+                let refs = kept.next().expect("output layout missing input column");
+                cols.push(interleave(refs, &locs[seg_start..seg_end])?);
+            }
+        }
+        debug_assert!(kept.next().is_none());
         out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
         seg_start = seg_end;
     }
@@ -1450,6 +1513,25 @@ fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_i
         row_group_size,
         dir,
     );
+}
+
+/// Preserve row-group membership while recursively packing each row group's
+/// page-sized intervals. Page indexes describe row intervals, so locality must
+/// hold at this nested physical unit rather than only at the row-group level.
+fn str_pack_pages(
+    rows: &mut [u32],
+    bboxes: &[Bbox],
+    row_group_size: usize,
+    page_row_count: usize,
+    level_idx: usize,
+) {
+    rows.chunks_mut(row_group_size)
+        .enumerate()
+        .for_each(|(row_group_idx, row_group)| {
+            let mut scratch = vec![(0.0, 0); row_group.len()];
+            let dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
+            str_pack_rec(row_group, &mut scratch, bboxes, page_row_count, dir);
+        });
 }
 
 fn str_pack_rec(

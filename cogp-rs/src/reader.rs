@@ -228,6 +228,39 @@ impl Reader {
         out
     }
 
+    /// Build a sync reader with Row Group and Page-level bbox pruning.
+    ///
+    /// PageIndexes are fetched lazily for the four covering bbox leaves of the
+    /// Row Groups that survive footer-level pruning. Files without PageIndexes
+    /// fall back to reading those complete Row Groups. The result remains a
+    /// conservative candidate set, so callers must apply an exact row filter.
+    pub fn sync_batch_reader_with_bbox<R: ChunkReader + 'static>(
+        &self,
+        reader: R,
+        row_groups: &[usize],
+        bbox: [f64; 4],
+    ) -> Result<ParquetRecordBatchReader> {
+        let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
+        let selection = match self.bbox_column_indexes() {
+            Some(columns) => crate::page_index::read_sync(
+                &reader,
+                self.arrow_meta.metadata(),
+                &row_groups,
+                columns,
+                bbox,
+            )?,
+            None => None,
+        };
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone())
+                .with_row_groups(row_groups);
+        let builder = match selection {
+            Some(selection) => builder.with_row_selection(selection),
+            None => builder,
+        };
+        Ok(builder.build()?)
+    }
+
     /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
     /// reusing the cached footer metadata (no second footer parse).
     pub fn sync_batch_reader<R: ChunkReader + 'static>(
@@ -254,6 +287,71 @@ impl Reader {
         let builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone());
         Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
+    }
+
+    /// Build an async stream with Row Group and Page-level bbox pruning.
+    ///
+    /// Only the bbox PageIndexes for candidate Row Groups are requested. The
+    /// reader's vectored-range implementation controls concurrency and range
+    /// coalescing. Missing indexes conservatively fall back to complete groups.
+    #[cfg(feature = "async")]
+    pub async fn async_batch_stream_with_bbox<R: AsyncFileReader + Send + 'static>(
+        &self,
+        mut reader: R,
+        row_groups: &[usize],
+        bbox: [f64; 4],
+    ) -> Result<ParquetRecordBatchStream<R>> {
+        let row_groups = self.bbox_candidate_row_groups(row_groups, bbox);
+        let selection = match self.bbox_column_indexes() {
+            Some(columns) => {
+                crate::page_index::read_async(
+                    &mut reader,
+                    self.arrow_meta.metadata(),
+                    &row_groups,
+                    columns,
+                    bbox,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.arrow_meta.clone())
+                .with_row_groups(row_groups);
+        let builder = match selection {
+            Some(selection) => builder.with_row_selection(selection),
+            None => builder,
+        };
+        Ok(builder.build()?)
+    }
+
+    fn bbox_column_indexes(&self) -> Option<[usize; 4]> {
+        let covering = self
+            .geo_meta
+            .columns
+            .get(&self.geo_meta.primary_column)?
+            .covering
+            .as_ref()?;
+        let schema = self.arrow_meta.metadata().file_metadata().schema_descr();
+        let find = |path: &[String]| {
+            let dotted = path.join(".");
+            (0..schema.num_columns()).find(|&i| schema.column(i).path().string() == dotted)
+        };
+        Some([
+            find(&covering.bbox.xmin)?,
+            find(&covering.bbox.ymin)?,
+            find(&covering.bbox.xmax)?,
+            find(&covering.bbox.ymax)?,
+        ])
+    }
+
+    fn bbox_candidate_row_groups(&self, row_groups: &[usize], bbox: [f64; 4]) -> Vec<usize> {
+        let candidates = self.row_groups_intersecting_bbox(bbox);
+        row_groups
+            .iter()
+            .copied()
+            .filter(|row_group| candidates.binary_search(row_group).is_ok())
+            .collect()
     }
 }
 
@@ -286,10 +384,42 @@ mod tests {
     use crate::meta::{
         BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, COGP_VERSION, GEOPARQUET_VERSION,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use std::collections::BTreeMap;
+
+    #[cfg(feature = "async")]
+    #[derive(Clone)]
+    struct TestAsyncReader {
+        data: bytes::Bytes,
+        metadata: Arc<ParquetMetaData>,
+    }
+
+    #[cfg(feature = "async")]
+    impl AsyncFileReader for TestAsyncReader {
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+            use futures::FutureExt;
+
+            let start = range.start as usize;
+            let end = range.end as usize;
+            futures::future::ready(Ok(self.data.slice(start..end))).boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a parquet::arrow::arrow_reader::ArrowReaderOptions>,
+        ) -> futures::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+            use futures::FutureExt;
+
+            futures::future::ready(Ok(self.metadata.clone())).boxed()
+        }
+    }
 
     fn level(row_group_end: i64, gsd: f64) -> Level {
         Level { row_group_end, gsd }
@@ -382,6 +512,135 @@ mod tests {
         assert_eq!(r.row_groups_up_to_gsd(500.0), 0..2);
         // target coarser than every level → empty
         assert!(r.row_groups_up_to_gsd(1e9).is_empty());
+    }
+
+    fn bbox_fixture(statistics: EnabledStatistics) -> bytes::Bytes {
+        let bbox_fields = Fields::from(vec![
+            Field::new("xmin", DataType::Float64, false),
+            Field::new("ymin", DataType::Float64, false),
+            Field::new("xmax", DataType::Float64, false),
+            Field::new("ymax", DataType::Float64, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "bbox",
+            DataType::Struct(bbox_fields.clone()),
+            false,
+        )]));
+        let values = vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0];
+        let bbox: ArrayRef = Arc::new(
+            StructArray::try_new(
+                bbox_fields,
+                vec![
+                    Arc::new(Float64Array::from(values.clone())),
+                    Arc::new(Float64Array::from(values.clone())),
+                    Arc::new(Float64Array::from(values.clone())),
+                    Arc::new(Float64Array::from(values)),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![bbox]).unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(statistics)
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .build();
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+            let mut columns = BTreeMap::new();
+            columns.insert(
+                "geometry".to_string(),
+                GeoColumn {
+                    encoding: "WKB".into(),
+                    geometry_types: vec![],
+                    covering: Some(Covering {
+                        bbox: BboxCovering {
+                            xmin: vec!["bbox".into(), "xmin".into()],
+                            ymin: vec!["bbox".into(), "ymin".into()],
+                            xmax: vec!["bbox".into(), "xmax".into()],
+                            ymax: vec!["bbox".into(), "ymax".into()],
+                        },
+                    }),
+                    bbox: None,
+                    crs: None,
+                },
+            );
+            let geo = GeoMeta {
+                version: GEOPARQUET_VERSION.into(),
+                primary_column: "geometry".into(),
+                columns,
+            };
+            let cogp = CogpMeta {
+                version: COGP_VERSION.into(),
+                levels: vec![level(0, 1.0)],
+            };
+            writer.append_key_value_metadata(KeyValue {
+                key: GEO_METADATA_KEY.into(),
+                value: Some(serde_json::to_string(&geo).unwrap()),
+            });
+            writer.append_key_value_metadata(KeyValue {
+                key: COGP_METADATA_KEY.into(),
+                value: Some(serde_json::to_string(&cogp).unwrap()),
+            });
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn bbox_batch_reader_lazily_prunes_pages() {
+        let bytes = bbox_fixture(EnabledStatistics::Page);
+        let reader = Reader::try_new(bytes.clone()).unwrap();
+        // Construction remains footer-only; indexes are fetched by the bbox
+        // read below rather than retained for unrelated future queries.
+        assert!(reader.parquet_metadata().column_index().is_none());
+        let rows = reader
+            .sync_batch_reader_with_bbox(bytes, &[0], [9.0, 9.0, 12.0, 12.0])
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 2);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn async_bbox_stream_lazily_prunes_pages() {
+        use futures::{executor::block_on, StreamExt};
+
+        let bytes = bbox_fixture(EnabledStatistics::Page);
+        let reader = Reader::try_new(bytes.clone()).unwrap();
+        let rows = block_on(async move {
+            let source = TestAsyncReader {
+                data: bytes,
+                metadata: reader.parquet_metadata().clone(),
+            };
+            let mut stream = reader
+                .async_batch_stream_with_bbox(source, &[0], [9.0, 9.0, 12.0, 12.0])
+                .await
+                .unwrap();
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+            rows
+        });
+        assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn bbox_batch_reader_falls_back_without_page_index() {
+        let bytes = bbox_fixture(EnabledStatistics::Chunk);
+        let reader = Reader::try_new(bytes.clone()).unwrap();
+        let rows = reader
+            .sync_batch_reader_with_bbox(bytes, &[0], [9.0, 9.0, 12.0, 12.0])
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 6);
     }
 
     /// Build a tiny parquet `bytes::Bytes` blob with the given KV metadata
