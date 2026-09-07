@@ -1,6 +1,6 @@
 [package]
 name = "cogp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Reference CLI for the Cloud Optimized GeoParquet Profile (COGP)"
 license = "MIT"

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 pub const COGP_METADATA_KEY: &str = "cogp";
 pub const GEO_METADATA_KEY: &str = "geo";
-pub const COGP_VERSION: &str = "0.1.0";
+pub const COGP_VERSION: &str = "0.1.1";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

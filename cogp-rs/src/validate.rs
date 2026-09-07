@@ -49,7 +49,7 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
     if !geo.version.starts_with("1.") {
-        warnings.push(format!("GeoParquet version is `{}`; COGP v0.1 targets 1.1.x", geo.version));
+        warnings.push(format!("GeoParquet version is `{}`; COGP v0.1.1 targets 1.1.x", geo.version));
     }
 
     let primary = geo.primary_column.clone();
@@ -196,7 +196,7 @@ pub fn run(path: &Path) -> Result<()> {
 
 fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     if errors.is_empty() {
-        println!("OK: {} conforms to COGP v0.1", path.display());
+        println!("OK: {} conforms to COGP v0.1.1", path.display());
     } else {
         println!("FAIL: {} ({} error(s))", path.display(), errors.len());
     }
