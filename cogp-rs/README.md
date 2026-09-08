@@ -65,7 +65,7 @@ Other important options:
 - `--simplification-tolerance-factor` — simplification tolerance as a multiple
   of each level resolution; default `1`.
 - `--row-group-size` — maximum number of rows per Parquet row group; default
-  `10000`. Level boundaries and `--row-group-max-bytes` may produce smaller
+  `65536`. Level boundaries and `--row-group-max-bytes` may produce smaller
   row groups, but geometry type and bbox size do not change this row limit.
 - `--row-group-max-bytes` — approximate maximum uncompressed render-geometry
   bytes in a row group: the largest usable overview for Line/Polygon or primary

@@ -22,7 +22,6 @@ import {
   type CogpMeta,
   extractCogpDocument,
   type GeoMeta,
-  geometryFamily,
 } from './meta.js';
 import {
   decodeQuantizedOverview,
@@ -69,8 +68,8 @@ export interface ReadOptions {
   columns?: string[];
   /**
    * Decode a zero-copy quantized overview into a caller-owned representation.
-   * The default materializes GeoJSON geometry. This hook is only used for
-   * Line/Polygon-family files; Point-family files read their primary WKB.
+   * The default materializes GeoJSON geometry. This hook is only used when the
+   * file declares overviews; otherwise the reader returns primary WKB.
    */
   overviewDecoder?: (overview: QuantizedOverviewGeometry | null) => unknown;
   /**
@@ -106,11 +105,10 @@ export class CogpReader {
       initialFetchSize: 8,
     })) as unknown as FullFileMetadata;
     const doc = extractCogpDocument(metadata.key_value_metadata);
-    const family = geometryFamily(doc.geo.columns[doc.geo.primary_column]!.geometry_types)!;
     const configuredRanges = opts.rangeCoalescing === false
       ? []
       : opts.rangeCoalescing?.protectedRanges ?? [];
-    const protectedRanges = family === 'point'
+    const protectedRanges = doc.cogp.overviews === undefined
       ? configuredRanges
       : [...configuredRanges, ...wkbColumnRanges(metadata, doc.geo)];
     const file = opts.rangeCoalescing === false
@@ -146,7 +144,7 @@ export class CogpReader {
   private readonly bboxPaths: BboxCovering;
   /** WKB columns excluded from overview-backed browser projections. */
   private readonly geomColumns: readonly string[];
-  /** Point-family files render their compact primary WKB and have no overviews. */
+  /** Whether rendering uses the overview column instead of primary WKB. */
   private readonly usesOverviews: boolean;
   /** Codec table is resolved once so every page read shares initialized decoders. */
   private readonly compressors: Compressors;
@@ -163,9 +161,7 @@ export class CogpReader {
     this.cogp = doc.cogp;
     this.geo = doc.geo;
     this.compressors = { ...defaultCompressors, ...compressors };
-    this.usesOverviews = geometryFamily(
-      this.geo.columns[this.geo.primary_column]!.geometry_types,
-    ) !== 'point';
+    this.usesOverviews = this.cogp.overviews !== undefined;
     const finalBoundary = this.cogp.levels[this.cogp.levels.length - 1]!.row_group_end;
     if (finalBoundary !== metadata.row_groups.length - 1) {
       throw new Error(
@@ -230,9 +226,9 @@ export class CogpReader {
 
   /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
-   * records. Line and Polygon geometry is decoded from the selected integer
-   * overview. Point-family files have no overviews and use primary WKB through
-   * hyparquet's normal GeoParquet decoding path.
+   * records. When the file declares overviews, geometry is decoded from the
+   * selected integer overview. Otherwise primary WKB is read through
+   * hyparquet's normal GeoParquet path.
    *
    * Row groups whose covering envelope misses the query are skipped entirely
    * (no I/O). Rows in the remaining groups are filtered exactly against each

@@ -62,7 +62,7 @@ pub struct ConvertArgs {
     pub webmerc_maxzoom: u32,
     /// Maximum number of rows per Parquet row group. Level boundaries and the
     /// render-geometry byte limit may produce smaller row groups.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 65_536)]
     pub row_group_size: usize,
     /// Maximum cumulative render-geometry bytes in a row group: the largest
     /// usable overview for Line/Polygon or primary WKB for Point.
