@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { decodeOverview, projectOverviewMetadata } from '../dist/overview.js';
+import { decodeOverview, parseOverview, projectOverviewMetadata } from '../dist/overview.js';
 
 test('decodes quantized multipolygon coordinates and topology', () => {
   const geometry = decodeOverview(
@@ -26,6 +26,48 @@ test('decodes quantized multipolygon coordinates and topology', () => {
       [10, 20],
     ]]],
   });
+});
+
+test('decodes typed overview arrays without changing topology', () => {
+  const geometry = decodeOverview(
+    {
+      geometry_type: 5,
+      l1: {
+        x: new Int32Array([0, 2, 4]),
+        y: new Int32Array([1, 3, 5]),
+        part_ends: new Int32Array([2, 3]),
+        polygon_ends: new Int32Array(0),
+      },
+    },
+    { scale: [0.5, 2], offset: [10, 20] },
+  );
+  assert.deepEqual(geometry, {
+    type: 'MultiLineString',
+    coordinates: [
+      [[10, 22], [11, 26]],
+      [[12, 30]],
+    ],
+  });
+});
+
+test('exposes a zero-copy quantized overview view for custom renderers', () => {
+  const x = new Int32Array([1, 2]);
+  const y = new Int32Array([3, 4]);
+  const partEnds = new Int32Array([2]);
+  const polygonEnds = new Int32Array(0);
+  const overview = parseOverview(
+    {
+      geometry_type: 5,
+      l1: { x, y, part_ends: partEnds, polygon_ends: polygonEnds },
+    },
+    { scale: [0.5, 2], offset: [10, 20] },
+  );
+  assert.equal(overview.x, x);
+  assert.equal(overview.y, y);
+  assert.equal(overview.partEnds, partEnds);
+  assert.equal(overview.polygonEnds, polygonEnds);
+  assert.deepEqual(overview.scale, [0.5, 2]);
+  assert.deepEqual(overview.offset, [10, 20]);
 });
 
 test('metadata projection removes sibling LoDs from range planning', () => {

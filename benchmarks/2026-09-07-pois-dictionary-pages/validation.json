@@ -1,0 +1,59 @@
+{
+  "checks": [
+    {
+      "check": "row counts and id fingerprints match within RG 32768",
+      "file": "pois10-rg32768-p512-dict32k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 32768",
+      "file": "pois10-rg32768-p512-dict64k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 32768",
+      "file": "pois10-rg32768-p512-dict128k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 32768",
+      "file": "pois10-rg32768-p512-dict256k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 32768",
+      "file": "pois10-rg32768-p512-dict1024k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 65536",
+      "file": "pois10-rg65536-p512-dict32k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 65536",
+      "file": "pois10-rg65536-p512-dict64k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 65536",
+      "file": "pois10-rg65536-p512-dict128k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 65536",
+      "file": "pois10-rg65536-p512-dict256k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "row counts and id fingerprints match within RG 65536",
+      "file": "pois10-rg65536-p512-dict1024k.parquet",
+      "mismatches": 0
+    },
+    {
+      "check": "full row counts, id fingerprints, and candidate RowGroups match",
+      "file": "pois-full-rg65536-p512-dict32k.parquet",
+      "mismatches": 0
+    }
+  ]
+}

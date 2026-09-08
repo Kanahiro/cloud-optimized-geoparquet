@@ -1,4 +1,4 @@
-import type { FeatureCollection } from 'geojson';
+export const MVT_LAYER_NAME = 'cogp';
 
 export interface MetadataSummary {
   primary_column: string;
@@ -23,20 +23,30 @@ export interface ViewportBbox {
   maxY: number;
 }
 
-export interface ViewportResult {
-  data: FeatureCollection;
-  status: string;
+export interface TileResult {
+  data: ArrayBuffer;
+  featureCount: number;
+  readMs: number;
+  encodeMs: number;
+  maxLevel: number;
 }
 
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readViewport'; url: string; bbox: ViewportBbox; targetResolution: number };
+  | { type: 'readTile'; url: string; z: number; x: number; y: number };
 
 export interface WorkerEnvelope {
   id: number;
   payload: WorkerRequest;
 }
 
+export interface WorkerCancel {
+  type: 'cancel';
+  id: number;
+}
+
+export type WorkerMessage = WorkerEnvelope | WorkerCancel;
+
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | ViewportResult }
+  | { id: number; ok: true; result: OpenResult | TileResult }
   | { id: number; ok: false; error: string };

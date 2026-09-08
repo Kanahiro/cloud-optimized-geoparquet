@@ -1,5 +1,6 @@
 import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
-import { compressors } from 'hyparquet-compressors';
+import type { Compressors } from 'hyparquet';
+import { compressors as defaultCompressors } from 'hyparquet-compressors';
 
 import {
   type Bbox,
@@ -16,11 +17,19 @@ import {
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
 import { selectLevelByResolution } from './level.js';
-import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 import {
-  decodeOverview,
+  type BboxCovering,
+  type CogpMeta,
+  extractCogpDocument,
+  type GeoMeta,
+  geometryFamily,
+} from './meta.js';
+import {
+  decodeQuantizedOverview,
+  parseOverview,
   projectOverviewMetadata,
   rootColumnNames,
+  type QuantizedOverviewGeometry,
   type OverviewFileMetadata,
 } from './overview.js';
 import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
@@ -42,6 +51,8 @@ export interface OpenOptions {
   rangeCoalescing?: RangeCoalescingOptions | false;
   /** In-memory byte-range cache for this reader; enabled by default. */
   rangeCache?: RangeCacheOptions | false;
+  /** Override individual Parquet compression codecs. */
+  compressors?: Compressors;
 }
 
 // Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
@@ -56,6 +67,12 @@ export interface ReadOptions {
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];
+  /**
+   * Decode a zero-copy quantized overview into a caller-owned representation.
+   * The default materializes GeoJSON geometry. This hook is only used for
+   * Line/Polygon-family files; Point-family files read their primary WKB.
+   */
+  overviewDecoder?: (overview: QuantizedOverviewGeometry | null) => unknown;
   /**
    * Output cap: stop streaming once this many rows have survived bbox
    * filtering. Applied to the post-filter row count, so when a `bbox` is
@@ -89,14 +106,17 @@ export class CogpReader {
       initialFetchSize: 8,
     })) as unknown as FullFileMetadata;
     const doc = extractCogpDocument(metadata.key_value_metadata);
+    const family = geometryFamily(doc.geo.columns[doc.geo.primary_column]!.geometry_types)!;
     const configuredRanges = opts.rangeCoalescing === false
       ? []
       : opts.rangeCoalescing?.protectedRanges ?? [];
-    const protectedRanges = [...configuredRanges, ...wkbColumnRanges(metadata, doc.geo)];
+    const protectedRanges = family === 'point'
+      ? configuredRanges
+      : [...configuredRanges, ...wkbColumnRanges(metadata, doc.geo)];
     const file = opts.rangeCoalescing === false
       ? cached
       : coalescingAsyncBuffer(cached, { ...opts.rangeCoalescing, protectedRanges });
-    return new CogpReader(file, metadata, url);
+    return new CogpReader(file, metadata, url, opts.compressors);
   }
 
   /**
@@ -108,11 +128,12 @@ export class CogpReader {
   static async fromAsyncBuffer(
     file: { byteLength: number; slice: (start: number, end?: number) => unknown },
     url: string,
+    opts: Pick<OpenOptions, 'compressors'> = {},
   ): Promise<CogpReader> {
     const metadata = (await parquetMetadataAsync(file as never, {
       initialFetchSize: 8,
     })) as unknown as FullFileMetadata;
-    return new CogpReader(file, metadata, url);
+    return new CogpReader(file, metadata, url, opts.compressors);
   }
 
   readonly cogp: CogpMeta;
@@ -123,17 +144,28 @@ export class CogpReader {
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
   private readonly bboxPaths: BboxCovering;
-  /** WKB columns are excluded from every browser projection and protected range plan. */
+  /** WKB columns excluded from overview-backed browser projections. */
   private readonly geomColumns: readonly string[];
+  /** Point-family files render their compact primary WKB and have no overviews. */
+  private readonly usesOverviews: boolean;
+  /** Codec table is resolved once so every page read shares initialized decoders. */
+  private readonly compressors: Compressors;
+  /** Two adjacent zoom levels cover normal pan/zoom without retaining every projection. */
+  private readonly overviewMetadataCache = new Map<string, FullFileMetadata>();
 
   private constructor(
     private readonly file: unknown,
     readonly metadata: FullFileMetadata,
     readonly url: string,
+    compressors?: Compressors,
   ) {
     const doc = extractCogpDocument(metadata.key_value_metadata);
     this.cogp = doc.cogp;
     this.geo = doc.geo;
+    this.compressors = { ...defaultCompressors, ...compressors };
+    this.usesOverviews = geometryFamily(
+      this.geo.columns[this.geo.primary_column]!.geometry_types,
+    ) !== 'point';
     const finalBoundary = this.cogp.levels[this.cogp.levels.length - 1]!.row_group_end;
     if (finalBoundary !== metadata.row_groups.length - 1) {
       throw new Error(
@@ -198,9 +230,9 @@ export class CogpReader {
 
   /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
-   * records. The geometry column carries a GeoJSON Geometry object decoded
-   * from the selected integer overview; decoding happens lazily after bbox
-   * filtering so rows that miss the query never pay for it.
+   * records. Line and Polygon geometry is decoded from the selected integer
+   * overview. Point-family files have no overviews and use primary WKB through
+   * hyparquet's normal GeoParquet decoding path.
    *
    * Row groups whose covering envelope misses the query are skipped entirely
    * (no I/O). Rows in the remaining groups are filtered exactly against each
@@ -210,8 +242,13 @@ export class CogpReader {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const level = this.levels[maxLevel];
     if (!level) throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
-    const lodMetadata = this.cogp.overviews.lods[level.lod]!;
-    const projectedMetadata = projectOverviewMetadata(this.metadata, level.lod);
+    const lod = level.lod;
+    const lodMetadata = this.usesOverviews
+      ? this.cogp.overviews!.lods[lod!]!
+      : undefined;
+    const projectedMetadata = this.usesOverviews
+      ? this.projectedMetadata(lod!)
+      : this.metadata;
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
@@ -222,14 +259,19 @@ export class CogpReader {
     const requested = opts.columns ?? rootColumnNames(this.metadata.schema);
     const wantsGeometry = opts.columns === undefined
       || opts.columns.includes(this.primaryGeometryColumn)
-      || opts.columns.includes('overviews');
+      || (this.usesOverviews && opts.columns.includes('overviews'));
     let columns = requested.filter(
-      (column) => !this.geomColumns.includes(column) && column !== 'overviews',
+      (column) => (!this.usesOverviews || !this.geomColumns.includes(column))
+        && column !== 'overviews',
     );
-    if (wantsGeometry) columns.push('overviews');
+    if (wantsGeometry && this.usesOverviews) columns.push('overviews');
+    let injectedBboxColumn: string | undefined;
     if (bbox && columns) {
       const top = this.bboxPaths.xmin[0]!;
-      if (!columns.includes(top)) columns = [...columns, top];
+      if (!columns.includes(top)) {
+        columns = [...columns, top];
+        injectedBboxColumn = top;
+      }
     }
     const out: Record<string, unknown>[] = [];
     const paths = bbox ? this.bboxPaths : null;
@@ -237,10 +279,14 @@ export class CogpReader {
     // iterating the current row group (and the outer stream) immediately
     // rather than draining the rest of the batch.
     const acceptRow = (row: Record<string, unknown>): boolean => {
-      if (wantsGeometry) {
-        row[this.primaryGeometryColumn] = decodeOverview(row['overviews'], lodMetadata);
+      if (wantsGeometry && lodMetadata) {
+        const overview = parseOverview(row['overviews'], lodMetadata);
+        row[this.primaryGeometryColumn] = opts.overviewDecoder
+          ? opts.overviewDecoder(overview)
+          : decodeQuantizedOverview(overview);
         delete row['overviews'];
       }
+      if (injectedBboxColumn) delete row[injectedBboxColumn];
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
@@ -325,7 +371,7 @@ export class CogpReader {
         metadata,
         rowStart,
         rowEnd,
-        compressors,
+        compressors: this.compressors,
       };
       if (columns) readArgs['columns'] = columns;
       if (filter) {
@@ -364,6 +410,22 @@ export class CogpReader {
       n += Number(this.metadata.row_groups[i]?.num_rows ?? 0);
     }
     return n;
+  }
+
+  private projectedMetadata(lod: string): FullFileMetadata {
+    const cached = this.overviewMetadataCache.get(lod);
+    if (cached) {
+      this.overviewMetadataCache.delete(lod);
+      this.overviewMetadataCache.set(lod, cached);
+      return cached;
+    }
+    const projected = projectOverviewMetadata(this.metadata, lod);
+    this.overviewMetadataCache.set(lod, projected);
+    if (this.overviewMetadataCache.size > 2) {
+      const oldest = this.overviewMetadataCache.keys().next().value as string | undefined;
+      if (oldest !== undefined) this.overviewMetadataCache.delete(oldest);
+    }
+    return projected;
   }
 
 }

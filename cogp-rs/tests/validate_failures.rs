@@ -64,7 +64,7 @@ fn cogp(levels: Vec<Level>) -> CogpMeta {
         .iter()
         .map(|level| {
             (
-                level.lod.clone(),
+                level.lod.clone().unwrap(),
                 LodMeta {
                     scale: [1.0, 1.0],
                     offset: [0.0, 0.0],
@@ -75,10 +75,10 @@ fn cogp(levels: Vec<Level>) -> CogpMeta {
     CogpMeta {
         version: COGP_VERSION.into(),
         levels,
-        overviews: OverviewsMeta {
+        overviews: Some(OverviewsMeta {
             encoding: OVERVIEWS_ENCODING.into(),
             lods,
-        },
+        }),
     }
 }
 
@@ -138,7 +138,7 @@ fn rejects_missing_geo_metadata() {
         Some(cogp(vec![Level {
             row_group_end: 0,
             resolution: 100.0,
-            lod: "l0".into(),
+            lod: Some("l0".into()),
         }])),
     );
     assert_invalid(&path);
@@ -155,12 +155,12 @@ fn rejects_non_decreasing_resolution() {
             Level {
                 row_group_end: 0,
                 resolution: 100.0,
-                lod: "l0".into(),
+                lod: Some("l0".into()),
             },
             Level {
                 row_group_end: 0,
                 resolution: 100.0,
-                lod: "l1".into(),
+                lod: Some("l1".into()),
             },
         ])),
     );
@@ -174,9 +174,27 @@ fn rejects_level_referencing_unknown_lod() {
     let mut metadata = cogp(vec![Level {
         row_group_end: 0,
         resolution: 100.0,
-        lod: "l0".into(),
+        lod: Some("l0".into()),
     }]);
-    metadata.levels[0].lod = "missing".into();
+    metadata.levels[0].lod = Some("missing".into());
     write_file(&path, Some(standard_geo()), Some(metadata));
+    assert_invalid(&path);
+}
+
+#[test]
+fn rejects_point_family_overviews() {
+    let dir = TempDir::new("point-overviews");
+    let path = dir.0.join("bad.parquet");
+    let mut geo = standard_geo();
+    geo.columns.get_mut("geometry").unwrap().geometry_types = vec!["Point".into()];
+    write_file(
+        &path,
+        Some(geo),
+        Some(cogp(vec![Level {
+            row_group_end: 0,
+            resolution: 100.0,
+            lod: Some("l0".into()),
+        }])),
+    );
     assert_invalid(&path);
 }

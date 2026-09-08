@@ -1,32 +1,50 @@
 /// <reference lib="webworker" />
-import { CogpReader } from 'cogp';
-import type { Feature, Geometry } from 'geojson';
+import {
+  CogpReader,
+  type QuantizedOverviewGeometry,
+  type ReadOptions,
+} from 'cogp';
+import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import type {
   MetadataSummary,
   OpenResult,
+  TileResult,
   ViewportBbox,
-  ViewportResult,
-  WorkerEnvelope,
+  WorkerMessage,
   WorkerResponse,
 } from './cogp-types';
+import {
+  createOverviewMvtEncoder,
+  type EncodedMvtFeature,
+  encodeMvtTile,
+  encodePointFeature,
+  MVT_BUFFER,
+  MVT_EXTENT,
+} from './mvt';
 
-const VIEWPORT_MAX_ROWS = 50_000;
+const TILE_MAX_ROWS = 50_000;
+const VECTOR_TILE_SIZE = 512;
+const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
 interface ActiveDataset {
   url: string;
   reader: CogpReader;
   dataBbox: [[number, number], [number, number]] | null;
-  bboxStructTop: string | null;
-  servedViewports: number;
 }
 
 let active: ActiveDataset | null = null;
 let latestUrl = '';
+const zstdDecoder = Zstd.load();
+const runningRequests = new Set<number>();
+const cancelledRequests = new Set<number>();
 
 async function openDataset(url: string): Promise<OpenResult> {
   latestUrl = url;
-  const reader = await CogpReader.open(url);
+  const zstd = await zstdDecoder;
+  const reader = await CogpReader.open(url, {
+    compressors: { ZSTD: (input) => zstd.decompress(input) },
+  });
   if (latestUrl !== url) throw new Error('Dataset open was superseded');
 
   const dataBbox = computeDataBbox(reader);
@@ -34,48 +52,90 @@ async function openDataset(url: string): Promise<OpenResult> {
     url,
     reader,
     dataBbox,
-    bboxStructTop: bboxStructTopColumn(reader),
-    servedViewports: 0,
   };
 
   return { summary: metadataSummary(reader), dataBbox };
 }
 
-async function readViewport(
+async function readTile(
   url: string,
-  bbox: ViewportBbox,
-  targetResolution: number,
-): Promise<ViewportResult> {
+  z: number,
+  x: number,
+  y: number,
+  isCancelled: () => boolean,
+): Promise<TileResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
-    return { data: { type: 'FeatureCollection', features: [] }, status: '' };
+    throw new Error('Dataset is no longer active');
   }
+  const targetResolution = tileResolution(z, y);
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetResolution);
-  const rows = await ds.reader.readRows({
-    bbox,
+  const usesOverviews = ds.reader.cogp.overviews !== undefined;
+  const readOptions: ReadOptions = {
+    bbox: tileBounds(z, x, y),
+    columns: [geomColumn],
     maxLevel,
-    maxRows: VIEWPORT_MAX_ROWS,
-  });
-
-  const features: Feature[] = [];
-  const skip = new Set<string>([geomColumn]);
-  if (ds.bboxStructTop) skip.add(ds.bboxStructTop);
-  for (const row of rows) {
-    const geometry = row[geomColumn] as Geometry | null | undefined;
-    if (!geometry) continue;
-    const properties: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(row)) {
-      if (skip.has(key)) continue;
-      properties[key] = coerceForGeoJson(value);
-    }
-    features.push({ type: 'Feature', geometry, properties });
-  }
-  ds.servedViewports += 1;
-  return {
-    data: { type: 'FeatureCollection', features },
-    status: `Loaded ${features.length} features at ${formatResolution(targetResolution)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
+    maxRows: TILE_MAX_ROWS,
   };
+  if (usesOverviews) {
+    // Keep the selected overview as its zero-copy typed-array view. The MVT
+    // encoder below consumes it without constructing GeoJSON geometry.
+    readOptions.overviewDecoder = (overview) => overview;
+  }
+  const readStartedAt = performance.now();
+  const rows = await ds.reader.readRows(readOptions);
+  const readMs = performance.now() - readStartedAt;
+  if (isCancelled()) throw new DOMException('COGP tile request aborted', 'AbortError');
+
+  const encodeStartedAt = performance.now();
+  const overviewEncoder = createOverviewMvtEncoder(z, x, y);
+  let featureCount = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const feature = usesOverviews
+      ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null)
+      : encodePointFeature(row[geomColumn], z, x, y);
+    if (!feature) continue;
+    // Reuse the rows array so a dense tile does not need a second 10k-entry
+    // container solely for its already-encoded protobuf feature messages.
+    rows[featureCount++] = feature as unknown as Record<string, unknown>;
+  }
+  rows.length = featureCount;
+  const data = encodeMvtTile(rows as unknown as EncodedMvtFeature[]);
+  const encodeMs = performance.now() - encodeStartedAt;
+  return {
+    data,
+    featureCount,
+    readMs,
+    encodeMs,
+    maxLevel,
+  };
+}
+
+function tileBounds(z: number, x: number, y: number): ViewportBbox {
+  const tiles = 2 ** z;
+  const normalizedX = ((x % tiles) + tiles) % tiles;
+  const padding = MVT_BUFFER / MVT_EXTENT;
+  return {
+    minX: ((normalizedX - padding) / tiles) * 360 - 180,
+    minY: tileYToLatitude(y + 1 + padding, tiles),
+    maxX: ((normalizedX + 1 + padding) / tiles) * 360 - 180,
+    maxY: tileYToLatitude(y - padding, tiles),
+  };
+}
+
+function tileYToLatitude(y: number, tiles: number): number {
+  return (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / tiles))) * 180) / Math.PI;
+}
+
+function tileResolution(z: number, y: number): number {
+  const tiles = 2 ** z;
+  const latitude = tileYToLatitude(y + 0.5, tiles);
+  return (
+    (EARTH_CIRCUMFERENCE_METERS * Math.cos((latitude * Math.PI) / 180)) /
+    (VECTOR_TILE_SIZE * tiles)
+  );
 }
 
 function metadataSummary(reader: CogpReader): MetadataSummary {
@@ -89,11 +149,6 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
     })),
     crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
   };
-}
-
-function bboxStructTopColumn(reader: CogpReader): string | null {
-  const path = reader.geo.columns[reader.primaryGeometryColumn]?.covering?.bbox?.xmin;
-  return path?.[0] ?? null;
 }
 
 function computeDataBbox(reader: CogpReader): [[number, number], [number, number]] | null {
@@ -116,37 +171,34 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
   ];
 }
 
-// MapLibre serializes GeoJSON properties through JSON.stringify when shipping
-// data to its worker, which can't handle bigint or Uint8Array. Coerce both
-// here so the GeoJSON source accepts the FeatureCollection.
-function coerceForGeoJson(value: unknown): unknown {
-  if (typeof value === 'bigint') {
-    const n = Number(value);
-    return Number.isSafeInteger(n) ? n : value.toString();
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
+  if ('type' in e.data) {
+    if (runningRequests.has(e.data.id)) cancelledRequests.add(e.data.id);
+    return;
   }
-  if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
-  return value;
-}
-
-function formatResolution(resolution: number): string {
-  if (resolution >= 1000) return `${(resolution / 1000).toFixed(1)} km`;
-  if (resolution >= 1) return `${resolution.toFixed(1)} m`;
-  return `${(resolution * 100).toFixed(1)} cm`;
-}
-
-self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
   const { id, payload } = e.data;
+  runningRequests.add(id);
   try {
-    let result: OpenResult | ViewportResult;
     if (payload.type === 'open') {
-      result = await openDataset(payload.url);
+      const result: OpenResult = await openDataset(payload.url);
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response);
     } else {
-      result = await readViewport(payload.url, payload.bbox, payload.targetResolution);
+      const result: TileResult = await readTile(
+        payload.url,
+        payload.z,
+        payload.x,
+        payload.y,
+        () => cancelledRequests.has(id),
+      );
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response, { transfer: [result.data] });
     }
-    const response: WorkerResponse = { id, ok: true, result };
-    self.postMessage(response);
   } catch (err) {
     const response: WorkerResponse = { id, ok: false, error: (err as Error).message };
     self.postMessage(response);
+  } finally {
+    runningRequests.delete(id);
+    cancelledRequests.delete(id);
   }
 };

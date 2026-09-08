@@ -79,6 +79,18 @@ test('supports an omitted end and rejects invalid bounds', async () => {
   await assert.rejects(file.slice(0, 33), /outside buffer/);
 });
 
+test('passes through an exact run without copying its buffer', async () => {
+  const sourceBuffer = new ArrayBuffer(10);
+  const file = coalescingAsyncBuffer({
+    byteLength: 10,
+    slice() {
+      return sourceBuffer;
+    },
+  });
+
+  assert.equal(await file.slice(0, 10), sourceBuffer);
+});
+
 test('never requests or merges across protected ranges', async () => {
   const { source, calls } = sourceFixture();
   const file = coalescingAsyncBuffer(source, {

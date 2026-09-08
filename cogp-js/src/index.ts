@@ -30,5 +30,9 @@ export type {
 
 export { selectLevelByGsd, selectLevelByResolution } from './level.js';
 export { decodeOverview } from './overview.js';
+export type {
+  OverviewGeometryType,
+  QuantizedOverviewGeometry,
+} from './overview.js';
 
 export type { Bbox } from './bbox.js';

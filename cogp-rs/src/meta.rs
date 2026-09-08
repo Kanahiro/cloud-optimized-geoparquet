@@ -12,14 +12,16 @@ pub const OVERVIEWS_ENCODING: &str = "quantized_xy_v1";
 pub struct CogpMeta {
     pub version: String,
     pub levels: Vec<Level>,
-    pub overviews: OverviewsMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overviews: Option<OverviewsMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
     pub resolution: f64,
-    pub lod: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lod: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,15 +121,15 @@ mod tests {
                 Level {
                     row_group_end: 0,
                     resolution: 1000.0,
-                    lod: "l0".into(),
+                    lod: Some("l0".into()),
                 },
                 Level {
                     row_group_end: 3,
                     resolution: 250.0,
-                    lod: "l1".into(),
+                    lod: Some("l1".into()),
                 },
             ],
-            overviews: OverviewsMeta {
+            overviews: Some(OverviewsMeta {
                 encoding: OVERVIEWS_ENCODING.into(),
                 lods: BTreeMap::from([
                     (
@@ -145,7 +147,7 @@ mod tests {
                         },
                     ),
                 ]),
-            },
+            }),
         };
         let s = serde_json::to_string(&m).unwrap();
         let parsed: CogpMeta = serde_json::from_str(&s).unwrap();
@@ -153,8 +155,8 @@ mod tests {
         assert_eq!(parsed.levels.len(), 2);
         assert_eq!(parsed.levels[0].row_group_end, 0);
         assert_eq!(parsed.levels[1].resolution, 250.0);
-        assert_eq!(parsed.levels[0].lod, "l0");
-        assert_eq!(parsed.overviews.encoding, OVERVIEWS_ENCODING);
+        assert_eq!(parsed.levels[0].lod.as_deref(), Some("l0"));
+        assert_eq!(parsed.overviews.unwrap().encoding, OVERVIEWS_ENCODING);
     }
 
     #[test]

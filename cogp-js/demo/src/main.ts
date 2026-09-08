@@ -1,14 +1,60 @@
 import maplibregl, { type LngLatBoundsLike } from 'maplibre-gl';
-import type { FeatureCollection } from 'geojson';
 
 import {
   openDataset as openCogpDataset,
-  readViewport,
+  readTile,
   type MetadataSummary,
 } from './dataset-service';
+import { MVT_LAYER_NAME } from './cogp-types';
 
 const COGP_SOURCE_ID = 'cogp';
-const VIEWPORT_REFRESH_INTERVAL_MS = 150;
+const COGP_PROTOCOL = 'cogp';
+
+interface TileAddress {
+  revision: number;
+  z: number;
+  x: number;
+  y: number;
+}
+
+interface TileStats {
+  tiles: number;
+  features: number;
+  bytes: number;
+  readMs: number;
+  encodeMs: number;
+}
+
+let datasetRevision = 0;
+let tileStats: TileStats = emptyTileStats();
+
+maplibregl.addProtocol(COGP_PROTOCOL, async (params, abortController) => {
+  const address = parseTileAddress(params.url);
+  const ds = active;
+  if (!ds || address.revision !== datasetRevision) {
+    throw new Error('Stale COGP tile request');
+  }
+
+  const result = await readTile(
+    ds.url,
+    address.z,
+    address.x,
+    address.y,
+    abortController.signal,
+  );
+  if (abortController.signal.aborted) {
+    throw new DOMException('COGP tile request aborted', 'AbortError');
+  }
+  if (active?.url === ds.url && address.revision === datasetRevision) {
+    tileStats.tiles += 1;
+    tileStats.features += result.featureCount;
+    tileStats.bytes += result.data.byteLength;
+    tileStats.readMs += result.readMs;
+    tileStats.encodeMs += result.encodeMs;
+    reportTileStats(result.maxLevel);
+  }
+  return { data: result.data };
+});
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -94,26 +140,24 @@ map.on('load', () => {
   if (active) installCogpSource();
 });
 
-map.on('move', () => {
-  if (active) {
-    viewportToken += 1;
-    requestViewportRefresh();
-  }
-});
-
 function installCogpSource(): void {
   if (!map.isStyleLoaded()) return;
   removeCogpLayersAndSource();
+  datasetRevision += 1;
+  tileStats = emptyTileStats();
 
   map.addSource(COGP_SOURCE_ID, {
-    type: 'geojson',
-    data: emptyFC(),
+    type: 'vector',
+    tiles: [`${COGP_PROTOCOL}://tiles/${datasetRevision}/{z}/{x}/{y}.pbf`],
+    minzoom: 0,
+    maxzoom: 24,
   });
   map.addLayer({
     id: 'cogp-fill',
     type: 'fill',
     source: COGP_SOURCE_ID,
-    filter: ['any', ['==', ['geometry-type'], 'Polygon'], ['==', ['geometry-type'], 'MultiPolygon']],
+    'source-layer': MVT_LAYER_NAME,
+    filter: ['==', ['geometry-type'], 'Polygon'],
     paint: {
       'fill-color': '#4a6cf7',
       'fill-opacity': 0.35,
@@ -124,7 +168,8 @@ function installCogpSource(): void {
     id: 'cogp-line',
     type: 'line',
     source: COGP_SOURCE_ID,
-    filter: ['any', ['==', ['geometry-type'], 'LineString'], ['==', ['geometry-type'], 'MultiLineString']],
+    'source-layer': MVT_LAYER_NAME,
+    filter: ['==', ['geometry-type'], 'LineString'],
     paint: {
       'line-color': '#1f3aa8',
       'line-width': 1.5,
@@ -134,7 +179,8 @@ function installCogpSource(): void {
     id: 'cogp-point',
     type: 'circle',
     source: COGP_SOURCE_ID,
-    filter: ['any', ['==', ['geometry-type'], 'Point'], ['==', ['geometry-type'], 'MultiPoint']],
+    'source-layer': MVT_LAYER_NAME,
+    filter: ['==', ['geometry-type'], 'Point'],
     paint: {
       'circle-radius': 3,
       'circle-color': '#4a6cf7',
@@ -142,9 +188,6 @@ function installCogpSource(): void {
       'circle-stroke-width': 1,
     },
   });
-
-  viewportToken += 1;
-  requestViewportRefresh(true);
 }
 
 function removeCogpLayersAndSource(): void {
@@ -154,69 +197,33 @@ function removeCogpLayersAndSource(): void {
   if (map.getSource(COGP_SOURCE_ID)) map.removeSource(COGP_SOURCE_ID);
 }
 
-function emptyFC(): FeatureCollection {
-  return { type: 'FeatureCollection', features: [] };
-}
-
-let viewportToken = 0;
-let viewportRefreshTimer: number | null = null;
-let viewportRefreshInFlight = false;
-let viewportRefreshRequested = false;
-let lastViewportRefreshStartedAt = -Infinity;
-
-function requestViewportRefresh(immediate = false): void {
-  viewportRefreshRequested = true;
-  if (viewportRefreshInFlight) return;
-
-  if (viewportRefreshTimer !== null) {
-    if (!immediate) return;
-    clearTimeout(viewportRefreshTimer);
-  }
-
-  const elapsed = performance.now() - lastViewportRefreshStartedAt;
-  const delay = immediate ? 0 : Math.max(0, VIEWPORT_REFRESH_INTERVAL_MS - elapsed);
-  viewportRefreshTimer = window.setTimeout(() => {
-    viewportRefreshTimer = null;
-    void runViewportRefresh();
-  }, delay);
-}
-
-async function runViewportRefresh(): Promise<void> {
-  if (!viewportRefreshRequested || viewportRefreshInFlight) return;
-  viewportRefreshRequested = false;
-  viewportRefreshInFlight = true;
-  lastViewportRefreshStartedAt = performance.now();
-  try {
-    await refreshViewport();
-  } finally {
-    viewportRefreshInFlight = false;
-    if (viewportRefreshRequested) requestViewportRefresh();
-  }
-}
-
-async function refreshViewport(): Promise<void> {
-  const ds = active;
-  if (!ds) return;
-  const source = map.getSource(COGP_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-  if (!source) return;
-  const myToken = viewportToken;
-  const b = map.getBounds();
-  const bbox = {
-    minX: b.getWest(),
-    minY: b.getSouth(),
-    maxX: b.getEast(),
-    maxY: b.getNorth(),
+function parseTileAddress(url: string): TileAddress {
+  const match = /^cogp:\/\/tiles\/(\d+)\/(\d+)\/(\d+)\/(\d+)\.pbf$/.exec(url);
+  if (!match) throw new Error(`Invalid COGP tile URL: ${url}`);
+  return {
+    revision: Number(match[1]),
+    z: Number(match[2]),
+    x: Number(match[3]),
+    y: Number(match[4]),
   };
-  try {
-    const { data, status } = await readViewport(ds.url, bbox, metersPerCssPixel());
-    if (myToken !== viewportToken || active?.url !== ds.url) return;
-    source.setData(data);
-    if (status) setStatus(status);
-  } catch (err) {
-    if (myToken !== viewportToken) return;
-    console.error(err);
-    setStatus(`Viewport read failed: ${(err as Error).message}`);
-  }
+}
+
+function emptyTileStats(): TileStats {
+  return { tiles: 0, features: 0, bytes: 0, readMs: 0, encodeMs: 0 };
+}
+
+function reportTileStats(maxLevel: number): void {
+  setStatus(
+    `Rendered ${tileStats.tiles} MVT tiles from ${tileStats.features.toLocaleString()} source features ` +
+      `(${formatBytes(tileStats.bytes)} PBF, level <= ${maxLevel}). ` +
+      `COGP reads: ${tileStats.readMs.toFixed(0)} ms total; MVT encoding: ${tileStats.encodeMs.toFixed(0)} ms total.`,
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
 }
 
 const urlInput = document.getElementById('url') as HTMLInputElement;
@@ -280,13 +287,14 @@ async function loadDataset(url: string): Promise<void> {
     }
     installCogpSource();
     setStatus(
-      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels.`,
+      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels; requesting MVT tiles.`,
     );
   } catch (err) {
     if (latestUrl !== url) return;
     console.error(err);
     setStatus(`Error: ${(err as Error).message}`);
     active = null;
+    datasetRevision += 1;
     removeCogpLayersAndSource();
   } finally {
     if (latestUrl === url) loadBtn.disabled = false;
@@ -295,12 +303,4 @@ async function loadDataset(url: string): Promise<void> {
 
 function renderMetadata(summary: MetadataSummary): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
-}
-
-function metersPerCssPixel(): number {
-  const sampleWidth = 100;
-  const y = map.getContainer().clientHeight / 2;
-  const left = map.unproject([0, y]);
-  const right = map.unproject([sampleWidth, y]);
-  return left.distanceTo(right) / sampleWidth;
 }

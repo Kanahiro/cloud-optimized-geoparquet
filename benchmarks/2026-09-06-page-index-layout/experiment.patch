@@ -1,0 +1,100 @@
+--- a/cogp-rs/src/convert.rs
++++ b/cogp-rs/src/convert.rs
+@@ -65,6 +65,18 @@
+     /// For Point data this is also the row limit.
+     #[arg(long, default_value_t = 10_000)]
+     pub row_group_size: usize,
++    /// Benchmark-only override for a literal row limit per row group. When
++    /// omitted, the production spatial-cell budget derives a limit per level.
++    #[arg(long)]
++    pub fixed_row_group_rows: Option<usize>,
++    /// Maximum top-level rows per Parquet data page. Keeping this explicit lets
++    /// the layout benchmark vary page and row-group granularity independently.
++    #[arg(long, default_value_t = 256)]
++    pub page_row_count: usize,
++    /// Benchmark control: retain row-group packing but skip the nested spatial
++    /// packing that makes each page-sized row interval spatially compact.
++    #[arg(long, default_value_t = false)]
++    pub no_spatial_page_pack: bool,
+     /// Maximum cumulative coordinate bytes in a row group's largest usable
+     /// geometry overview.
+     #[arg(long, default_value = "4194304")]
+@@ -430,6 +442,12 @@
+     if args.row_group_size == 0 {
+         bail!("--row-group-size must be >= 1");
+     }
++    if args.fixed_row_group_rows == Some(0) {
++        bail!("--fixed-row-group-rows must be >= 1");
++    }
++    if args.page_row_count == 0 {
++        bail!("--page-row-count must be >= 1");
++    }
+     if args.row_group_max_bytes == Some(0) {
+         bail!("--row-group-max-bytes must be >= 1");
+     }
+@@ -616,7 +634,7 @@
+         .collect::<Vec<_>>();
+     let row_group_sizes = row_group_plans
+         .iter()
+-        .map(|plan| plan.max_rows)
++        .map(|plan| args.fixed_row_group_rows.unwrap_or(plan.max_rows))
+         .collect::<Vec<_>>();
+     for (level, rows) in per_level.iter().enumerate() {
+         let plan = row_group_plans[level];
+@@ -634,6 +652,15 @@
+ 
+     for (level_idx, rows) in per_level.iter_mut().enumerate() {
+         str_pack(rows, &bboxes, row_group_sizes[level_idx], level_idx);
++        if !args.no_spatial_page_pack {
++            str_pack_pages(
++                rows,
++                &bboxes,
++                row_group_sizes[level_idx],
++                args.page_row_count,
++                level_idx,
++            );
++        }
+     }
+ 
+     let dataset_bbox = bboxes
+@@ -710,12 +737,11 @@
+     // as bytes, and match the write batch so the writer can honor that boundary
+     // closely. Offset indexes are emitted for every column, allowing a bbox
+     // page selection to skip the corresponding overview and attribute pages.
+-    const PAGE_INDEX_ROWS: usize = 256;
+     let mut props_builder = WriterProperties::builder()
+         .set_compression(compression)
+         .set_max_row_group_size(args.row_group_size)
+-        .set_data_page_row_count_limit(PAGE_INDEX_ROWS)
+-        .set_write_batch_size(PAGE_INDEX_ROWS)
++        .set_data_page_row_count_limit(args.page_row_count)
++        .set_write_batch_size(args.page_row_count)
+         .set_statistics_enabled(EnabledStatistics::Chunk)
+         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false)
+         .set_column_encoding(ColumnPath::from(geom_col_name.as_str()), Encoding::PLAIN)
+@@ -1978,6 +2004,25 @@
+         row_group_size,
+         dir,
+     );
++}
++
++/// Preserve row-group membership while recursively packing each row group's
++/// page-sized intervals. Page indexes describe row intervals, so locality must
++/// hold at this nested physical unit rather than only at the row-group level.
++fn str_pack_pages(
++    rows: &mut [u32],
++    bboxes: &[Bbox],
++    row_group_size: usize,
++    page_row_count: usize,
++    level_idx: usize,
++) {
++    rows.chunks_mut(row_group_size)
++        .enumerate()
++        .for_each(|(row_group_idx, row_group)| {
++            let mut scratch = vec![(0.0, 0); row_group.len()];
++            let dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
++            str_pack_rec(row_group, &mut scratch, bboxes, page_row_count, dir);
++        });
+ }
+ 
+ fn str_pack_rec(

@@ -176,7 +176,11 @@ async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {
       );
     }
     for (const slice of run.slices) {
-      slice.resolve(buffer.slice(slice.start - run.start, slice.end - run.start));
+      // The common one-request run already has the exact ArrayBuffer the
+      // caller asked for. Passing it through avoids copying every compressed
+      // Parquet page solely because it traversed the coalescing layer.
+      if (slice.start === run.start && slice.end === run.end) slice.resolve(buffer);
+      else slice.resolve(buffer.slice(slice.start - run.start, slice.end - run.start));
     }
   } catch (error) {
     for (const slice of run.slices) slice.reject(error);

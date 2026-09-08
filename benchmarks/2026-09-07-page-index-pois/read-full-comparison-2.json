@@ -1,0 +1,924 @@
+{
+  "generatedAt": "2026-09-06T18:04:47.634Z",
+  "simulatedRttMs": 25,
+  "files": {
+    "cogp-js/demo/pois.page-index.cogp.parquet": {
+      "sizeBytes": 3315504823,
+      "openBytes": 25694814,
+      "openRequests": 2,
+      "byResolution": {
+        "10": {
+          "samples": 8,
+          "rows": {
+            "mean": 2144.125,
+            "p50": 2112,
+            "p95": 2983
+          },
+          "candidateRowGroups": {
+            "mean": 12.375,
+            "p50": 12,
+            "p95": 13
+          },
+          "queryBytes": {
+            "mean": 1254756.375,
+            "p50": 1182925,
+            "p95": 1373723
+          },
+          "queryRequests": {
+            "mean": 226.625,
+            "p50": 224,
+            "p95": 237
+          },
+          "queryMilliseconds": {
+            "mean": 838.9858334999999,
+            "p50": 808.4958750000005,
+            "p95": 913.833666999999
+          },
+          "totalBytes": {
+            "mean": 26949570.375,
+            "p50": 26877739,
+            "p95": 27068537
+          },
+          "totalRequests": {
+            "mean": 228.625,
+            "p50": 226,
+            "p95": 239
+          }
+        },
+        "100": {
+          "samples": 8,
+          "rows": {
+            "mean": 3016.625,
+            "p50": 2039,
+            "p95": 4766
+          },
+          "candidateRowGroups": {
+            "mean": 10.125,
+            "p50": 10,
+            "p95": 11
+          },
+          "queryBytes": {
+            "mean": 1173688.125,
+            "p50": 1092448,
+            "p95": 1361611
+          },
+          "queryRequests": {
+            "mean": 188,
+            "p50": 180,
+            "p95": 207
+          },
+          "queryMilliseconds": {
+            "mean": 696.7970831250009,
+            "p50": 654.4627500000006,
+            "p95": 841.193709000001
+          },
+          "totalBytes": {
+            "mean": 26868502.125,
+            "p50": 26787262,
+            "p95": 27056425
+          },
+          "totalRequests": {
+            "mean": 190,
+            "p50": 182,
+            "p95": 209
+          }
+        },
+        "1000": {
+          "samples": 8,
+          "rows": {
+            "mean": 3599.5,
+            "p50": 4208,
+            "p95": 4986
+          },
+          "candidateRowGroups": {
+            "mean": 6.75,
+            "p50": 6,
+            "p95": 7
+          },
+          "queryBytes": {
+            "mean": 911948,
+            "p50": 883029,
+            "p95": 951562
+          },
+          "queryRequests": {
+            "mean": 130.875,
+            "p50": 130,
+            "p95": 132
+          },
+          "queryMilliseconds": {
+            "mean": 505.27779187500005,
+            "p50": 497.1356249999999,
+            "p95": 521.5146670000004
+          },
+          "totalBytes": {
+            "mean": 26606762,
+            "p50": 26577843,
+            "p95": 26646376
+          },
+          "totalRequests": {
+            "mean": 132.875,
+            "p50": 132,
+            "p95": 134
+          }
+        }
+      },
+      "samples": [
+        {
+          "center": "tokyo",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4368,
+          "candidateRowGroups": 6,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 880236,
+          "queryRequests": 119,
+          "queryMilliseconds": 540.690625,
+          "totalBytes": 26575050,
+          "totalRequests": 121
+        },
+        {
+          "center": "osaka",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4986,
+          "candidateRowGroups": 6,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 873934,
+          "queryRequests": 119,
+          "queryMilliseconds": 499.966584,
+          "totalBytes": 26568748,
+          "totalRequests": 121
+        },
+        {
+          "center": "nagoya",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 5298,
+          "candidateRowGroups": 6,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 893288,
+          "queryRequests": 119,
+          "queryMilliseconds": 495.270125,
+          "totalBytes": 26588102,
+          "totalRequests": 121
+        },
+        {
+          "center": "sapporo",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 1516,
+          "candidateRowGroups": 6,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 883029,
+          "queryRequests": 130,
+          "queryMilliseconds": 489.16975,
+          "totalBytes": 26577843,
+          "totalRequests": 132
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4208,
+          "candidateRowGroups": 7,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 998311,
+          "queryRequests": 131,
+          "queryMilliseconds": 520.887667,
+          "totalBytes": 26693125,
+          "totalRequests": 133
+        },
+        {
+          "center": "sendai",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 3756,
+          "candidateRowGroups": 6,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 875894,
+          "queryRequests": 130,
+          "queryMilliseconds": 497.1356249999999,
+          "totalBytes": 26570708,
+          "totalRequests": 132
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4399,
+          "candidateRowGroups": 7,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 951562,
+          "queryRequests": 132,
+          "queryMilliseconds": 521.5146670000004,
+          "totalBytes": 26646376,
+          "totalRequests": 134
+        },
+        {
+          "center": "naha",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 265,
+          "candidateRowGroups": 10,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 939330,
+          "queryRequests": 167,
+          "queryMilliseconds": 477.58729200000016,
+          "totalBytes": 26634144,
+          "totalRequests": 169
+        },
+        {
+          "center": "tokyo",
+          "resolution": 100,
+          "level": 8,
+          "rows": 6353,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1627393,
+          "queryRequests": 211,
+          "queryMilliseconds": 863.0252909999999,
+          "totalBytes": 27322207,
+          "totalRequests": 213
+        },
+        {
+          "center": "osaka",
+          "resolution": 100,
+          "level": 8,
+          "rows": 4766,
+          "candidateRowGroups": 10,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1189124,
+          "queryRequests": 190,
+          "queryMilliseconds": 708.0844159999997,
+          "totalBytes": 26883938,
+          "totalRequests": 192
+        },
+        {
+          "center": "nagoya",
+          "resolution": 100,
+          "level": 8,
+          "rows": 4739,
+          "candidateRowGroups": 11,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1361611,
+          "queryRequests": 207,
+          "queryMilliseconds": 841.193709000001,
+          "totalBytes": 27056425,
+          "totalRequests": 209
+        },
+        {
+          "center": "sapporo",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1341,
+          "candidateRowGroups": 9,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1001995,
+          "queryRequests": 179,
+          "queryMilliseconds": 630.6208750000005,
+          "totalBytes": 26696809,
+          "totalRequests": 181
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 100,
+          "level": 8,
+          "rows": 2039,
+          "candidateRowGroups": 11,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1154808,
+          "queryRequests": 193,
+          "queryMilliseconds": 654.4627500000006,
+          "totalBytes": 26849622,
+          "totalRequests": 195
+        },
+        {
+          "center": "sendai",
+          "resolution": 100,
+          "level": 8,
+          "rows": 2271,
+          "candidateRowGroups": 9,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1092448,
+          "queryRequests": 178,
+          "queryMilliseconds": 663.4871250000033,
+          "totalBytes": 26787262,
+          "totalRequests": 180
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1602,
+          "candidateRowGroups": 9,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 991488,
+          "queryRequests": 166,
+          "queryMilliseconds": 620.9350410000006,
+          "totalBytes": 26686302,
+          "totalRequests": 168
+        },
+        {
+          "center": "naha",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1022,
+          "candidateRowGroups": 10,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 970638,
+          "queryRequests": 180,
+          "queryMilliseconds": 592.5674580000014,
+          "totalBytes": 26665452,
+          "totalRequests": 182
+        },
+        {
+          "center": "tokyo",
+          "resolution": 10,
+          "level": 11,
+          "rows": 3378,
+          "candidateRowGroups": 13,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1509696,
+          "queryRequests": 231,
+          "queryMilliseconds": 954.7355420000022,
+          "totalBytes": 27204510,
+          "totalRequests": 233
+        },
+        {
+          "center": "osaka",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2983,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1373723,
+          "queryRequests": 223,
+          "queryMilliseconds": 913.833666999999,
+          "totalBytes": 27068537,
+          "totalRequests": 225
+        },
+        {
+          "center": "nagoya",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2438,
+          "candidateRowGroups": 13,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1300386,
+          "queryRequests": 241,
+          "queryMilliseconds": 851.3944999999985,
+          "totalBytes": 26995200,
+          "totalRequests": 243
+        },
+        {
+          "center": "sapporo",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2112,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1182925,
+          "queryRequests": 227,
+          "queryMilliseconds": 808.4958750000005,
+          "totalBytes": 26877739,
+          "totalRequests": 229
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 10,
+          "level": 11,
+          "rows": 1569,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1141095,
+          "queryRequests": 215,
+          "queryMilliseconds": 781.0428339999999,
+          "totalBytes": 26835909,
+          "totalRequests": 217
+        },
+        {
+          "center": "sendai",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2303,
+          "candidateRowGroups": 13,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1349078,
+          "queryRequests": 237,
+          "queryMilliseconds": 879.3344159999979,
+          "totalBytes": 27043892,
+          "totalRequests": 239
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 10,
+          "level": 11,
+          "rows": 1383,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1099609,
+          "queryRequests": 224,
+          "queryMilliseconds": 776.4577090000021,
+          "totalBytes": 26794423,
+          "totalRequests": 226
+        },
+        {
+          "center": "naha",
+          "resolution": 10,
+          "level": 11,
+          "rows": 987,
+          "candidateRowGroups": 12,
+          "openBytes": 25694814,
+          "openRequests": 2,
+          "queryBytes": 1081539,
+          "queryRequests": 215,
+          "queryMilliseconds": 746.5921249999992,
+          "totalBytes": 26776353,
+          "totalRequests": 217
+        }
+      ]
+    },
+    "/tmp/cogp-pois-bench.5np1C7/pois-full-rg16384-p512.parquet": {
+      "sizeBytes": 2973120338,
+      "openBytes": 15737104,
+      "openRequests": 2,
+      "byResolution": {
+        "10": {
+          "samples": 8,
+          "rows": {
+            "mean": 2144.125,
+            "p50": 2112,
+            "p95": 2983
+          },
+          "candidateRowGroups": {
+            "mean": 12.75,
+            "p50": 12,
+            "p95": 13
+          },
+          "queryBytes": {
+            "mean": 1410872.375,
+            "p50": 1282206,
+            "p95": 1539834
+          },
+          "queryRequests": {
+            "mean": 225.875,
+            "p50": 210,
+            "p95": 238
+          },
+          "queryMilliseconds": {
+            "mean": 681.8671039999999,
+            "p50": 677.2428329999966,
+            "p95": 699.2432499999995
+          },
+          "totalBytes": {
+            "mean": 17147976.375,
+            "p50": 17019310,
+            "p95": 17276938
+          },
+          "totalRequests": {
+            "mean": 227.875,
+            "p50": 212,
+            "p95": 240
+          }
+        },
+        "100": {
+          "samples": 8,
+          "rows": {
+            "mean": 3016.625,
+            "p50": 2039,
+            "p95": 4766
+          },
+          "candidateRowGroups": {
+            "mean": 9.625,
+            "p50": 10,
+            "p95": 10
+          },
+          "queryBytes": {
+            "mean": 1138691.5,
+            "p50": 1127664,
+            "p95": 1271282
+          },
+          "queryRequests": {
+            "mean": 175.75,
+            "p50": 172,
+            "p95": 196
+          },
+          "queryMilliseconds": {
+            "mean": 519.0310103749998,
+            "p50": 496.15474999999424,
+            "p95": 554.4325420000023
+          },
+          "totalBytes": {
+            "mean": 16875795.5,
+            "p50": 16864768,
+            "p95": 17008386
+          },
+          "totalRequests": {
+            "mean": 177.75,
+            "p50": 174,
+            "p95": 198
+          }
+        },
+        "1000": {
+          "samples": 8,
+          "rows": {
+            "mean": 3599.5,
+            "p50": 4208,
+            "p95": 4986
+          },
+          "candidateRowGroups": {
+            "mean": 6.375,
+            "p50": 6,
+            "p95": 6
+          },
+          "queryBytes": {
+            "mean": 862608.25,
+            "p50": 851926,
+            "p95": 916434
+          },
+          "queryRequests": {
+            "mean": 119.125,
+            "p50": 106,
+            "p95": 139
+          },
+          "queryMilliseconds": {
+            "mean": 347.16162537499986,
+            "p50": 348.8282919999983,
+            "p95": 360.54554199999984
+          },
+          "totalBytes": {
+            "mean": 16599712.25,
+            "p50": 16589030,
+            "p95": 16653538
+          },
+          "totalRequests": {
+            "mean": 121.125,
+            "p50": 108,
+            "p95": 141
+          }
+        }
+      },
+      "samples": [
+        {
+          "center": "tokyo",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4368,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 851926,
+          "queryRequests": 96,
+          "queryMilliseconds": 352.9472089999981,
+          "totalBytes": 16589030,
+          "totalRequests": 98
+        },
+        {
+          "center": "osaka",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4986,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 850346,
+          "queryRequests": 115,
+          "queryMilliseconds": 348.8282919999983,
+          "totalBytes": 16587450,
+          "totalRequests": 117
+        },
+        {
+          "center": "nagoya",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 5298,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 916434,
+          "queryRequests": 106,
+          "queryMilliseconds": 360.54554199999984,
+          "totalBytes": 16653538,
+          "totalRequests": 108
+        },
+        {
+          "center": "sapporo",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 1516,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 725687,
+          "queryRequests": 104,
+          "queryMilliseconds": 317.726459000005,
+          "totalBytes": 16462791,
+          "totalRequests": 106
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4208,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 867904,
+          "queryRequests": 136,
+          "queryMilliseconds": 360.3028340000019,
+          "totalBytes": 16605008,
+          "totalRequests": 138
+        },
+        {
+          "center": "sendai",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 3756,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 789052,
+          "queryRequests": 94,
+          "queryMilliseconds": 336.601582999996,
+          "totalBytes": 16526156,
+          "totalRequests": 96
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 4399,
+          "candidateRowGroups": 6,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 854427,
+          "queryRequests": 139,
+          "queryMilliseconds": 365.734375,
+          "totalBytes": 16591531,
+          "totalRequests": 141
+        },
+        {
+          "center": "naha",
+          "resolution": 1000,
+          "level": 5,
+          "rows": 265,
+          "candidateRowGroups": 9,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1045090,
+          "queryRequests": 163,
+          "queryMilliseconds": 334.6067089999997,
+          "totalBytes": 16782194,
+          "totalRequests": 165
+        },
+        {
+          "center": "tokyo",
+          "resolution": 100,
+          "level": 8,
+          "rows": 6353,
+          "candidateRowGroups": 10,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1356541,
+          "queryRequests": 202,
+          "queryMilliseconds": 552.059583000002,
+          "totalBytes": 17093645,
+          "totalRequests": 204
+        },
+        {
+          "center": "osaka",
+          "resolution": 100,
+          "level": 8,
+          "rows": 4766,
+          "candidateRowGroups": 10,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1271282,
+          "queryRequests": 196,
+          "queryMilliseconds": 555.253374999993,
+          "totalBytes": 17008386,
+          "totalRequests": 198
+        },
+        {
+          "center": "nagoya",
+          "resolution": 100,
+          "level": 8,
+          "rows": 4739,
+          "candidateRowGroups": 9,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1174367,
+          "queryRequests": 161,
+          "queryMilliseconds": 523.9060420000023,
+          "totalBytes": 16911471,
+          "totalRequests": 163
+        },
+        {
+          "center": "sapporo",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1341,
+          "candidateRowGroups": 9,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 983605,
+          "queryRequests": 172,
+          "queryMilliseconds": 489.55291600000055,
+          "totalBytes": 16720709,
+          "totalRequests": 174
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 100,
+          "level": 8,
+          "rows": 2039,
+          "candidateRowGroups": 10,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1127664,
+          "queryRequests": 177,
+          "queryMilliseconds": 554.4325420000023,
+          "totalBytes": 16864768,
+          "totalRequests": 179
+        },
+        {
+          "center": "sendai",
+          "resolution": 100,
+          "level": 8,
+          "rows": 2271,
+          "candidateRowGroups": 9,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1047632,
+          "queryRequests": 177,
+          "queryMilliseconds": 496.15474999999424,
+          "totalBytes": 16784736,
+          "totalRequests": 179
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1602,
+          "candidateRowGroups": 10,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1150744,
+          "queryRequests": 167,
+          "queryMilliseconds": 495.6191670000044,
+          "totalBytes": 16887848,
+          "totalRequests": 169
+        },
+        {
+          "center": "naha",
+          "resolution": 100,
+          "level": 8,
+          "rows": 1022,
+          "candidateRowGroups": 10,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 997697,
+          "queryRequests": 154,
+          "queryMilliseconds": 485.2697079999998,
+          "totalBytes": 16734801,
+          "totalRequests": 156
+        },
+        {
+          "center": "tokyo",
+          "resolution": 10,
+          "level": 11,
+          "rows": 3378,
+          "candidateRowGroups": 16,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1798136,
+          "queryRequests": 320,
+          "queryMilliseconds": 729.2314170000027,
+          "totalBytes": 17535240,
+          "totalRequests": 322
+        },
+        {
+          "center": "osaka",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2983,
+          "candidateRowGroups": 12,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1389974,
+          "queryRequests": 229,
+          "queryMilliseconds": 689.2620410000018,
+          "totalBytes": 17127078,
+          "totalRequests": 231
+        },
+        {
+          "center": "nagoya",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2438,
+          "candidateRowGroups": 13,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1539834,
+          "queryRequests": 224,
+          "queryMilliseconds": 699.2432499999995,
+          "totalBytes": 17276938,
+          "totalRequests": 226
+        },
+        {
+          "center": "sapporo",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2112,
+          "candidateRowGroups": 12,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1276272,
+          "queryRequests": 194,
+          "queryMilliseconds": 655.7907080000004,
+          "totalBytes": 17013376,
+          "totalRequests": 196
+        },
+        {
+          "center": "fukuoka",
+          "resolution": 10,
+          "level": 11,
+          "rows": 1569,
+          "candidateRowGroups": 12,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1272911,
+          "queryRequests": 210,
+          "queryMilliseconds": 657.7145000000019,
+          "totalBytes": 17010015,
+          "totalRequests": 212
+        },
+        {
+          "center": "sendai",
+          "resolution": 10,
+          "level": 11,
+          "rows": 2303,
+          "candidateRowGroups": 13,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1467536,
+          "queryRequests": 238,
+          "queryMilliseconds": 695.8399579999968,
+          "totalBytes": 17204640,
+          "totalRequests": 240
+        },
+        {
+          "center": "hiroshima",
+          "resolution": 10,
+          "level": 11,
+          "rows": 1383,
+          "candidateRowGroups": 12,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1260110,
+          "queryRequests": 192,
+          "queryMilliseconds": 677.2428329999966,
+          "totalBytes": 16997214,
+          "totalRequests": 194
+        },
+        {
+          "center": "naha",
+          "resolution": 10,
+          "level": 11,
+          "rows": 987,
+          "candidateRowGroups": 12,
+          "openBytes": 15737104,
+          "openRequests": 2,
+          "queryBytes": 1282206,
+          "queryRequests": 200,
+          "queryMilliseconds": 650.6121249999997,
+          "totalBytes": 17019310,
+          "totalRequests": 202
+        }
+      ]
+    }
+  }
+}

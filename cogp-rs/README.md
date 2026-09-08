@@ -4,9 +4,9 @@ Rust reference producer, validator, CLI, and reader for the [Cloud Optimized
 GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` assigns each feature to one coarse-to-fine level, spatially packs the
-rows, preserves the primary WKB, and writes a required `overviews` struct. Each
-overview LoD is simplified at its target resolution and stores quantized XY as
-integer lists. `validate` checks the structural rules in SPEC §5.
+rows, and preserves the primary WKB. Line and Polygon files add an `overviews`
+struct whose LoDs store simplified, quantized XY integer lists. Point files do
+not create overviews. `validate` checks the structural rules in SPEC §5.
 
 ## Install
 
@@ -64,13 +64,12 @@ Other important options:
 
 - `--simplification-tolerance-factor` — simplification tolerance as a multiple
   of each level resolution; default `1`.
-- `--row-group-size` — target number of point-equivalent resolution-grid cells
-  per Parquet row group; default `10000`. A point consumes one cell. For each
-  line or polygon level, the row limit is derived by dividing this budget by
-  the mean bbox occupancy on that level's resolution grid. The value is
-  therefore also the row limit for point data.
-- `--row-group-max-bytes` — approximate maximum uncompressed bytes of the
-  largest usable overview representation in a row group; default 4 MiB.
+- `--row-group-size` — maximum number of rows per Parquet row group; default
+  `10000`. Level boundaries and `--row-group-max-bytes` may produce smaller
+  row groups, but geometry type and bbox size do not change this row limit.
+- `--row-group-max-bytes` — approximate maximum uncompressed render-geometry
+  bytes in a row group: the largest usable overview for Line/Polygon or primary
+  WKB for Point; default 4 MiB.
 - `--input-units auto|degrees|meters` — coordinate-unit handling. `auto`
   inspects GeoParquet CRS metadata. Reproject high-latitude or
   antimeridian-spanning data to a meter-based CRS for predictable tolerances.
@@ -85,15 +84,17 @@ The producer:
 - preserves original attributes and lossless primary geometry;
 - writes a canonical `bbox` struct and GeoParquet `covering.bbox` metadata;
 - emits row groups in coarse-to-fine order with level-aligned boundaries;
-- creates one sparse LoD child (`l0`, `l1`, …) per retained level under the
-  fixed `overviews` column;
+- for Line/Polygon, creates one sparse LoD child (`l0`, `l1`, …) per retained
+  level under the fixed `overviews` column; Point files omit the column;
 - simplifies each LoD directly from primary WKB, then encodes XY as `int32`
   lists using LoD-wide `scale` and `offset` metadata;
 - writes overview integer leaves with Parquet `DELTA_BINARY_PACKED` encoding
   and no dictionary, while retaining ZSTD compression;
 - writes bbox ColumnIndexes plus OffsetIndexes for every column, with
-  row-aligned data pages, so viewport readers can prune within row groups;
-- writes `cogp.levels[].resolution` and the required `lod` for every level.
+  row-aligned data pages and nested STR packing inside each row group, so
+  viewport readers can prune spatially compact page intervals;
+- writes `cogp.levels[].resolution`; Line/Polygon levels also declare the
+  required `lod`, while Point levels omit it.
 
 ## Library use — reading COGP files
 
@@ -120,8 +121,8 @@ let batches = reader.sync_batch_reader_with_bbox(
 for batch in batches {
     let batch = batch?;
     // Page pruning is conservative; apply the exact bbox predicate to rows.
-    // Project/decode `overviews.geometry_type` and `overviews.{lod}` for
-    // rendering, or explicitly project primary WKB for lossless analysis.
+    // For Line/Polygon, project/decode `overviews.geometry_type` and
+    // `overviews.{lod}`. For Point (or lossless analysis), project primary WKB.
     let _ = (&batch, lod);
 }
 # Ok::<(), anyhow::Error>(())
@@ -152,8 +153,8 @@ cogp validate <FILE>
 ```
 
 Validation covers GeoParquet bbox metadata and statistics, level ordering and
-coverage, required per-level `resolution` and `lod`, `quantized_xy_v1`
-metadata, finite scale/offset values, and the physical `overviews` leaf schema.
+coverage, per-level `resolution`, conditional Line/Polygon `lod` and
+`quantized_xy_v1` metadata, and the conditional physical `overviews` schema.
 Semantic rendering quality remains a producer responsibility.
 
 ## Benchmarks

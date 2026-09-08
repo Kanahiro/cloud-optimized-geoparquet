@@ -7,8 +7,8 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::meta::{
-    geometry_family, CogpMeta, GeoMeta, COGP_METADATA_KEY, COGP_VERSION, GEO_METADATA_KEY,
-    OVERVIEWS_COLUMN, OVERVIEWS_ENCODING,
+    geometry_family, CogpMeta, GeoMeta, GeometryFamily, COGP_METADATA_KEY, COGP_VERSION,
+    GEO_METADATA_KEY, OVERVIEWS_COLUMN, OVERVIEWS_ENCODING,
 };
 
 pub fn run(path: &Path) -> Result<()> {
@@ -71,7 +71,8 @@ pub fn run(path: &Path) -> Result<()> {
             bail!("validation failed");
         }
     };
-    if geometry_family(&primary_col.geometry_types).is_none() {
+    let geometry_family = geometry_family(&primary_col.geometry_types);
+    if geometry_family.is_none() {
         errors.push(format!(
             "`geo.columns[{primary}].geometry_types` must declare exactly one Point, Line, or Polygon family"
         ));
@@ -128,31 +129,46 @@ pub fn run(path: &Path) -> Result<()> {
 
     let mut prev_rge: Option<i64> = None;
     let mut prev_resolution: Option<f64> = None;
-    if cogp.overviews.encoding != OVERVIEWS_ENCODING {
-        errors.push(format!(
-            "cogp.overviews.encoding must be `{OVERVIEWS_ENCODING}`, got `{}`",
-            cogp.overviews.encoding
-        ));
-    }
-    if cogp.overviews.lods.is_empty() {
-        errors.push("`cogp.overviews.lods` must be non-empty".into());
-    }
-    for (lod, metadata) in &cogp.overviews.lods {
-        if lod.is_empty() {
-            errors.push("overview LoD names must be non-empty".into());
-        }
-        for axis in 0..2 {
-            if metadata.scale[axis].partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-                errors.push(format!(
-                    "overviews.lods.{lod}.scale[{axis}] must be positive and finite"
-                ));
-            }
-            if !metadata.offset[axis].is_finite() {
-                errors.push(format!(
-                    "overviews.lods.{lod}.offset[{axis}] must be finite"
-                ));
+    match geometry_family {
+        Some(GeometryFamily::Point) => {
+            if cogp.overviews.is_some() {
+                errors.push("Point-family files must not declare `cogp.overviews`".into());
             }
         }
+        Some(GeometryFamily::Line | GeometryFamily::Polygon) => match &cogp.overviews {
+            None => errors.push("Line/Polygon files must declare `cogp.overviews`".into()),
+            Some(overviews) => {
+                if overviews.encoding != OVERVIEWS_ENCODING {
+                    errors.push(format!(
+                        "cogp.overviews.encoding must be `{OVERVIEWS_ENCODING}`, got `{}`",
+                        overviews.encoding
+                    ));
+                }
+                if overviews.lods.is_empty() {
+                    errors.push("`cogp.overviews.lods` must be non-empty".into());
+                }
+                for (lod, metadata) in &overviews.lods {
+                    if lod.is_empty() {
+                        errors.push("overview LoD names must be non-empty".into());
+                    }
+                    for axis in 0..2 {
+                        if metadata.scale[axis].partial_cmp(&0.0)
+                            != Some(std::cmp::Ordering::Greater)
+                        {
+                            errors.push(format!(
+                                "overviews.lods.{lod}.scale[{axis}] must be positive and finite"
+                            ));
+                        }
+                        if !metadata.offset[axis].is_finite() {
+                            errors.push(format!(
+                                "overviews.lods.{lod}.offset[{axis}] must be finite"
+                            ));
+                        }
+                    }
+                }
+            }
+        },
+        None => {}
     }
     for (i, level) in cogp.levels.iter().enumerate() {
         if level.row_group_end < 0 || (level.row_group_end as usize) >= num_rgs {
@@ -186,13 +202,28 @@ pub fn run(path: &Path) -> Result<()> {
             }
         }
         prev_resolution = Some(level.resolution);
-        if level.lod.is_empty() {
-            errors.push(format!("levels[{i}].lod must be a non-empty string"));
-        } else if !cogp.overviews.lods.contains_key(&level.lod) {
-            errors.push(format!(
-                "levels[{i}].lod `{}` is missing from cogp.overviews.lods",
-                level.lod
-            ));
+        match geometry_family {
+            Some(GeometryFamily::Point) => {
+                if level.lod.is_some() {
+                    errors.push(format!("Point-family levels[{i}] must not declare lod"));
+                }
+            }
+            Some(GeometryFamily::Line | GeometryFamily::Polygon) => {
+                let Some(lod) = level.lod.as_deref().filter(|lod| !lod.is_empty()) else {
+                    errors.push(format!("levels[{i}].lod must be a non-empty string"));
+                    continue;
+                };
+                if !cogp
+                    .overviews
+                    .as_ref()
+                    .is_some_and(|overviews| overviews.lods.contains_key(lod))
+                {
+                    errors.push(format!(
+                        "levels[{i}].lod `{lod}` is missing from cogp.overviews.lods"
+                    ));
+                }
+            }
+            None => {}
         }
     }
     if let Some(last) = cogp.levels.last() {
@@ -207,7 +238,19 @@ pub fn run(path: &Path) -> Result<()> {
 
     let parquet_schema = metadata.file_metadata().schema_descr();
     match parquet_to_arrow_schema(parquet_schema, kv) {
-        Ok(schema) => validate_overviews_schema(schema.fields(), &cogp, &mut errors),
+        Ok(schema) => match geometry_family {
+            Some(GeometryFamily::Point) => {
+                if schema.field_with_name(OVERVIEWS_COLUMN).is_ok() {
+                    errors.push("Point-family files must not contain an `overviews` column".into());
+                }
+            }
+            Some(GeometryFamily::Line | GeometryFamily::Polygon) => {
+                if let Some(overviews) = &cogp.overviews {
+                    validate_overviews_schema(schema.fields(), overviews, &mut errors);
+                }
+            }
+            None => {}
+        },
         Err(error) => errors.push(format!("cannot decode Arrow schema: {error}")),
     }
 
@@ -298,7 +341,11 @@ pub fn run(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_overviews_schema(fields: &Fields, cogp: &CogpMeta, errors: &mut Vec<String>) {
+fn validate_overviews_schema(
+    fields: &Fields,
+    overviews: &crate::meta::OverviewsMeta,
+    errors: &mut Vec<String>,
+) {
     let Some(root) = fields.iter().find(|field| field.name() == OVERVIEWS_COLUMN) else {
         errors.push(format!("missing required `{OVERVIEWS_COLUMN}` struct"));
         return;
@@ -319,7 +366,7 @@ fn validate_overviews_schema(fields: &Fields, cogp: &CogpMeta, errors: &mut Vec<
         .iter()
         .filter(|field| field.name() != "geometry_type")
     {
-        if !cogp.overviews.lods.contains_key(child.name()) {
+        if !overviews.lods.contains_key(child.name()) {
             errors.push(format!(
                 "overview child `{}` has no cogp.overviews.lods metadata",
                 child.name()
@@ -327,7 +374,7 @@ fn validate_overviews_schema(fields: &Fields, cogp: &CogpMeta, errors: &mut Vec<
         }
         validate_lod_field(child, errors);
     }
-    for lod in cogp.overviews.lods.keys() {
+    for lod in overviews.lods.keys() {
         if children.find(lod).is_none() {
             errors.push(format!(
                 "cogp.overviews.lods.{lod} has no physical overview child"

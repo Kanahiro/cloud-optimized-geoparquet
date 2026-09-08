@@ -224,18 +224,19 @@ fn convert_reader_validate_pipeline() {
     assert_eq!(reader.primary_column(), "geometry");
 
     let cogp = reader.cogp_meta();
+    let overviews = cogp.overviews.as_ref().unwrap();
     assert!(cogp
         .levels
         .iter()
-        .all(|level| cogp.overviews.lods.contains_key(&level.lod)));
+        .all(|level| overviews.lods.contains_key(level.lod.as_deref().unwrap())));
     assert_eq!(
         reader.lod_for_resolution(cogp.levels[0].resolution),
-        cogp.levels[0].lod
+        cogp.levels[0].lod.as_deref()
     );
     let finest_level = cogp.levels.last().unwrap();
     assert_eq!(
         reader.lod_for_resolution(finest_level.resolution / 2.0),
-        finest_level.lod
+        finest_level.lod.as_deref()
     );
     for row_group in reader.parquet_metadata().row_groups() {
         for column in row_group.columns() {
@@ -355,7 +356,7 @@ fn convert_reader_validate_pipeline() {
     let mut geometry_boundaries = BTreeMap::new();
     for level in &cogp.levels {
         geometry_boundaries
-            .entry(level.lod.as_str())
+            .entry(level.lod.as_deref().unwrap())
             .and_modify(|boundary: &mut usize| {
                 *boundary = (*boundary).max(level.row_group_end as usize)
             })
@@ -417,7 +418,7 @@ fn convert_reader_validate_pipeline() {
 }
 
 #[test]
-fn convert_point_also_writes_overviews() {
+fn convert_point_omits_overviews() {
     let tmp = TempDir::new("point-primary-wkb");
     let input = tmp.path().join("input.parquet");
     let output = tmp.path().join("output.cogp.parquet");
@@ -431,14 +432,12 @@ fn convert_point_also_writes_overviews() {
     cogp::validate::run(&output).unwrap();
 
     let reader = Reader::open(&output).unwrap();
-    assert!(reader.levels().iter().all(|level| reader
-        .cogp_meta()
-        .overviews
-        .lods
-        .contains_key(&level.lod)));
+    assert!(reader.cogp_meta().overviews.is_none());
+    assert!(reader.levels().iter().all(|level| level.lod.is_none()));
+    assert_eq!(reader.lod_for_resolution(1_000.0), None);
     assert!(
         reader.num_row_groups() > 1,
-        "overview coordinates must drive the byte budget"
+        "primary Point WKB must drive the render-geometry byte budget"
     );
 
     let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
@@ -449,7 +448,7 @@ fn convert_point_also_writes_overviews() {
         .collect();
     let schema = batches[0].schema();
     assert!(schema.field_with_name("geometry").is_ok());
-    assert!(schema.field_with_name("overviews").is_ok());
+    assert!(schema.field_with_name("overviews").is_err());
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
 }
 
@@ -611,6 +610,30 @@ fn convert_explicit_resolution_path() {
     args.resolution = vec![1000.0, 100.0, 10.0];
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
+}
+
+#[test]
+fn convert_row_group_size_is_a_row_limit() {
+    let tmp = TempDir::new("row-group-rows");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("out.cogp.parquet");
+    write_input(&input);
+
+    let mut args = convert_args(&input, &output);
+    // These polygons span many cells at this resolution. Their spatial
+    // footprint must not reduce the configured eight-row group limit.
+    args.resolution = vec![1.0];
+    args.row_group_size = 8;
+    args.row_group_max_bytes = None;
+    cogp::convert::run(args).unwrap();
+
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(reader.num_row_groups(), 5);
+    assert!(reader
+        .parquet_metadata()
+        .row_groups()
+        .iter()
+        .all(|group| group.num_rows() <= 8));
 }
 
 #[test]

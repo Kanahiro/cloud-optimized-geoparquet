@@ -1,0 +1,962 @@
+[
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "tokyo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1270,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "osaka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1621,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "nagoya",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1519,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sapporo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 628,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "fukuoka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 927,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sendai",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1076,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "hiroshima",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1247,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "naha",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 5,
+    "candidate_rows": 2261,
+    "selected_rows": 359,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "tokyo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 886,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "osaka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 960,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "nagoya",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 822,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sapporo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 756,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "fukuoka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 804,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sendai",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 692,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "hiroshima",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 831,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "naha",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 8,
+    "candidate_rows": 5021,
+    "selected_rows": 576,
+    "selected_runs": 8
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "tokyo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 694,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "osaka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 832,
+    "selected_runs": 12
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "nagoya",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 822,
+    "selected_runs": 13
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sapporo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 756,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "fukuoka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 740,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "sendai",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 820,
+    "selected_runs": 12
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "hiroshima",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 573,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page64.parquet",
+    "center": "naha",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 11,
+    "candidate_rows": 37111,
+    "selected_rows": 704,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "tokyo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1398,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "osaka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1775,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "nagoya",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1782,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sapporo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 820,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "fukuoka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1247,
+    "selected_runs": 5
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sendai",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1332,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "hiroshima",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1454,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "naha",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 5,
+    "candidate_rows": 2261,
+    "selected_rows": 477,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "tokyo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1597,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "osaka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1526,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "nagoya",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1270,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sapporo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1147,
+    "selected_runs": 8
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "fukuoka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1334,
+    "selected_runs": 8
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sendai",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1083,
+    "selected_runs": 8
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "hiroshima",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 1403,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "naha",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 8,
+    "candidate_rows": 5021,
+    "selected_rows": 861,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "tokyo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1469,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "osaka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1526,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "nagoya",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1526,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sapporo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1403,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "fukuoka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1590,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "sendai",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1467,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "hiroshima",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 1529,
+    "selected_runs": 12
+  },
+  {
+    "file": "admin-fixed65536-page128.parquet",
+    "center": "naha",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 11,
+    "candidate_rows": 37111,
+    "selected_rows": 1245,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "tokyo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1972,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "osaka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2156,
+    "selected_runs": 2
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "nagoya",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2161,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sapporo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1460,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "fukuoka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1939,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sendai",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1716,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "hiroshima",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 1900,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "naha",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 5,
+    "candidate_rows": 2261,
+    "selected_rows": 981,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "tokyo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2681,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "osaka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2870,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "nagoya",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2169,
+    "selected_runs": 8
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sapporo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2171,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "fukuoka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2156,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sendai",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2171,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "hiroshima",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2412,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "naha",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 8,
+    "candidate_rows": 5021,
+    "selected_rows": 1493,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "tokyo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 3449,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "osaka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 3126,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "nagoya",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 3193,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sapporo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 2683,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "fukuoka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 2924,
+    "selected_runs": 11
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "sendai",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 3195,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "hiroshima",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 2668,
+    "selected_runs": 10
+  },
+  {
+    "file": "admin-fixed65536-nested.parquet",
+    "center": "naha",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 11,
+    "candidate_rows": 37111,
+    "selected_rows": 2261,
+    "selected_runs": 9
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "tokyo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2200,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "osaka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2451,
+    "selected_runs": 1
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "nagoya",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2330,
+    "selected_runs": 2
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sapporo",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2200,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "fukuoka",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2451,
+    "selected_runs": 1
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sendai",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2200,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "hiroshima",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 6,
+    "candidate_rows": 2451,
+    "selected_rows": 2451,
+    "selected_runs": 1
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "naha",
+    "resolution": 1000.0,
+    "level": 5,
+    "candidate_row_groups": 5,
+    "candidate_rows": 2261,
+    "selected_rows": 1237,
+    "selected_runs": 2
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "tokyo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 3677,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "osaka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 3679,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "nagoya",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 4189,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sapporo",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 3677,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "fukuoka",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 2653,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sendai",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 3677,
+    "selected_runs": 4
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "hiroshima",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 9,
+    "candidate_rows": 5211,
+    "selected_rows": 3800,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "naha",
+    "resolution": 100.0,
+    "level": 8,
+    "candidate_row_groups": 8,
+    "candidate_rows": 5021,
+    "selected_rows": 2463,
+    "selected_runs": 3
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "tokyo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 5213,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "osaka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 5215,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "nagoya",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 5215,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sapporo",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 4701,
+    "selected_runs": 6
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "fukuoka",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 4701,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "sendai",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 5213,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "hiroshima",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 12,
+    "candidate_rows": 37301,
+    "selected_rows": 4824,
+    "selected_runs": 7
+  },
+  {
+    "file": "admin-fixed65536-page512.parquet",
+    "center": "naha",
+    "resolution": 10.0,
+    "level": 11,
+    "candidate_row_groups": 11,
+    "candidate_rows": 37111,
+    "selected_rows": 3999,
+    "selected_runs": 6
+  }
+]

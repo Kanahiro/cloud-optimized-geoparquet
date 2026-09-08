@@ -1,0 +1,4 @@
+row_group_rows,row_group_label,parquet_row_groups,footer_kb,query_kb_10m,rtt25_ms_10m,query_requests_10m,selected_rows_10m
+4096,"4,096",43,422.6,2387.7,330.4,138.4,2905.4
+16384,"16,384",22,231.3,2422.0,247.3,134.0,2905.4
+65536,"65,536",17,184.8,2437.3,238.9,134.4,2937.4

@@ -1,0 +1,4 @@
+resolution,lod,row_group_end,wkb_compressed_bytes,overview_compressed_bytes,wkb_overview_ratio
+1000,l5,15,136388082,73687,1850.9
+100,l8,18,144618548,465117,310.9
+10,l11,31,161597729,2467214,65.5

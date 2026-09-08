@@ -12,6 +12,24 @@ export interface OverviewFileMetadata extends FileMetadataLike {
   [key: string]: unknown;
 }
 
+export type OverviewGeometryType = 1 | 2 | 3 | 4 | 5 | 6;
+
+type NumberArray = ArrayLike<number> & { readonly length: number };
+
+/**
+ * A zero-copy view over one quantized overview geometry. Custom renderers can
+ * consume this directly instead of first materializing nested GeoJSON arrays.
+ */
+export interface QuantizedOverviewGeometry {
+  readonly type: OverviewGeometryType;
+  readonly x: NumberArray;
+  readonly y: NumberArray;
+  readonly partEnds: NumberArray;
+  readonly polygonEnds: NumberArray;
+  readonly scale: readonly [number, number];
+  readonly offset: readonly [number, number];
+}
+
 export function rootColumnNames(schema: readonly SchemaElementLike[]): string[] {
   const root = schema[0];
   if (!root) throw new Error('parquet schema is empty');
@@ -59,54 +77,138 @@ export function projectOverviewMetadata<T extends OverviewFileMetadata>(metadata
 }
 
 export function decodeOverview(value: unknown, metadata: LodMetadata): unknown {
+  return decodeQuantizedOverview(parseOverview(value, metadata));
+}
+
+export function parseOverview(
+  value: unknown,
+  metadata: LodMetadata,
+): QuantizedOverviewGeometry | null {
   const root = value as Record<string, unknown> | undefined;
   if (!root) return null;
-  const geometryType = Number(root['geometry_type']);
+  const geometryType = Number(root['geometry_type']) as OverviewGeometryType;
+  if (!isOverviewGeometryType(geometryType)) {
+    throw new Error(`unsupported overview geometry type ${geometryType}`);
+  }
   const lodName = Object.keys(root).find((name) => name !== 'geometry_type');
   const lod = lodName ? root[lodName] as Record<string, unknown> | undefined : undefined;
   if (!lod) return null;
-  const xs = asNumbers(lod['x']);
-  const ys = asNumbers(lod['y']);
+  const xs = asNumberArray(lod['x']);
+  const ys = asNumberArray(lod['y']);
   if (xs.length !== ys.length) throw new Error('overview x/y lengths differ');
-  const coordinates = xs.map((x, index) => [
-    metadata.offset[0] + metadata.scale[0] * x,
-    metadata.offset[1] + metadata.scale[1] * ys[index]!,
-  ]);
-  const partEnds = asNumbers(lod['part_ends']);
-  const polygonEnds = asNumbers(lod['polygon_ends']);
-  switch (geometryType) {
-    case 1: return { type: 'Point', coordinates: coordinates[0] ?? [] };
-    case 2: return { type: 'LineString', coordinates };
-    case 3: return { type: 'Polygon', coordinates: splitAt(coordinates, partEnds) };
-    case 4: return { type: 'MultiPoint', coordinates };
-    case 5: return { type: 'MultiLineString', coordinates: splitAt(coordinates, partEnds) };
+  const partEnds = asNumberArray(lod['part_ends']);
+  const polygonEnds = asNumberArray(lod['polygon_ends']);
+  if (geometryType === 3 || geometryType === 5 || geometryType === 6) {
+    validateEnds(partEnds, xs.length, 'overview part');
+  }
+  if (geometryType === 6) {
+    validateEnds(polygonEnds, partEnds.length, 'overview polygon');
+  }
+  return {
+    type: geometryType,
+    x: xs,
+    y: ys,
+    partEnds,
+    polygonEnds,
+    scale: metadata.scale,
+    offset: metadata.offset,
+  };
+}
+
+export function decodeQuantizedOverview(value: QuantizedOverviewGeometry | null): unknown {
+  if (!value) return null;
+  const decode = coordinateDecoder(value);
+  switch (value.type) {
+    case 1: return { type: 'Point', coordinates: value.x.length ? decode(0) : [] };
+    case 2: return { type: 'LineString', coordinates: decodeRange(decode, 0, value.x.length) };
+    case 3: return { type: 'Polygon', coordinates: decodeParts(decode, value.x.length, value.partEnds) };
+    case 4: return { type: 'MultiPoint', coordinates: decodeRange(decode, 0, value.x.length) };
+    case 5: return { type: 'MultiLineString', coordinates: decodeParts(decode, value.x.length, value.partEnds) };
     case 6: {
-      const rings = splitAt(coordinates, partEnds);
-      return { type: 'MultiPolygon', coordinates: splitAt(rings, polygonEnds) };
+      const rings = decodeParts(decode, value.x.length, value.partEnds);
+      return { type: 'MultiPolygon', coordinates: splitParts(rings, value.polygonEnds) };
     }
-    default: throw new Error(`unsupported overview geometry type ${geometryType}`);
   }
 }
 
-function asNumbers(value: unknown): number[] {
+function asNumberArray(value: unknown): NumberArray {
   if (!Array.isArray(value) && !ArrayBuffer.isView(value as ArrayBufferView)) {
     throw new Error('overview coordinate field is not an array');
   }
-  return Array.from(value as ArrayLike<number>, Number);
+  // Hyparquet commonly returns typed arrays. Keep their backing store instead
+  // of cloning it with Array.from; decoding only needs indexed read access.
+  return value as NumberArray;
 }
 
-function splitAt<T>(values: T[], ends: number[]): T[][] {
+function coordinateDecoder(
+  value: QuantizedOverviewGeometry,
+): (index: number) => [number, number] {
+  const [scaleX, scaleY] = value.scale;
+  const [offsetX, offsetY] = value.offset;
+  return (index) => [
+    offsetX + scaleX * Number(value.x[index]),
+    offsetY + scaleY * Number(value.y[index]),
+  ];
+}
+
+function decodeRange(
+  decode: (index: number) => [number, number],
+  start: number,
+  end: number,
+): [number, number][] {
+  const result = new Array<[number, number]>(end - start);
+  for (let i = start; i < end; i++) result[i - start] = decode(i);
+  return result;
+}
+
+function decodeParts(
+  decode: (index: number) => [number, number],
+  valueCount: number,
+  ends: NumberArray,
+): [number, number][][] {
+  const result = new Array<[number, number][]>(ends.length);
+  let start = 0;
+  for (let i = 0; i < ends.length; i++) {
+    const end = Number(ends[i]);
+    validateEnd(end, start, valueCount, 'overview part');
+    result[i] = decodeRange(decode, start, end);
+    start = end;
+  }
+  if (start !== valueCount) throw new Error('overview part end offsets do not cover all values');
+  return result;
+}
+
+function splitParts<T>(values: T[], ends: NumberArray): T[][] {
   const result: T[][] = [];
   let start = 0;
-  for (const end of ends) {
-    if (!Number.isInteger(end) || end < start || end > values.length) {
-      throw new Error('invalid overview end offset');
-    }
+  for (let i = 0; i < ends.length; i++) {
+    const end = Number(ends[i]);
+    validateEnd(end, start, values.length, 'overview polygon');
     result.push(values.slice(start, end));
     start = end;
   }
-  if (start !== values.length) throw new Error('overview end offsets do not cover all values');
+  if (start !== values.length) throw new Error('overview polygon end offsets do not cover all values');
   return result;
+}
+
+function validateEnd(end: number, start: number, length: number, label: string): void {
+  if (!Number.isInteger(end) || end < start || end > length) {
+    throw new Error(`invalid ${label} end offset`);
+  }
+}
+
+function validateEnds(ends: NumberArray, length: number, label: string): void {
+  let start = 0;
+  for (let i = 0; i < ends.length; i++) {
+    const end = Number(ends[i]);
+    validateEnd(end, start, length, label);
+    start = end;
+  }
+  if (start !== length) throw new Error(`${label} end offsets do not cover all values`);
+}
+
+function isOverviewGeometryType(value: number): value is OverviewGeometryType {
+  return Number.isInteger(value) && value >= 1 && value <= 6;
 }
 
 function subtreeSize(schema: readonly SchemaElementLike[], index: number): number {

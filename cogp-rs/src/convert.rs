@@ -32,7 +32,7 @@ use crate::meta::{
 };
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
 use crate::wkb_simplify::{
-    first_viable_level, overview_scale, quantized_overview, QuantizedOverview,
+    first_viable_level, overview_scale, quantized_overview_with_fallback, QuantizedOverview,
 };
 
 #[derive(Args)]
@@ -60,13 +60,12 @@ pub struct ConvertArgs {
     /// --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
-    /// Target point-equivalent resolution-grid cells per Parquet row group.
-    /// A point occupies one cell; a line or polygon consumes its bbox cell occupancy.
-    /// For Point data this is also the row limit.
+    /// Maximum number of rows per Parquet row group. Level boundaries and the
+    /// render-geometry byte limit may produce smaller row groups.
     #[arg(long, default_value_t = 10_000)]
     pub row_group_size: usize,
-    /// Maximum cumulative coordinate bytes in a row group's largest usable
-    /// geometry overview.
+    /// Maximum cumulative render-geometry bytes in a row group: the largest
+    /// usable overview for Line/Polygon or primary WKB for Point.
     #[arg(long, default_value = "4194304")]
     pub row_group_max_bytes: Option<usize>,
     /// Simplification tolerance as a multiple of each level's resolution.
@@ -144,26 +143,21 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64
 
 /// Owns the row-group boundary policy. Parquet's writer still enforces the
 /// hard row count, while this limiter tracks the bytes that rendering readers
-/// can actually project. In particular, lossless primary WKB does not make
-/// overview-backed row groups artificially tiny.
+/// can actually project. Line and Polygon files use overview bytes; Point files
+/// use their already-compact primary WKB because they have no overviews.
 struct RowGroupLimiter {
     max_rows: usize,
-    max_overview_bytes: Option<usize>,
-    in_progress_overview_bytes: usize,
+    max_render_geometry_bytes: Option<usize>,
+    in_progress_render_geometry_bytes: usize,
 }
 
 impl RowGroupLimiter {
-    fn new(max_rows: usize, max_overview_bytes: Option<usize>) -> Self {
+    fn new(max_rows: usize, max_render_geometry_bytes: Option<usize>) -> Self {
         Self {
             max_rows,
-            max_overview_bytes,
-            in_progress_overview_bytes: 0,
+            max_render_geometry_bytes,
+            in_progress_render_geometry_bytes: 0,
         }
-    }
-
-    fn start_level(&mut self, max_rows: usize) {
-        debug_assert_eq!(self.in_progress_overview_bytes, 0);
-        self.max_rows = max_rows;
     }
 
     fn write<W: Write + Send>(
@@ -172,17 +166,18 @@ impl RowGroupLimiter {
         batch: &RecordBatch,
         render_geometry_columns: &[usize],
     ) -> Result<()> {
-        let row_overview_bytes = overview_bytes_per_row(batch, render_geometry_columns)?;
+        let row_render_geometry_bytes =
+            render_geometry_bytes_per_row(batch, render_geometry_columns)?;
         let mut offset = 0;
         while offset < batch.num_rows() {
             if writer.in_progress_rows() == 0 {
-                self.in_progress_overview_bytes = 0;
+                self.in_progress_render_geometry_bytes = 0;
             }
             if writer.in_progress_rows() >= self.max_rows
                 || (writer.in_progress_rows() > 0
                     && self
-                        .max_overview_bytes
-                        .is_some_and(|max| self.in_progress_overview_bytes >= max))
+                        .max_render_geometry_bytes
+                        .is_some_and(|max| self.in_progress_render_geometry_bytes >= max))
             {
                 self.flush(writer)?;
                 continue;
@@ -190,12 +185,12 @@ impl RowGroupLimiter {
 
             let row_capacity = self.max_rows - writer.in_progress_rows();
             let available = batch.num_rows() - offset;
-            let rows = match self.max_overview_bytes {
+            let rows = match self.max_render_geometry_bytes {
                 None => available.min(row_capacity),
-                Some(max_bytes) => rows_within_overview_budget(
-                    &row_overview_bytes[offset..],
+                Some(max_bytes) => rows_within_render_geometry_budget(
+                    &row_render_geometry_bytes[offset..],
                     available.min(row_capacity),
-                    max_bytes.saturating_sub(self.in_progress_overview_bytes),
+                    max_bytes.saturating_sub(self.in_progress_render_geometry_bytes),
                     writer.in_progress_rows() == 0,
                 ),
             };
@@ -204,7 +199,7 @@ impl RowGroupLimiter {
                 continue;
             }
 
-            let added_overview_bytes = row_overview_bytes[offset..offset + rows]
+            let added_render_geometry_bytes = row_render_geometry_bytes[offset..offset + rows]
                 .iter()
                 .fold(0usize, |total, bytes| total.saturating_add(*bytes));
             writer.write(&batch.slice(offset, rows))?;
@@ -213,14 +208,14 @@ impl RowGroupLimiter {
             // ArrowWriter auto-flushes on its row limit. Keep our accounting
             // synchronized with that implicit boundary.
             if writer.in_progress_rows() == 0 {
-                self.in_progress_overview_bytes = 0;
+                self.in_progress_render_geometry_bytes = 0;
             } else {
-                self.in_progress_overview_bytes = self
-                    .in_progress_overview_bytes
-                    .saturating_add(added_overview_bytes);
+                self.in_progress_render_geometry_bytes = self
+                    .in_progress_render_geometry_bytes
+                    .saturating_add(added_render_geometry_bytes);
                 if self
-                    .max_overview_bytes
-                    .is_some_and(|max| self.in_progress_overview_bytes >= max)
+                    .max_render_geometry_bytes
+                    .is_some_and(|max| self.in_progress_render_geometry_bytes >= max)
                 {
                     self.flush(writer)?;
                 }
@@ -231,15 +226,16 @@ impl RowGroupLimiter {
 
     fn flush<W: Write + Send>(&mut self, writer: &mut ArrowWriter<W>) -> Result<()> {
         writer.flush()?;
-        self.in_progress_overview_bytes = 0;
+        self.in_progress_render_geometry_bytes = 0;
         Ok(())
     }
 }
 
-/// For every row, use the largest non-null overview payload. A row group may
-/// be read at several display scales, so budgeting only the coarsest overview
-/// would leave finer overview fetches unbounded.
-fn overview_bytes_per_row(
+/// For every row, use primary WKB for Point data or the largest non-null
+/// overview payload for Line/Polygon data. An overview-backed row group may be
+/// read at several display scales, so budgeting only its coarsest LoD would
+/// leave finer overview fetches unbounded.
+fn render_geometry_bytes_per_row(
     batch: &RecordBatch,
     render_geometry_columns: &[usize],
 ) -> Result<Vec<usize>> {
@@ -294,15 +290,15 @@ fn overview_bytes_per_row(
     Ok(sizes)
 }
 
-fn rows_within_overview_budget(
-    row_overview_bytes: &[usize],
+fn rows_within_render_geometry_budget(
+    row_render_geometry_bytes: &[usize],
     max_rows: usize,
     remaining_bytes: usize,
     empty_row_group: bool,
 ) -> usize {
     let mut rows = 0;
     let mut bytes = 0usize;
-    for &row_bytes in row_overview_bytes.iter().take(max_rows) {
+    for &row_bytes in row_render_geometry_bytes.iter().take(max_rows) {
         if bytes.saturating_add(row_bytes) > remaining_bytes {
             // A single geometry is indivisible. Give it a one-row group so it
             // cannot force unrelated rows over the target as well.
@@ -600,40 +596,24 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         occupied_candidates.len(),
         resolutions.len()
     );
-    let row_group_plans = per_level
-        .iter()
-        .enumerate()
-        .map(|(level, rows)| {
-            spatial_row_group_plan(
-                rows,
-                &bboxes,
-                &kinds,
-                resolutions[level],
-                input_units,
-                args.row_group_size,
-            )
-        })
-        .collect::<Vec<_>>();
-    let row_group_sizes = row_group_plans
-        .iter()
-        .map(|plan| plan.max_rows)
-        .collect::<Vec<_>>();
     for (level, rows) in per_level.iter().enumerate() {
-        let plan = row_group_plans[level];
         eprintln!(
-            "      level {level} (resolution={:>10.2} m): {:>9} features, {:>5} rows/group \
-             (bbox cells mean={:.1}, p50={:.0}, p90={:.0})",
+            "      level {level} (resolution={:>10.2} m): {:>9} features, <= {:>5} rows/group",
             resolutions[level],
             rows.len(),
-            row_group_sizes[level],
-            plan.mean_cells,
-            plan.median_cells,
-            plan.p90_cells,
+            args.row_group_size,
         );
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(rows, &bboxes, row_group_sizes[level_idx], level_idx);
+        str_pack(rows, &bboxes, args.row_group_size, level_idx);
+        str_pack_pages(
+            rows,
+            &bboxes,
+            args.row_group_size,
+            PAGE_INDEX_ROWS,
+            level_idx,
+        );
     }
 
     let dataset_bbox = bboxes
@@ -646,31 +626,35 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             a.merge(&b);
             a
         });
-    let overview_plan: Vec<OverviewPlan> = resolutions
-        .iter()
-        .enumerate()
-        .map(|(level, resolution)| {
-            let tolerance = resolution_in_input_units(
-                *resolution * args.simplification_tolerance_factor,
-                input_units,
-            );
-            let scale = overview_scale(tolerance)?;
-            let center = [
-                (dataset_bbox.xmin + dataset_bbox.xmax) * 0.5,
-                (dataset_bbox.ymin + dataset_bbox.ymax) * 0.5,
-            ];
-            Ok(OverviewPlan {
-                id: format!("l{level}"),
-                level,
-                tolerance,
-                scale: [scale, scale],
-                offset: [
-                    (center[0] / scale).round() * scale,
-                    (center[1] / scale).round() * scale,
-                ],
+    let overview_plan: Vec<OverviewPlan> = if declared_geometry_family == GeometryFamily::Point {
+        Vec::new()
+    } else {
+        resolutions
+            .iter()
+            .enumerate()
+            .map(|(level, resolution)| {
+                let tolerance = resolution_in_input_units(
+                    *resolution * args.simplification_tolerance_factor,
+                    input_units,
+                );
+                let scale = overview_scale(tolerance)?;
+                let center = [
+                    (dataset_bbox.xmin + dataset_bbox.xmax) * 0.5,
+                    (dataset_bbox.ymin + dataset_bbox.ymax) * 0.5,
+                ];
+                Ok(OverviewPlan {
+                    id: format!("l{level}"),
+                    level,
+                    tolerance,
+                    scale: [scale, scale],
+                    offset: [
+                        (center[0] / scale).round() * scale,
+                        (center[1] / scale).round() * scale,
+                    ],
+                })
             })
-        })
-        .collect::<Result<_>>()?;
+            .collect::<Result<_>>()?
+    };
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
     // Replace any pre-existing `bbox` column (and the bbox covering column we
@@ -691,7 +675,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         output_fields.push(f.clone());
         keep_col_indices.push(i);
     }
-    output_fields.push(Arc::new(overviews_struct_field(&overview_plan)));
+    if !overview_plan.is_empty() {
+        output_fields.push(Arc::new(overviews_struct_field(&overview_plan)));
+    }
     output_fields.push(Arc::new(bbox_struct_field()));
     let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -710,7 +696,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // as bytes, and match the write batch so the writer can honor that boundary
     // closely. Offset indexes are emitted for every column, allowing a bbox
     // page selection to skip the corresponding overview and attribute pages.
-    const PAGE_INDEX_ROWS: usize = 256;
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_size(args.row_group_size)
@@ -772,14 +757,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("internal: primary geometry column was dropped"))?;
     let producer_keep = keep_col_indices;
     let producer_per_level = per_level;
-    let producer_row_group_sizes = row_group_sizes.clone();
+    let producer_row_group_size = args.row_group_size;
     let producer_overview_plan = overview_plan.clone();
     let producer = thread::spawn(move || -> Result<()> {
         let chunks: Vec<(usize, &[u32])> = producer_per_level
             .iter()
             .enumerate()
             .flat_map(|(level_i, rows)| {
-                rows.chunks(producer_row_group_sizes[level_i])
+                rows.chunks(producer_row_group_size)
                     .map(move |chunk| (level_i, chunk))
             })
             .collect();
@@ -817,8 +802,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     let mut last_level: Option<usize> = None;
     let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
-    let render_geometry_columns = vec![output_schema.index_of(OVERVIEWS_COLUMN)?];
-    let mut row_group_limiter = RowGroupLimiter::new(row_group_sizes[0], args.row_group_max_bytes);
+    let render_geometry_columns = vec![if overview_plan.is_empty() {
+        output_schema.index_of(&geom_col_name)?
+    } else {
+        output_schema.index_of(OVERVIEWS_COLUMN)?
+    }];
+    let mut row_group_limiter = RowGroupLimiter::new(args.row_group_size, args.row_group_max_bytes);
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
@@ -826,9 +815,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 levels_meta.push(Level {
                     row_group_end: flushed_row_group_end(&writer)?,
                     resolution: resolutions[prev],
-                    lod: overview_plan[prev].id.clone(),
+                    lod: overview_plan.get(prev).map(|overview| overview.id.clone()),
                 });
-                row_group_limiter.start_level(row_group_sizes[level_i]);
             }
         }
         row_group_limiter.write(&mut writer, &batch, &render_geometry_columns)?;
@@ -839,7 +827,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         levels_meta.push(Level {
             row_group_end: flushed_row_group_end(&writer)?,
             resolution: resolutions[prev],
-            lod: overview_plan[prev].id.clone(),
+            lod: overview_plan.get(prev).map(|overview| overview.id.clone()),
         });
     }
     producer
@@ -882,7 +870,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let cogp_meta = CogpMeta {
         version: COGP_VERSION.to_string(),
         levels: levels_meta,
-        overviews: OverviewsMeta {
+        overviews: (!overview_plan.is_empty()).then(|| OverviewsMeta {
             encoding: OVERVIEWS_ENCODING.to_string(),
             lods: overview_plan
                 .iter()
@@ -896,7 +884,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     )
                 })
                 .collect(),
-        },
+        }),
     };
 
     writer.append_key_value_metadata(KeyValue {
@@ -1351,6 +1339,7 @@ fn var_width_bytes_at(arr: &dyn Array, i: usize) -> usize {
 /// sum across columns bounds each single column, so staying under 1 GiB keeps
 /// every i32-offset column comfortably below arrow's ~2 GiB overflow point.
 const SEGMENT_MAX_BYTES: usize = 1 << 30;
+const PAGE_INDEX_ROWS: usize = 256;
 
 /// Skip/select run-length selection over the whole file for the given
 /// ascending, duplicate-free row indices.
@@ -1461,17 +1450,20 @@ fn gather_chunk(
             seg_bytes += weights[seg_end];
             seg_end += 1;
         }
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(n_cols + 2);
+        let mut cols: Vec<ArrayRef> =
+            Vec::with_capacity(n_cols + usize::from(!layout.overview_plan.is_empty()) + 1);
         for refs in &col_refs {
             cols.push(interleave(refs, &locs[seg_start..seg_end])?);
         }
-        let raw_geometry = cols[layout.geometry_col].clone();
-        cols.push(Arc::new(build_overviews_array(
-            raw_geometry.as_ref(),
-            layout.feature_level,
-            layout.overview_plan,
-            &chunk[seg_start..seg_end],
-        )?));
+        if !layout.overview_plan.is_empty() {
+            let raw_geometry = cols[layout.geometry_col].clone();
+            cols.push(Arc::new(build_overviews_array(
+                raw_geometry.as_ref(),
+                layout.feature_level,
+                layout.overview_plan,
+                &chunk[seg_start..seg_end],
+            )?));
+        }
         let seg_bboxes: Vec<Bbox> = chunk[seg_start..seg_end]
             .iter()
             .map(|r| bboxes[*r as usize])
@@ -1491,56 +1483,6 @@ fn resolution_in_input_units(resolution: f64, units: InputUnits) -> f64 {
         InputUnits::Meters => resolution,
         InputUnits::Auto => unreachable!("input units must be resolved before conversion"),
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SpatialRowGroupPlan {
-    max_rows: usize,
-    mean_cells: f64,
-    median_cells: f64,
-    p90_cells: f64,
-}
-
-/// A point occupies one resolution-grid cell, so the configured cell budget is
-/// also its row limit. Lines and polygons consume the number of cells covered
-/// by their bbox; using the bbox rather than geometry length or area matches
-/// the envelope that controls row-group pruning.
-fn spatial_row_group_plan(
-    rows: &[u32],
-    bboxes: &[Bbox],
-    kinds: &[GeomKind],
-    resolution: f64,
-    units: InputUnits,
-    cell_budget: usize,
-) -> SpatialRowGroupPlan {
-    debug_assert!(!rows.is_empty());
-    let grid = resolution_in_input_units(resolution, units);
-    let mut cells = rows
-        .iter()
-        .map(|row| {
-            let row = *row as usize;
-            match kinds[row] {
-                GeomKind::Point => 1.0,
-                GeomKind::Line | GeomKind::Polygon => bbox_grid_cells(&bboxes[row], grid),
-            }
-        })
-        .collect::<Vec<_>>();
-    let mean_cells = cells.iter().sum::<f64>() / cells.len() as f64;
-    cells.sort_unstable_by(f64::total_cmp);
-    let median_cells = cells[(cells.len() - 1) / 2];
-    let p90_cells = cells[(cells.len() - 1) * 9 / 10];
-    let max_rows = ((cell_budget as f64 / mean_cells).floor() as usize).clamp(1, cell_budget);
-    SpatialRowGroupPlan {
-        max_rows,
-        mean_cells,
-        median_cells,
-        p90_cells,
-    }
-}
-
-fn bbox_grid_cells(bbox: &Bbox, grid: f64) -> f64 {
-    let axis_cells = |min: f64, max: f64| ((max - min) / grid).ceil().max(1.0);
-    axis_cells(bbox.xmin, bbox.xmax) * axis_cells(bbox.ymin, bbox.ymax)
 }
 
 fn occupied_level_candidates(assignment: &[u16], candidate_count: usize) -> Result<Vec<usize>> {
@@ -1599,6 +1541,10 @@ fn build_overviews_array(
     if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
         bail!("primary geometry is not a WKB Binary/LargeBinary column");
     }
+    let fallback_tolerance = plan
+        .get(feature_level)
+        .ok_or_else(|| anyhow!("internal: feature level has no overview plan"))?
+        .tolerance;
 
     let mut geometry_types = vec![None; array.len()];
     let mut lod_arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len());
@@ -1611,14 +1557,18 @@ fn build_overviews_array(
                 }
                 bytes_at(index)
                     .map(|bytes| {
-                        quantized_overview(bytes, overview.tolerance, overview.offset).with_context(
-                            || {
-                                format!(
-                                    "building {} overview for input row {} (feature level {})",
-                                    overview.id, source_rows[index], feature_level
-                                )
-                            },
+                        quantized_overview_with_fallback(
+                            bytes,
+                            overview.tolerance,
+                            fallback_tolerance,
+                            overview.offset,
                         )
+                        .with_context(|| {
+                            format!(
+                                "building {} overview for input row {} (feature level {})",
+                                overview.id, source_rows[index], feature_level
+                            )
+                        })
                     })
                     .transpose()
             })
@@ -1980,6 +1930,25 @@ fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_i
     );
 }
 
+/// Preserve row-group membership while recursively packing page-sized
+/// intervals. Page indexes describe row intervals, so spatial locality must
+/// hold at this nested physical unit as well as at the row-group level.
+fn str_pack_pages(
+    rows: &mut [u32],
+    bboxes: &[Bbox],
+    row_group_size: usize,
+    page_row_count: usize,
+    level_idx: usize,
+) {
+    rows.chunks_mut(row_group_size)
+        .enumerate()
+        .for_each(|(row_group_idx, row_group)| {
+            let mut scratch = vec![(0.0, 0); row_group.len()];
+            let dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
+            str_pack_rec(row_group, &mut scratch, bboxes, page_row_count, dir);
+        });
+}
+
 fn str_pack_rec(
     rows: &mut [u32],
     scratch: &mut [(f64, u32)],
@@ -2072,42 +2041,6 @@ mod tests {
     }
 
     #[test]
-    fn spatial_row_group_plan_uses_cell_budget_as_the_point_row_limit() {
-        let bboxes = vec![bb(0.0, 0.0, 0.0, 0.0), bb(100.0, 100.0, 100.0, 100.0)];
-        let kinds = vec![GeomKind::Point; 2];
-        let plan =
-            spatial_row_group_plan(&[0, 1], &bboxes, &kinds, 10.0, InputUnits::Meters, 5_000);
-        assert_eq!(plan.max_rows, 5_000);
-        assert_eq!(plan.mean_cells, 1.0);
-    }
-
-    #[test]
-    fn spatial_row_group_plan_scales_lines_by_bbox_cell_occupancy() {
-        let bboxes = vec![bb(0.0, 0.0, 20.0, 20.0)];
-        let kinds = vec![GeomKind::Line];
-        let plan = spatial_row_group_plan(&[0], &bboxes, &kinds, 10.0, InputUnits::Meters, 4_000);
-        assert_eq!(plan.max_rows, 1_000);
-        assert_eq!(plan.mean_cells, 4.0);
-    }
-
-    #[test]
-    fn spatial_row_group_plan_scales_rows_by_bbox_cell_occupancy() {
-        let bboxes = vec![bb(0.0, 0.0, 20.0, 20.0), bb(30.0, 0.0, 50.0, 20.0)];
-        let kinds = vec![GeomKind::Polygon; 2];
-        let plan =
-            spatial_row_group_plan(&[0, 1], &bboxes, &kinds, 10.0, InputUnits::Meters, 4_000);
-        assert_eq!(plan.mean_cells, 4.0);
-        assert_eq!(plan.median_cells, 4.0);
-        assert_eq!(plan.p90_cells, 4.0);
-        assert_eq!(plan.max_rows, 1_000);
-    }
-
-    #[test]
-    fn bbox_grid_cells_counts_sub_grid_width_as_one_cell() {
-        assert_eq!(bbox_grid_cells(&bb(0.0, 0.0, 20.0, 1.0), 10.0), 2.0);
-    }
-
-    #[test]
     fn empty_candidates_are_removed_and_occupied_candidates_are_preserved() {
         let assignment = vec![0, 2, 2, 4];
         assert_eq!(
@@ -2121,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_budget_ignores_primary_geometry() {
+    fn render_geometry_budget_uses_selected_columns() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("geometry", DataType::Binary, false),
             Field::new("geometry_ovr_0", DataType::Binary, true),
@@ -2150,21 +2083,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            overview_bytes_per_row(&batch, &[1, 2]).unwrap(),
+            render_geometry_bytes_per_row(&batch, &[1, 2]).unwrap(),
             vec![80, 60]
         );
         assert_eq!(
-            overview_bytes_per_row(&batch, &[0]).unwrap(),
+            render_geometry_bytes_per_row(&batch, &[0]).unwrap(),
             vec![10_000, 20_000]
         );
     }
 
     #[test]
     fn wkb_budget_splits_before_overflow_and_isolates_oversized_rows() {
-        assert_eq!(rows_within_overview_budget(&[40, 50, 20], 3, 100, true), 2);
-        assert_eq!(rows_within_overview_budget(&[20], 1, 10, false), 0);
-        assert_eq!(rows_within_overview_budget(&[120, 5], 2, 100, true), 1);
-        assert_eq!(rows_within_overview_budget(&[0, 0, 0], 2, 0, true), 2);
+        assert_eq!(
+            rows_within_render_geometry_budget(&[40, 50, 20], 3, 100, true),
+            2
+        );
+        assert_eq!(rows_within_render_geometry_budget(&[20], 1, 10, false), 0);
+        assert_eq!(
+            rows_within_render_geometry_budget(&[120, 5], 2, 100, true),
+            1
+        );
+        assert_eq!(
+            rows_within_render_geometry_budget(&[0, 0, 0], 2, 0, true),
+            2
+        );
     }
 
     #[test]
@@ -2476,6 +2418,36 @@ mod tests {
         sorted.sort();
         let expected: Vec<u32> = (0..17u32).collect();
         assert_eq!(sorted, expected, "str_pack must preserve the row set");
+    }
+
+    #[test]
+    fn str_pack_pages_preserves_row_groups_and_packs_page_leaves() {
+        let bboxes = vec![
+            bb(0.0, 0.0, 0.0, 0.0),
+            bb(100.0, 100.0, 100.0, 100.0),
+            bb(0.0, 1.0, 0.0, 1.0),
+            bb(100.0, 101.0, 100.0, 101.0),
+            bb(1.0, 0.0, 1.0, 0.0),
+            bb(101.0, 100.0, 101.0, 100.0),
+            bb(1.0, 1.0, 1.0, 1.0),
+            bb(101.0, 101.0, 101.0, 101.0),
+        ];
+        let mut rows: Vec<u32> = (0..8).collect();
+        let original = rows.clone();
+
+        str_pack_pages(&mut rows, &bboxes, 8, 2, 0);
+
+        let mut sorted = rows.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, original);
+        for page in rows.chunks(2) {
+            let mut envelope = Bbox::empty();
+            for row in page {
+                envelope.merge(&bboxes[*row as usize]);
+            }
+            assert!(envelope.width() <= 1.0);
+            assert!(envelope.height() <= 1.0);
+        }
     }
 
     #[test]

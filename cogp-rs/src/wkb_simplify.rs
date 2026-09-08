@@ -74,12 +74,32 @@ pub fn overview_scale(tolerance: f64) -> Result<f64> {
 /// Build an XY-only integer overview. `offset` must be aligned to `scale`;
 /// producers normally choose an aligned point near the dataset bbox centre so
 /// signed 32-bit coordinates cover the largest possible extent.
+#[cfg(test)]
 pub fn quantized_overview(
     bytes: &[u8],
     tolerance: f64,
     offset: [f64; 2],
 ) -> Result<QuantizedOverview> {
+    quantized_overview_with_fallback(bytes, tolerance, tolerance, offset)
+}
+
+/// Build an overview, repeating a known-valid coarser representation when
+/// quantization makes an otherwise finer Polygon LoD invalid. Simplification
+/// viability is not monotonic across fixed grids: a thin polygon can be valid
+/// on one grid, collapse on the next, and become valid again on a finer grid.
+/// Reusing the feature's entry-level shape keeps it visible without requiring
+/// callers to understand or pre-scan that topology edge case.
+pub fn quantized_overview_with_fallback(
+    bytes: &[u8],
+    tolerance: f64,
+    fallback_tolerance: f64,
+    offset: [f64; 2],
+) -> Result<QuantizedOverview> {
     validate_tolerance(tolerance)?;
+    validate_tolerance(fallback_tolerance)?;
+    if fallback_tolerance < tolerance {
+        bail!("overview fallback tolerance must be at least the requested tolerance");
+    }
     let mut source = parse_complete_geometry(bytes)?;
     strip_to_xy(&mut source);
     let scale = quantization_grid(tolerance);
@@ -89,9 +109,19 @@ pub fn quantized_overview(
         // level (for example, a sub-pixel polygon). Its required overview must
         // still be independently renderable without falling back to WKB.
         OverviewOutcome::NotViable | OverviewOutcome::PreserveSource => {
-            rendering_fallback(&source, scale).ok_or_else(|| {
-                anyhow::anyhow!("geometry cannot be represented as a valid rendering overview")
-            })?
+            rendering_fallback(&source, scale)
+                .or_else(|| {
+                    if fallback_tolerance == tolerance {
+                        return None;
+                    }
+                    match build_overview(&source, fallback_tolerance) {
+                        OverviewOutcome::Built(geometry) => Some(geometry),
+                        OverviewOutcome::NotViable | OverviewOutcome::PreserveSource => None,
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("geometry cannot be represented as a valid rendering overview")
+                })?
         }
     };
     flatten_quantized(&geometry, scale, offset)
@@ -816,10 +846,22 @@ fn raw_type_with_kind(raw_type: u32, kind: u32) -> u32 {
 }
 
 fn signed_area2(points: &[Coordinate]) -> f64 {
+    let Some(origin) = points.first() else {
+        return 0.0;
+    };
+    // Polygon area is translation invariant. Subtracting a nearby origin
+    // avoids catastrophic cancellation for sub-meter footprints expressed as
+    // longitude/latitude values far from zero.
+    let origin_x = origin.0[0];
+    let origin_y = origin.0[1];
     let mut area2 = 0.0;
     for index in 0..points.len() {
         let next = (index + 1) % points.len();
-        area2 += points[index].0[0] * points[next].0[1] - points[next].0[0] * points[index].0[1];
+        let x0 = points[index].0[0] - origin_x;
+        let y0 = points[index].0[1] - origin_y;
+        let x1 = points[next].0[0] - origin_x;
+        let y1 = points[next].0[1] - origin_y;
+        area2 += x0 * y1 - x1 * y0;
     }
     area2
 }
@@ -1309,6 +1351,31 @@ mod tests {
     }
 
     #[test]
+    fn sub_meter_polygon_far_from_origin_gets_a_rendering_fallback() {
+        // buildings.cogp.parquet row 73,031,160 exposed cancellation in the
+        // shoelace sum: products around 136×36 hid an area around 1e-12.
+        let coordinates = [
+            (136.2325434, 36.2068124),
+            (136.2325424, 36.2068124),
+            (136.2325425, 36.2068115),
+            (136.2325434, 36.2068115),
+            (136.2325434, 36.2068124),
+        ];
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 3, 1);
+        put_u32(&mut wkb, 1, 1);
+        put_u32(&mut wkb, coordinates.len() as u32, 1);
+        for (x, y) in coordinates {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+        }
+
+        let tolerance = 0.60 / 111_320.0;
+        let overview = quantized_overview(&wkb, tolerance, [136.0, 36.0]).unwrap();
+        assert_valid_quantized_multipolygon(&overview);
+    }
+
+    #[test]
     fn polygon_type_and_topology_are_stable_across_overview_levels() {
         let coordinates = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)];
         let mut wkb = vec![1];
@@ -1453,5 +1520,34 @@ mod tests {
         }
 
         assert_eq!(first_viable_level(&wkb, &[10.0, 0.1]).unwrap(), 1);
+    }
+
+    #[test]
+    fn coarser_fallback_covers_non_monotonic_polygon_viability() {
+        // This valid, thin quadrilateral survives coarser and finer grids but
+        // collapses on the grid between them. It is distilled from a real
+        // building footprint that previously aborted conversion during write.
+        let coordinates = [
+            (124.0727199, 39.8270021),
+            (124.0775812, 39.828717),
+            (124.0775559, 39.8287598),
+            (124.0726945, 39.8270449),
+            (124.0727199, 39.8270021),
+        ];
+        let mut wkb = vec![1];
+        put_u32(&mut wkb, 3, 1);
+        put_u32(&mut wkb, 1, 1);
+        put_u32(&mut wkb, coordinates.len() as u32, 1);
+        for (x, y) in coordinates {
+            put_f64(&mut wkb, x, 1);
+            put_f64(&mut wkb, y, 1);
+        }
+
+        let tolerance = 9.554_628_535_647_032 / 111_320.0;
+        let entry_tolerance = 305.748_113_140_705 / 111_320.0;
+        let overview =
+            quantized_overview_with_fallback(&wkb, tolerance, entry_tolerance, [124.0, 40.0])
+                .unwrap();
+        assert_valid_quantized_multipolygon(&overview);
     }
 }

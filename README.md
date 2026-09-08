@@ -6,7 +6,7 @@ A GeoParquet profile for progressive map rendering and partial access over HTTP 
 
 A COGP file is a valid [GeoParquet 1.1](https://geoparquet.org/) file whose row groups are physically ordered from coarse to fine rendering detail. Metadata describes where each level ends and which quantized geometry LoD to render.
 
-COGP is **feature-level**: it reorders features across row groups without aggregating or duplicating rows. Each source feature appears in exactly one row group with lossless primary WKB, while a required `overviews` struct stores simplified, integer XY rendering geometries at several LoDs.
+COGP is **feature-level**: it reorders features across row groups without aggregating or duplicating rows. Each source feature appears in exactly one row group with lossless primary WKB. Line and Polygon files add simplified integer XY `overviews`; Point files render directly from primary WKB and do not create overviews.
 
 A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. Bbox PageIndexes can further avoid unrelated pages inside intersecting row groups. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
 
@@ -18,7 +18,7 @@ COGP is informed by several existing cloud-optimized and progressive rendering p
 - Cloud Optimized Point Cloud: remaining a valid LAZ file while adding thinning and multi-resolution level concepts;
 - tippecanoe: design choice to avoid rendering every feature literally at low zoom levels.
 
-COGP applies these ideas at the GeoParquet row group level. It keeps the primary geometry unchanged, places each source feature in exactly one level, and stores sparse rendering LoDs without duplicating feature rows.
+COGP applies these ideas at the GeoParquet row group level. It keeps the primary geometry unchanged, places each source feature in exactly one level, and stores sparse rendering LoDs for geometry families that benefit from simplification, without duplicating feature rows.
 
 ## Why
 

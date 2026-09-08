@@ -44,7 +44,7 @@ pub use parquet::arrow::async_reader::ParquetObjectReader;
 pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
 
 use crate::meta::{
-    geometry_family, CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY,
+    geometry_family, CogpMeta, GeoMeta, GeometryFamily, Level, COGP_METADATA_KEY, GEO_METADATA_KEY,
     OVERVIEWS_COLUMN, OVERVIEWS_ENCODING,
 };
 
@@ -100,28 +100,49 @@ impl Reader {
                     geo_meta.primary_column
                 )
             })?;
-        if geometry_family(&primary.geometry_types).is_none() {
-            bail!("COGP primary geometry must declare exactly one Point, Line, or Polygon family");
-        }
-        if cogp_meta.overviews.encoding != OVERVIEWS_ENCODING {
-            bail!(
-                "unsupported COGP overviews encoding `{}`",
-                cogp_meta.overviews.encoding
-            );
-        }
-        if arrow_meta
-            .schema()
-            .field_with_name(OVERVIEWS_COLUMN)
-            .is_err()
-        {
-            bail!("COGP file is missing required `{OVERVIEWS_COLUMN}` column");
-        }
-        for (index, level) in cogp_meta.levels.iter().enumerate() {
-            if !cogp_meta.overviews.lods.contains_key(&level.lod) {
-                bail!(
-                    "COGP levels[{index}].lod `{}` is missing from overviews.lods",
-                    level.lod
-                );
+        let family = geometry_family(&primary.geometry_types).ok_or_else(|| {
+            anyhow!("COGP primary geometry must declare exactly one Point, Line, or Polygon family")
+        })?;
+        match family {
+            GeometryFamily::Point => {
+                if cogp_meta.overviews.is_some()
+                    || arrow_meta
+                        .schema()
+                        .field_with_name(OVERVIEWS_COLUMN)
+                        .is_ok()
+                {
+                    bail!("Point-family COGP files must not contain overviews");
+                }
+                if cogp_meta.levels.iter().any(|level| level.lod.is_some()) {
+                    bail!("Point-family COGP levels must not declare lod");
+                }
+            }
+            GeometryFamily::Line | GeometryFamily::Polygon => {
+                let overviews = cogp_meta
+                    .overviews
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("COGP file is missing required overviews metadata"))?;
+                if overviews.encoding != OVERVIEWS_ENCODING {
+                    bail!(
+                        "unsupported COGP overviews encoding `{}`",
+                        overviews.encoding
+                    );
+                }
+                if arrow_meta
+                    .schema()
+                    .field_with_name(OVERVIEWS_COLUMN)
+                    .is_err()
+                {
+                    bail!("COGP file is missing required `{OVERVIEWS_COLUMN}` column");
+                }
+                for (index, level) in cogp_meta.levels.iter().enumerate() {
+                    let lod = level.lod.as_deref().ok_or_else(|| {
+                        anyhow!("COGP levels[{index}].lod is required for {family:?} data")
+                    })?;
+                    if !overviews.lods.contains_key(lod) {
+                        bail!("COGP levels[{index}].lod `{lod}` is missing from overviews.lods");
+                    }
+                }
             }
         }
         Ok(Self {
@@ -156,15 +177,16 @@ impl Reader {
     }
 
     /// Select the overview LoD declared by the level appropriate for the
-    /// target ground resolution.
-    pub fn lod_for_resolution(&self, target_resolution: f64) -> &str {
+    /// target ground resolution. Returns `None` for Point-family files, which
+    /// render primary WKB instead of overviews.
+    pub fn lod_for_resolution(&self, target_resolution: f64) -> Option<&str> {
         let level = self
             .cogp_meta
             .levels
             .iter()
             .rposition(|level| level.resolution >= target_resolution)
             .unwrap_or(0);
-        &self.cogp_meta.levels[level].lod
+        self.cogp_meta.levels[level].lod.as_deref()
     }
 
     pub fn num_row_groups(&self) -> usize {
@@ -445,7 +467,7 @@ mod tests {
         Level {
             row_group_end,
             resolution,
-            lod: format!("l{row_group_end}"),
+            lod: Some(format!("l{row_group_end}")),
         }
     }
 
@@ -453,21 +475,32 @@ mod tests {
     /// The Arrow schema and row-group count are minimal — only the selector
     /// tests below read them. The construction path itself goes through the
     /// real `from_arrow_metadata`, so the metadata-parse code runs as well.
-    fn reader_with_metadata(levels: Vec<Level>, geometry_types: Vec<String>) -> Reader {
-        let lod_fields = levels
-            .iter()
-            .map(|level| {
-                Field::new(
-                    &level.lod,
-                    DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
-                    true,
-                )
-            })
-            .collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("v", DataType::Int32, false),
-            Field::new(OVERVIEWS_COLUMN, DataType::Struct(lod_fields.into()), false),
-        ]));
+    fn reader_with_metadata(mut levels: Vec<Level>, geometry_types: Vec<String>) -> Reader {
+        let point_family = geometry_family(&geometry_types) == Some(GeometryFamily::Point);
+        if point_family {
+            for level in &mut levels {
+                level.lod = None;
+            }
+        }
+        let mut fields = vec![Field::new("v", DataType::Int32, false)];
+        if !point_family {
+            let lod_fields = levels
+                .iter()
+                .map(|level| {
+                    Field::new(
+                        level.lod.as_deref().unwrap(),
+                        DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            fields.push(Field::new(
+                OVERVIEWS_COLUMN,
+                DataType::Struct(lod_fields.into()),
+                false,
+            ));
+        }
+        let schema = Arc::new(Schema::new(fields));
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
@@ -496,13 +529,13 @@ mod tests {
             };
             let cogp = CogpMeta {
                 version: COGP_VERSION.into(),
-                overviews: OverviewsMeta {
+                overviews: (!point_family).then(|| OverviewsMeta {
                     encoding: OVERVIEWS_ENCODING.into(),
                     lods: levels
                         .iter()
                         .map(|level| {
                             (
-                                level.lod.clone(),
+                                level.lod.clone().unwrap(),
                                 LodMeta {
                                     scale: [1.0; 2],
                                     offset: [0.0; 2],
@@ -510,7 +543,7 @@ mod tests {
                             )
                         })
                         .collect(),
-                },
+                }),
                 levels,
             };
             w.append_key_value_metadata(KeyValue {
@@ -567,13 +600,13 @@ mod tests {
     #[test]
     fn lod_comes_from_selected_level() {
         let mut levels = vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)];
-        levels[0].lod = "coarse".into();
-        levels[1].lod = "medium".into();
-        levels[2].lod = "fine".into();
+        levels[0].lod = Some("coarse".into());
+        levels[1].lod = Some("medium".into());
+        levels[2].lod = Some("fine".into());
         let r = reader_with_metadata(levels, vec!["LineString".into()]);
-        assert_eq!(r.lod_for_resolution(1000.0), "coarse");
-        assert_eq!(r.lod_for_resolution(50.0), "medium");
-        assert_eq!(r.lod_for_resolution(1.0), "fine");
+        assert_eq!(r.lod_for_resolution(1000.0), Some("coarse"));
+        assert_eq!(r.lod_for_resolution(50.0), Some("medium"));
+        assert_eq!(r.lod_for_resolution(1.0), Some("fine"));
     }
 
     #[test]
@@ -638,7 +671,7 @@ mod tests {
                 "geometry".to_string(),
                 GeoColumn {
                     encoding: "WKB".into(),
-                    geometry_types: vec!["Point".into()],
+                    geometry_types: vec!["LineString".into()],
                     covering: Some(Covering {
                         bbox: BboxCovering {
                             xmin: vec!["bbox".into(), "xmin".into()],
@@ -659,7 +692,7 @@ mod tests {
             let cogp = CogpMeta {
                 version: COGP_VERSION.into(),
                 levels: vec![level(0, 1.0)],
-                overviews: OverviewsMeta {
+                overviews: Some(OverviewsMeta {
                     encoding: OVERVIEWS_ENCODING.into(),
                     lods: BTreeMap::from([(
                         "l0".into(),
@@ -668,7 +701,7 @@ mod tests {
                             offset: [0.0; 2],
                         },
                     )]),
-                },
+                }),
             };
             writer.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
@@ -717,10 +750,10 @@ mod tests {
         let cogp = CogpMeta {
             version: COGP_VERSION.into(),
             levels: vec![],
-            overviews: OverviewsMeta {
+            overviews: Some(OverviewsMeta {
                 encoding: OVERVIEWS_ENCODING.into(),
                 lods: BTreeMap::new(),
-            },
+            }),
         };
         let err = try_open_with_kv(vec![KeyValue {
             key: COGP_METADATA_KEY.into(),

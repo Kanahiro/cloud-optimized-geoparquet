@@ -19,10 +19,10 @@ A COGP file is:
 3. organized so that each level ends at a Parquet row group boundary;
 4. annotated with minimal metadata describing those level boundaries.
 
-COGP keeps a lossless primary geometry and stores sparse, scale-specific,
-integer rendering geometries in a required `overviews` struct. Feature rows
-are reordered but never duplicated. A COGP renderer never needs to transfer or
-decode primary WKB.
+COGP keeps a lossless primary geometry. Line and Polygon families also store
+sparse, scale-specific integer rendering geometries in an `overviews` struct;
+Point families render directly from their compact primary WKB. Feature rows
+are reordered but never duplicated.
 
 ## 2. Motivation
 
@@ -48,9 +48,9 @@ COGP's row layout is a **feature-level progressive subset**:
 * a feature's primary geometry is preserved verbatim;
 * features are assigned to the coarsest level at which they become independently renderable as whole features.
 
-Unlike a tile pyramid, COGP does not duplicate rows across levels. The
-`overviews` struct contains simplified rendering copies and is sparse outside
-the row prefixes where each LoD applies.
+Unlike a tile pyramid, COGP does not duplicate rows across levels. For Line and
+Polygon families, the `overviews` struct contains simplified rendering copies
+and is sparse outside the row prefixes where each LoD applies.
 
 A reader can choose how many leading row groups to load based on its target rendering resolution.
 
@@ -117,7 +117,8 @@ Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by 
 
 Producers SHOULD also write a Parquet ColumnIndex and OffsetIndex for each of
 these four bbox leaves. Columns intended for viewport rendering, including the
-`overviews` leaves, SHOULD have an OffsetIndex. This lets a reader translate a
+primary WKB for Point families and the `overviews` leaves for Line and Polygon
+families, SHOULD have an OffsetIndex. This lets a reader translate a
 bbox predicate into row ranges within an intersecting row group and request
 only the corresponding pages from projected columns. Missing page indexes do
 not make a file non-conforming; readers MUST fall back conservatively to row
@@ -138,8 +139,9 @@ Earlier row groups MUST contain features that are independently meaningful at co
 Later row groups MUST add features that are independently meaningful only at finer render resolutions.
 
 Every source feature MUST appear in exactly one row group. Its primary geometry
-and attributes MUST NOT be simplified or aggregated. The rendering geometries
-inside `overviews` are simplified copies and MUST NOT be used for analysis.
+and attributes MUST NOT be simplified or aggregated. For Line and Polygon
+families, the rendering geometries inside `overviews` are simplified copies and
+MUST NOT be used for analysis.
 
 Level ordering is defined with respect to the primary geometry column.
 
@@ -165,7 +167,9 @@ Each level entry MUST contain:
 
 * `row_group_end`
 * `resolution`
-* `lod`
+
+For Line and Polygon families, each level entry MUST also contain `lod`. For
+Point families, `lod` MUST be absent.
 
 `row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
 
@@ -181,9 +185,10 @@ The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the lev
 
 `resolution` values MUST be strictly monotonically decreasing from coarse to fine levels.
 
-`lod` MUST be a non-empty name present in `overviews.lods` and MUST name a
-direct child of the physical `overviews` struct. There is no implicit default
-LoD and no fallback to primary WKB.
+For Line and Polygon families, `lod` MUST be a non-empty name present in
+`overviews.lods` and MUST name a direct child of the physical `overviews`
+struct. There is no implicit default LoD. Point families render their primary
+WKB and do not declare an LoD.
 
 ### 5.4 Progressive access layout
 
@@ -191,10 +196,11 @@ Producers SHOULD choose row group sizes so that each level prefix can be fetched
 
 Producers SHOULD avoid placing so many bytes or features in an early row group that the first level is no longer useful as a coarse overview.
 
-Producers SHOULD size row groups using the `overviews` leaf column chunks that
-rendering readers actually project rather than the lossless primary WKB column.
-A producer MAY use the largest usable overview payload as a conservative
-pre-compression estimate.
+For Line and Polygon families, producers SHOULD size row groups using the
+`overviews` leaf column chunks that rendering readers actually project rather
+than the lossless primary WKB column. A producer MAY use the largest usable
+overview payload as a conservative pre-compression estimate. For Point
+families, producers SHOULD use the primary WKB payload.
 
 When writing page indexes, producers SHOULD bound data pages by row count and
 align page boundaries across bbox and rendering columns. A row group containing
@@ -210,8 +216,12 @@ features are assigned.
 
 ### 5.5 Overview encoding
 
-The file MUST contain exactly one top-level column named `overviews`, with this
-logical structure:
+Point-family files MUST NOT contain a top-level `overviews` column or
+`cogp.overviews` metadata. Point and MultiPoint coordinates cannot be
+simplified usefully, so rendering readers project the primary WKB column.
+
+Line- and Polygon-family files MUST contain exactly one top-level column named
+`overviews`, with this logical structure:
 
 ```text
 overviews: required struct<
@@ -228,9 +238,9 @@ overviews: required struct<
 
 Every key in `cogp.overviews.lods` MUST name exactly one `<lod>` child, and
 every `<lod>` child MUST have corresponding metadata. `geometry_type` uses the
-base OGC WKB type codes: `1` Point, `2` LineString, `3` Polygon, `4`
-MultiPoint, `5` MultiLineString, and `6` MultiPolygon. GeometryCollection is
-not permitted. A row's `geometry_type` MUST describe every non-null LoD in
+base OGC WKB type codes: `2` LineString, `3` Polygon, `5` MultiLineString, and
+`6` MultiPolygon. GeometryCollection is not permitted. A row's `geometry_type`
+MUST describe every non-null LoD in
 that row. In particular, a producer whose polygon repair can split a Polygon
 at some resolutions MUST encode all of that row's polygon LoDs as MultiPolygon;
 an unsplit Polygon is represented as a one-member MultiPolygon in those LoDs.
@@ -243,7 +253,7 @@ x_decoded = offset[0] + scale[0] * x_integer
 y_decoded = offset[1] + scale[1] * y_integer
 ```
 
-For Point, MultiPoint, and LineString, both end arrays are empty. For Polygon,
+For LineString, both end arrays are empty. For Polygon,
 `part_ends` contains the exclusive end of each ring. For MultiLineString it
 contains the exclusive end of each line. For MultiPolygon, `part_ends`
 contains the exclusive end of each ring and `polygon_ends` contains the
@@ -264,9 +274,7 @@ equivalent progressive hierarchy; error MUST NOT accumulate by repeatedly
 simplifying the previous LoD. The primary geometry remains unchanged.
 
 Only XY is represented in `overviews`. Z and M ordinates, when present in the
-primary geometry, are intentionally omitted. Point and MultiPoint geometries
-MUST also be encoded in `overviews`; this avoids requiring rendering readers to
-support WKB even though point coordinates themselves cannot be simplified.
+primary geometry, are intentionally omitted.
 
 ## 6. Metadata
 
@@ -290,6 +298,8 @@ Readers MUST ignore unrecognized fields in `cogp` metadata so that files written
 Readers MUST NOT interpret `cogp` metadata with an unsupported major version as conforming to this version of the profile.
 
 ### 6.2 Minimal example
+
+Line/Polygon example:
 
 ```json
 {
@@ -322,6 +332,18 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 }
 ```
 
+Point-family example:
+
+```json
+{
+  "version": "0.2.0",
+  "levels": [
+    { "row_group_end": 0, "resolution": 1000 },
+    { "row_group_end": 3, "resolution": 100 }
+  ]
+}
+```
+
 ### 6.3 Field definitions
 
 | Field | Required | Description |
@@ -330,12 +352,12 @@ Readers MUST NOT interpret `cogp` metadata with an unsupported major version as 
 | `levels` | Yes | Ordered level entries from coarse to fine. |
 | `levels[].row_group_end` | Yes | Inclusive row group index ending this level. |
 | `levels[].resolution` | Yes | Nominal ground resolution for which the level is intended, in meters. |
-| `levels[].lod` | Yes | Required child name in both the physical `overviews` struct and `overviews.lods`. |
-| `overviews` | Yes | Metadata for the fixed physical `overviews` column. |
-| `overviews.encoding` | Yes | Must be `quantized_xy_v1` for this version. |
-| `overviews.lods` | Yes | Non-empty object keyed by LoD child name. |
-| `overviews.lods.<lod>.scale` | Yes | Two positive finite numbers used to decode integer X and Y. |
-| `overviews.lods.<lod>.offset` | Yes | Two finite numbers used to decode integer X and Y. |
+| `levels[].lod` | Line/Polygon only | Required child name in both the physical `overviews` struct and `overviews.lods`; absent for Point families. |
+| `overviews` | Line/Polygon only | Metadata for the fixed physical `overviews` column; absent for Point families. |
+| `overviews.encoding` | Line/Polygon only | Must be `quantized_xy_v1` for this version. |
+| `overviews.lods` | Line/Polygon only | Non-empty object keyed by LoD child name. |
+| `overviews.lods.<lod>.scale` | Line/Polygon only | Two positive finite numbers used to decode integer X and Y. |
+| `overviews.lods.<lod>.offset` | Line/Polygon only | Two finite numbers used to decode integer X and Y. |
 
 ## 7. Reader guidance (non-normative)
 
@@ -387,11 +409,11 @@ If the view changes — for example, the user zooms in — the reader fetches on
 
 ### 7.3 Overview selection
 
-After selecting a level, a rendering reader projects only
-`overviews.geometry_type` and the four leaves under the level's required `lod`.
-Sibling LoDs and the primary WKB geometry column are not needed. A browser
-renderer SHOULD ensure that range coalescing does not overfetch primary WKB
-column chunks between requested overview chunks.
+After selecting a level for Line or Polygon data, a rendering reader projects
+only `overviews.geometry_type` and the four leaves under the level's required
+`lod`. Sibling LoDs and the primary WKB geometry column are not needed. A
+browser renderer SHOULD ensure that range coalescing does not overfetch primary
+WKB column chunks between requested overview chunks.
 
 The selected LoD is guaranteed to be non-null throughout the selected row
 prefix, so no fallback or per-row precision comparison is needed. A reader may
@@ -399,6 +421,9 @@ expose the decoded overview logically under the primary geometry column name.
 
 An analytical reader that requires lossless geometry explicitly projects the
 GeoParquet primary geometry column and does not use `overviews`.
+
+For Point-family data, a rendering reader projects the primary WKB geometry
+column. There is no overview selection or `lod` fallback.
 
 ## 8. Validation
 
