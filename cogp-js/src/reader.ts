@@ -1,5 +1,5 @@
-import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
-import type { Compressors } from 'hyparquet';
+import { parquetMetadataAsync, parquetRead } from 'hyparquet';
+import type { Compressors, ParquetQueryFilter } from 'hyparquet';
 import { compressors as defaultCompressors } from 'hyparquet-compressors';
 
 import {
@@ -12,9 +12,9 @@ import {
   rowGroupIntersects,
 } from './bbox.js';
 import {
+  type AsyncBufferLike,
   type ByteRange,
   coalescingAsyncBuffer,
-  type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
 import { selectLevelByResolution } from './level.js';
 import {
@@ -22,21 +22,45 @@ import {
   type CogpMeta,
   extractCogpDocument,
   type GeoMeta,
+  type LodMetadata,
 } from './meta.js';
 import {
   decodeQuantizedOverview,
-  parseOverview,
+  parseOverviewColumns,
   projectOverviewMetadata,
   rootColumnNames,
   type QuantizedOverviewGeometry,
   type OverviewFileMetadata,
 } from './overview.js';
 import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
+import { bindAbortSignal, throwIfAborted } from './abort.js';
+import { abortableAsyncBufferFromUrl } from './http-buffer.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
 interface FullFileMetadata extends OverviewFileMetadata {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
+}
+
+type NumberArray = ArrayLike<number> & { readonly length: number };
+
+interface PageChunk {
+  pathInSchema: string[];
+  columnData: ArrayLike<unknown>;
+  rowStart: number;
+  rowEnd: number;
+}
+
+interface ColumnChunk {
+  columnName: string;
+  columnData: ArrayLike<unknown>;
+  rowStart: number;
+  rowEnd: number;
+}
+
+interface OverviewSelection {
+  rowIndexes: number[];
+  values: QuantizedOverviewGeometry[];
 }
 
 export type BboxInput = Bbox | readonly [number, number, number, number];
@@ -45,18 +69,20 @@ export interface OpenOptions {
   fetch?: typeof fetch;
   byteLength?: number;
   /** Additional HTTP options. Browser caching is always forced to `no-store`. */
-  requestInit?: Omit<RequestInit, 'cache'>;
+  requestInit?: Omit<RequestInit, 'cache' | 'signal'>;
+  /** Abort opening the URL and fetching its Parquet metadata. */
+  signal?: AbortSignal;
   /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
-  rangeCoalescing?: RangeCoalescingOptions | false;
+  rangeCoalescing?: boolean;
   /** In-memory byte-range cache for this reader; enabled by default. */
   rangeCache?: RangeCacheOptions | false;
   /** Override individual Parquet compression codecs. */
   compressors?: Compressors;
 }
 
-// Cap on cumulative `num_rows` packed into a single coalesced fetch. A run
-// is read by one `parquetReadObjects` call that materializes every row in
-// the run as one array, so peak in-flight memory scales with this value.
+// Cap on cumulative `num_rows` packed into a single coalesced fetch. Columns
+// are retained until the run's surviving rows are assembled, so peak in-flight
+// memory still scales with this value.
 const RUN_MAX_ROWS = 50_000;
 
 export interface ReadOptions {
@@ -67,7 +93,7 @@ export interface ReadOptions {
   /** Subset of columns to materialize. */
   columns?: string[];
   /**
-   * Decode a zero-copy quantized overview into a caller-owned representation.
+   * Decode a quantized overview into a caller-owned representation.
    * The default materializes GeoJSON geometry. This hook is only used when the
    * file declares overviews; otherwise the reader returns primary WKB.
    */
@@ -82,38 +108,31 @@ export interface ReadOptions {
    * are skipped entirely.
    */
   maxRows?: number;
+  /** Abort pending Range requests and stop before decoding further runs. */
+  signal?: AbortSignal;
 }
 
 export class CogpReader {
   static async open(url: string, opts: OpenOptions = {}): Promise<CogpReader> {
     // Browser HTTP caches handle many 206 responses poorly. Bypass them and
     // keep reuse deterministic in the per-reader range cache below.
-    const fetchOpts: Record<string, unknown> = {
-      url,
-      requestInit: { ...opts.requestInit, cache: 'no-store' } satisfies RequestInit,
-    };
-    if (opts.fetch) fetchOpts['fetch'] = opts.fetch;
-    if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
-    const source = await asyncBufferFromUrl(fetchOpts as { url: string });
+    const source = await abortableAsyncBufferFromUrl(url, opts);
     const cached = opts.rangeCache === false
       ? source
       : rangeCachedAsyncBuffer(source, opts.rangeCache);
     // Fetch exactly the 8-byte trailer first, then exactly the declared
     // metadata. hyparquet's 512 KiB default tail prefetch can otherwise absorb
     // the final WKB page before its protected ranges are known.
-    const metadata = (await parquetMetadataAsync(cached as never, {
+    const metadata = (await parquetMetadataAsync(bindAbortSignal(cached, opts.signal) as never, {
       initialFetchSize: 8,
     })) as unknown as FullFileMetadata;
     const doc = extractCogpDocument(metadata.key_value_metadata);
-    const configuredRanges = opts.rangeCoalescing === false
-      ? []
-      : opts.rangeCoalescing?.protectedRanges ?? [];
     const protectedRanges = doc.cogp.overviews === undefined
-      ? configuredRanges
-      : [...configuredRanges, ...wkbColumnRanges(metadata, doc.geo)];
+      ? []
+      : wkbColumnRanges(metadata, doc.geo);
     const file = opts.rangeCoalescing === false
       ? cached
-      : coalescingAsyncBuffer(cached, { ...opts.rangeCoalescing, protectedRanges });
+      : coalescingAsyncBuffer(cached, { protectedRanges });
     return new CogpReader(file, metadata, url, opts.compressors);
   }
 
@@ -235,6 +254,7 @@ export class CogpReader {
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
+    throwIfAborted(opts.signal);
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const level = this.levels[maxLevel];
     if (!level) throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
@@ -276,7 +296,7 @@ export class CogpReader {
     // rather than draining the rest of the batch.
     const acceptRow = (row: Record<string, unknown>): boolean => {
       if (wantsGeometry && lodMetadata) {
-        const overview = parseOverview(row['overviews'], lodMetadata);
+        const overview = row['overviews'] as QuantizedOverviewGeometry | null;
         row[this.primaryGeometryColumn] = opts.overviewDecoder
           ? opts.overviewDecoder(overview)
           : decodeQuantizedOverview(overview);
@@ -288,7 +308,16 @@ export class CogpReader {
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamRuns(rgs, columns, projectedMetadata, bbox)) {
+    for await (const batch of this.streamRuns(
+      rgs,
+      columns,
+      projectedMetadata,
+      bbox,
+      wantsGeometry ? lod : undefined,
+      wantsGeometry ? lodMetadata : undefined,
+      opts.signal,
+    )) {
+      throwIfAborted(opts.signal);
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -318,6 +347,7 @@ export class CogpReader {
       }
       if (stopped) break;
     }
+    throwIfAborted(opts.signal);
     return out;
   }
 
@@ -353,33 +383,203 @@ export class CogpReader {
     columns: string[] | undefined,
     metadata: FullFileMetadata,
     bbox?: Bbox,
+    lod?: string,
+    lodMetadata?: LodMetadata,
+    signal?: AbortSignal,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
     const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    const file = bindAbortSignal(this.file as AsyncBufferLike, signal);
     for (const run of this.coalescedRuns(rgIndices)) {
+      throwIfAborted(signal);
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
       const rowStart = this.rowOffsets[startRg]!;
       const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
-      const readArgs: Record<string, unknown> = {
-        file: this.file,
+      const readsOverview = lod !== undefined && lodMetadata !== undefined;
+      const objectColumns = readsOverview
+        ? columns?.filter((column) => column !== 'overviews')
+        : columns;
+      const columnsPromise = this.readColumnValues(
+        file,
         metadata,
         rowStart,
         rowEnd,
-        compressors: this.compressors,
-      };
-      if (columns) readArgs['columns'] = columns;
-      if (filter) {
-        readArgs['filter'] = filter;
-        // hyparquet fetches the four bbox ColumnIndexes, derives conservative
-        // row ranges, then uses each projected leaf's OffsetIndex to request
-        // only data pages overlapping those ranges. Missing indexes degrade to
-        // the existing row-group read without affecting correctness.
-        readArgs['usePageIndex'] = true;
+        objectColumns ?? [],
+        filter,
+      );
+      const overviewPromise = readsOverview
+        ? this.readOverviewLeaves(
+          file,
+          metadata,
+          rowStart,
+          rowEnd,
+          lod,
+          lodMetadata,
+          bbox,
+        )
+        : undefined;
+      const [columnValues, overviewSelection] = await Promise.all([
+        columnsPromise,
+        overviewPromise,
+      ]);
+      const rowIndexes = overviewSelection?.rowIndexes
+        ?? selectedRowIndexes(columnValues, rowEnd - rowStart, this.bboxPaths, bbox);
+      const rows = new Array<Record<string, unknown>>(rowIndexes.length);
+      for (let i = 0; i < rowIndexes.length; i++) {
+        const localRow = rowIndexes[i]!;
+        const row: Record<string, unknown> = {};
+        for (const column of objectColumns ?? []) {
+          const values = columnValues.get(column);
+          if (!values || values[localRow] === undefined) {
+            throw new Error(`column \`${column}\` is missing row ${rowStart + localRow}`);
+          }
+          row[column] = values[localRow];
+        }
+        if (overviewSelection) row['overviews'] = overviewSelection.values[i]!;
+        rows[i] = row;
       }
-      yield (await parquetReadObjects(readArgs as never)) as Record<string, unknown>[];
+      throwIfAborted(signal);
+      yield rows;
     }
+  }
+
+  /** Read top-level columns without transposing the whole run into row objects. */
+  private async readColumnValues(
+    file: AsyncBufferLike,
+    metadata: FullFileMetadata,
+    rowStart: number,
+    rowEnd: number,
+    columns: string[],
+    filter?: ParquetQueryFilter,
+  ): Promise<Map<string, unknown[]>> {
+    const values = new Map<string, unknown[]>();
+    if (columns.length === 0 && !filter) return values;
+    const rowCount = rowEnd - rowStart;
+    await parquetRead({
+      file: file as never,
+      metadata: metadata as never,
+      rowStart,
+      rowEnd,
+      columns,
+      compressors: this.compressors,
+      rowFormat: 'object',
+      filter,
+      usePageIndex: filter !== undefined,
+      onChunk: ((chunk: ColumnChunk) => {
+        let target = values.get(chunk.columnName);
+        if (!target) {
+          target = new Array(rowCount);
+          values.set(chunk.columnName, target);
+        }
+        for (let i = 0; i < chunk.columnData.length; i++) {
+          const localRow = chunk.rowStart + i - rowStart;
+          if (localRow >= 0 && localRow < rowCount) target[localRow] = chunk.columnData[i];
+        }
+      }) as never,
+    });
+    return values;
+  }
+
+  /**
+   * Decode the selected LoD's physical leaves without asking hyparquet to
+   * assemble `list<struct<x,y>>`. The only per-row containers are the lists
+   * themselves; no object is allocated per vertex.
+   */
+  private async readOverviewLeaves(
+    file: AsyncBufferLike,
+    metadata: FullFileMetadata,
+    rowStart: number,
+    rowEnd: number,
+    lod: string,
+    lodMetadata: LodMetadata,
+    bbox?: Bbox,
+  ): Promise<OverviewSelection> {
+    const rowCount = rowEnd - rowStart;
+    const geometryTypes: Array<number | undefined> = new Array(rowCount);
+    const xs: Array<NumberArray | undefined> = new Array(rowCount);
+    const ys: Array<NumberArray | undefined> = new Array(rowCount);
+    const partEnds: Array<NumberArray | undefined> = new Array(rowCount);
+    const polygonEnds: Array<NumberArray | undefined> = new Array(rowCount);
+    const minXs: Array<number | undefined> = new Array(rowCount);
+    const minYs: Array<number | undefined> = new Array(rowCount);
+    const maxXs: Array<number | undefined> = new Array(rowCount);
+    const maxYs: Array<number | undefined> = new Array(rowCount);
+
+    const assign = <T>(target: Array<T | undefined>, chunk: PageChunk, map: (value: unknown) => T) => {
+      for (let i = 0; i < chunk.columnData.length; i++) {
+        const localRow = chunk.rowStart + i - rowStart;
+        if (localRow >= 0 && localRow < rowCount) {
+          target[localRow] = map(chunk.columnData[i]);
+        }
+      }
+    };
+    const onPage = (chunk: PageChunk) => {
+      const path = chunk.pathInSchema;
+      if (path[0] === 'overviews' && path[1] === 'geometry_type') {
+        assign(geometryTypes, chunk, Number);
+      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'coordinates') {
+        if (path[path.length - 1] === 'x') assign(xs, chunk, asNumberArray);
+        if (path[path.length - 1] === 'y') assign(ys, chunk, asNumberArray);
+      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'part_ends') {
+        assign(partEnds, chunk, asNumberArray);
+      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'polygon_ends') {
+        assign(polygonEnds, chunk, asNumberArray);
+      } else if (samePath(path, this.bboxPaths.xmin)) {
+        assign(minXs, chunk, Number);
+      } else if (samePath(path, this.bboxPaths.ymin)) {
+        assign(minYs, chunk, Number);
+      } else if (samePath(path, this.bboxPaths.xmax)) {
+        assign(maxXs, chunk, Number);
+      } else if (samePath(path, this.bboxPaths.ymax)) {
+        assign(maxYs, chunk, Number);
+      }
+    };
+    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    await parquetRead({
+      file: file as never,
+      metadata: metadata as never,
+      rowStart,
+      rowEnd,
+      columns: ['overviews'],
+      compressors: this.compressors,
+      rowFormat: 'object',
+      filter,
+      usePageIndex: filter !== undefined,
+      onPage: onPage as never,
+    });
+
+    const rowIndexes: number[] = [];
+    const values: QuantizedOverviewGeometry[] = [];
+    for (let row = 0; row < rowCount; row++) {
+      if (bbox) {
+        const values = [minXs[row], minYs[row], maxXs[row], maxYs[row]];
+        if (values.some((value) => value === undefined)) continue;
+        if (!bboxesIntersect(
+          { minX: values[0]!, minY: values[1]!, maxX: values[2]!, maxY: values[3]! },
+          bbox,
+        )) continue;
+      }
+      const geometryType = geometryTypes[row];
+      const rowXs = xs[row];
+      const rowYs = ys[row];
+      const rowPartEnds = partEnds[row];
+      const rowPolygonEnds = polygonEnds[row];
+      if (geometryType === undefined || !rowXs || !rowYs || !rowPartEnds || !rowPolygonEnds) {
+        throw new Error(`selected overview LoD \`${lod}\` is null or incomplete at row ${rowStart + row}`);
+      }
+      rowIndexes.push(row);
+      values.push(parseOverviewColumns(
+        geometryType,
+        rowXs,
+        rowYs,
+        rowPartEnds,
+        rowPolygonEnds,
+        lodMetadata,
+      ));
+    }
+    return { rowIndexes, values };
   }
 
   private coalescedRuns(indices: number[]): Array<number[]> {
@@ -426,7 +626,7 @@ export class CogpReader {
 
 }
 
-function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
+function bboxFilter(paths: BboxCovering, bbox: Bbox): ParquetQueryFilter {
   return {
     $and: [
       { [paths.xmin.join('.')]: { $lte: bbox.maxX } },
@@ -435,6 +635,39 @@ function bboxFilter(paths: BboxCovering, bbox: Bbox): Record<string, unknown> {
       { [paths.ymax.join('.')]: { $gte: bbox.minY } },
     ],
   };
+}
+
+function selectedRowIndexes(
+  columns: Map<string, unknown[]>,
+  rowCount: number,
+  paths: BboxCovering,
+  bbox?: Bbox,
+): number[] {
+  if (!bbox) return Array.from({ length: rowCount }, (_, row) => row);
+  const selected: number[] = [];
+  for (let row = 0; row < rowCount; row++) {
+    const minX = readColumnNum(columns, row, paths.xmin);
+    const minY = readColumnNum(columns, row, paths.ymin);
+    const maxX = readColumnNum(columns, row, paths.xmax);
+    const maxY = readColumnNum(columns, row, paths.ymax);
+    if (minX === undefined || minY === undefined || maxX === undefined || maxY === undefined) {
+      continue;
+    }
+    if (bboxesIntersect({ minX, minY, maxX, maxY }, bbox)) selected.push(row);
+  }
+  return selected;
+}
+
+function readColumnNum(
+  columns: Map<string, unknown[]>,
+  row: number,
+  path: readonly string[],
+): number | undefined {
+  let value = columns.get(path[0]!)?.[row];
+  for (let i = 1; value !== undefined && i < path.length; i++) {
+    value = (value as Record<string, unknown>)[path[i]!];
+  }
+  return value === undefined ? undefined : Number(value);
 }
 
 /**
@@ -480,6 +713,28 @@ function normalizeBbox(input?: BboxInput): Bbox | undefined {
     return { minX: input[0]!, minY: input[1]!, maxX: input[2]!, maxY: input[3]! };
   }
   return input as Bbox;
+}
+
+function samePath(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+// onPage keeps list nesting but does not assemble the surrounding struct. A
+// nullable LoD can add singleton wrappers outside the actual leaf list, so
+// remove only wrappers whose sole value is itself an array.
+function asNumberArray(input: unknown): NumberArray {
+  let value = input;
+  while (
+    Array.isArray(value)
+    && value.length === 1
+    && (Array.isArray(value[0]) || ArrayBuffer.isView(value[0] as ArrayBufferView))
+  ) {
+    value = value[0];
+  }
+  if (!Array.isArray(value) && !ArrayBuffer.isView(value as ArrayBufferView)) {
+    throw new Error('overview physical leaf is not an array');
+  }
+  return value as NumberArray;
 }
 
 // Walk a path-in-schema like `['bbox','xmin']` against a hyparquet row object.

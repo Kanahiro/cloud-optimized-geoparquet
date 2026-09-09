@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, Float64Array, GenericBinaryArray, Int32Builder, Int8Array,
-    LargeBinaryArray, LargeStringArray, ListArray, ListBuilder, OffsetSizeTrait, RecordBatch,
-    StringArray, StructArray,
+    LargeBinaryArray, LargeStringArray, ListBuilder, OffsetSizeTrait, RecordBatch, StringArray,
+    StructArray, StructBuilder,
 };
 use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -61,13 +61,9 @@ pub struct ConvertArgs {
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
     /// Maximum number of rows per Parquet row group. Level boundaries and the
-    /// render-geometry byte limit may produce smaller row groups.
+    /// end of the input may produce smaller row groups.
     #[arg(long, default_value_t = 65_536)]
     pub row_group_size: usize,
-    /// Maximum cumulative render-geometry bytes in a row group: the largest
-    /// usable overview for Line/Polygon or primary WKB for Point.
-    #[arg(long, default_value = "4194304")]
-    pub row_group_max_bytes: Option<usize>,
     /// Simplification tolerance as a multiple of each level's resolution.
     /// Every geometry in one overview column uses the same spatial tolerance.
     #[arg(long, default_value_t = 1.0)]
@@ -94,12 +90,6 @@ pub struct ConvertArgs {
     /// resolutions are taken verbatim and no projection is assumed).
     #[arg(long, default_value_t = 1024)]
     pub webmerc_resolution: u32,
-    /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
-    /// many times coarser than `prec` per axis, yielding ~factor² fewer points
-    /// per level than a factor of 1. Set to `1` for the finest supported
-    /// thinning grid (one winner per resolution-sized cell).
-    #[arg(long, default_value_t = 4)]
-    pub point_thinning_factor: u32,
     /// Attribute column deciding which feature wins when several contend for the
     /// same point-thinning cell. When set it is the primary criterion: the
     /// higher-ranked feature survives to coarser levels, so the more important
@@ -141,176 +131,24 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64
     Ok((count as i64) - 1)
 }
 
-/// Owns the row-group boundary policy. Parquet's writer still enforces the
-/// hard row count, while this limiter tracks the bytes that rendering readers
-/// can actually project. Line and Polygon files use overview bytes; Point files
-/// use their already-compact primary WKB because they have no overviews.
-struct RowGroupLimiter {
-    max_rows: usize,
-    max_render_geometry_bytes: Option<usize>,
-    in_progress_render_geometry_bytes: usize,
-}
-
-impl RowGroupLimiter {
-    fn new(max_rows: usize, max_render_geometry_bytes: Option<usize>) -> Self {
-        Self {
-            max_rows,
-            max_render_geometry_bytes,
-            in_progress_render_geometry_bytes: 0,
-        }
-    }
-
-    fn write<W: Write + Send>(
-        &mut self,
-        writer: &mut ArrowWriter<W>,
-        batch: &RecordBatch,
-        render_geometry_columns: &[usize],
-    ) -> Result<()> {
-        let row_render_geometry_bytes =
-            render_geometry_bytes_per_row(batch, render_geometry_columns)?;
-        let mut offset = 0;
-        while offset < batch.num_rows() {
-            if writer.in_progress_rows() == 0 {
-                self.in_progress_render_geometry_bytes = 0;
-            }
-            if writer.in_progress_rows() >= self.max_rows
-                || (writer.in_progress_rows() > 0
-                    && self
-                        .max_render_geometry_bytes
-                        .is_some_and(|max| self.in_progress_render_geometry_bytes >= max))
-            {
-                self.flush(writer)?;
-                continue;
-            }
-
-            let row_capacity = self.max_rows - writer.in_progress_rows();
-            let available = batch.num_rows() - offset;
-            let rows = match self.max_render_geometry_bytes {
-                None => available.min(row_capacity),
-                Some(max_bytes) => rows_within_render_geometry_budget(
-                    &row_render_geometry_bytes[offset..],
-                    available.min(row_capacity),
-                    max_bytes.saturating_sub(self.in_progress_render_geometry_bytes),
-                    writer.in_progress_rows() == 0,
-                ),
-            };
-            if rows == 0 {
-                self.flush(writer)?;
-                continue;
-            }
-
-            let added_render_geometry_bytes = row_render_geometry_bytes[offset..offset + rows]
-                .iter()
-                .fold(0usize, |total, bytes| total.saturating_add(*bytes));
-            writer.write(&batch.slice(offset, rows))?;
-            offset += rows;
-
-            // ArrowWriter auto-flushes on its row limit. Keep our accounting
-            // synchronized with that implicit boundary.
-            if writer.in_progress_rows() == 0 {
-                self.in_progress_render_geometry_bytes = 0;
-            } else {
-                self.in_progress_render_geometry_bytes = self
-                    .in_progress_render_geometry_bytes
-                    .saturating_add(added_render_geometry_bytes);
-                if self
-                    .max_render_geometry_bytes
-                    .is_some_and(|max| self.in_progress_render_geometry_bytes >= max)
-                {
-                    self.flush(writer)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush<W: Write + Send>(&mut self, writer: &mut ArrowWriter<W>) -> Result<()> {
-        writer.flush()?;
-        self.in_progress_render_geometry_bytes = 0;
-        Ok(())
-    }
-}
-
-/// For every row, use primary WKB for Point data or the largest non-null
-/// overview payload for Line/Polygon data. An overview-backed row group may be
-/// read at several display scales, so budgeting only its coarsest LoD would
-/// leave finer overview fetches unbounded.
-fn render_geometry_bytes_per_row(
+/// Write without allowing an input batch to push a row group beyond the
+/// public row-count limit. Levels explicitly flush at their boundaries.
+fn write_with_row_group_limit<W: Write + Send>(
+    writer: &mut ArrowWriter<W>,
     batch: &RecordBatch,
-    render_geometry_columns: &[usize],
-) -> Result<Vec<usize>> {
-    let mut sizes = vec![0; batch.num_rows()];
-    for &column_index in render_geometry_columns {
-        let column = batch.column(column_index);
-        if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
-            for (row, size) in sizes.iter_mut().enumerate() {
-                if !values.is_null(row) {
-                    *size = (*size).max(values.value(row).len());
-                }
-            }
-        } else if let Some(values) = column.as_any().downcast_ref::<LargeBinaryArray>() {
-            for (row, size) in sizes.iter_mut().enumerate() {
-                if !values.is_null(row) {
-                    *size = (*size).max(values.value(row).len());
-                }
-            }
-        } else if let Some(overviews) = column.as_any().downcast_ref::<StructArray>() {
-            for child in overviews.columns().iter().skip(1) {
-                let lod = child
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or_else(|| anyhow!("overviews child must be a struct"))?;
-                for (row, size) in sizes.iter_mut().enumerate() {
-                    if lod.is_null(row) {
-                        continue;
-                    }
-                    let bytes = lod
-                        .columns()
-                        .iter()
-                        .map(|field| {
-                            field
-                                .as_any()
-                                .downcast_ref::<ListArray>()
-                                .map(|list| {
-                                    list.value_length(row) as usize * std::mem::size_of::<i32>()
-                                })
-                                .unwrap_or(0)
-                        })
-                        .sum();
-                    *size = (*size).max(bytes);
-                }
-            }
-        } else {
-            bail!(
-                "render geometry column `{}` is neither WKB nor overviews",
-                batch.schema().field(column_index).name()
-            );
-        }
-    }
-    Ok(sizes)
-}
-
-fn rows_within_render_geometry_budget(
-    row_render_geometry_bytes: &[usize],
     max_rows: usize,
-    remaining_bytes: usize,
-    empty_row_group: bool,
-) -> usize {
-    let mut rows = 0;
-    let mut bytes = 0usize;
-    for &row_bytes in row_render_geometry_bytes.iter().take(max_rows) {
-        if bytes.saturating_add(row_bytes) > remaining_bytes {
-            // A single geometry is indivisible. Give it a one-row group so it
-            // cannot force unrelated rows over the target as well.
-            if rows == 0 && empty_row_group {
-                return 1;
-            }
-            break;
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < batch.num_rows() {
+        if writer.in_progress_rows() >= max_rows {
+            writer.flush()?;
         }
-        bytes = bytes.saturating_add(row_bytes);
-        rows += 1;
+        let capacity = max_rows - writer.in_progress_rows();
+        let rows = (batch.num_rows() - offset).min(capacity);
+        writer.write(&batch.slice(offset, rows))?;
+        offset += rows;
     }
-    rows
+    Ok(())
 }
 
 /// Inspect the GeoParquet column `crs` PROJJSON value to guess coordinate units.
@@ -417,17 +255,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             bail!("resolution values must be positive, got {:?}", resolutions);
         }
     }
-    if args.point_thinning_factor == 0 {
-        bail!(
-            "--point-thinning-factor must be >= 1 (got {})",
-            args.point_thinning_factor
-        );
-    }
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
-    }
-    if args.row_group_max_bytes == Some(0) {
-        bail!("--row-group-max-bytes must be >= 1");
     }
     if args.simplification_tolerance_factor.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         bail!(
@@ -583,7 +412,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         },
         &resolutions,
         input_units,
-        args.point_thinning_factor,
     )?;
     let occupied_candidates = occupied_level_candidates(&assignment, resolutions.len())?;
     let mut per_level = remap_levels(&assignment, &occupied_candidates)?;
@@ -714,7 +542,20 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // sequences. Delta encoding preserves the simple logical schema while
     // avoiding a dictionary that grows with every distinct coordinate.
     for overview in &overview_plan {
-        for child in ["x", "y", "part_ends", "polygon_ends"] {
+        for axis in ["x", "y"] {
+            let path = ColumnPath::from(vec![
+                OVERVIEWS_COLUMN.to_string(),
+                overview.id.clone(),
+                "coordinates".to_string(),
+                "list".to_string(),
+                "element".to_string(),
+                axis.to_string(),
+            ]);
+            props_builder = props_builder
+                .set_column_dictionary_enabled(path.clone(), false)
+                .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+        }
+        for child in ["part_ends", "polygon_ends"] {
             let path = ColumnPath::from(vec![
                 OVERVIEWS_COLUMN.to_string(),
                 overview.id.clone(),
@@ -802,16 +643,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     let mut last_level: Option<usize> = None;
     let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
-    let render_geometry_columns = vec![if overview_plan.is_empty() {
-        output_schema.index_of(&geom_col_name)?
-    } else {
-        output_schema.index_of(OVERVIEWS_COLUMN)?
-    }];
-    let mut row_group_limiter = RowGroupLimiter::new(args.row_group_size, args.row_group_max_bytes);
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
-                row_group_limiter.flush(&mut writer)?;
+                writer.flush()?;
                 levels_meta.push(Level {
                     row_group_end: flushed_row_group_end(&writer)?,
                     resolution: resolutions[prev],
@@ -819,11 +654,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 });
             }
         }
-        row_group_limiter.write(&mut writer, &batch, &render_geometry_columns)?;
+        write_with_row_group_limit(&mut writer, &batch, args.row_group_size)?;
         last_level = Some(level_i);
     }
     if let Some(prev) = last_level {
-        row_group_limiter.flush(&mut writer)?;
+        writer.flush()?;
         levels_meta.push(Level {
             row_group_end: flushed_row_group_end(&writer)?,
             resolution: resolutions[prev],
@@ -947,10 +782,24 @@ fn integer_list_type() -> DataType {
     DataType::List(Arc::new(Field::new("element", DataType::Int32, false)))
 }
 
+fn coordinate_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("x", DataType::Int32, false),
+        Field::new("y", DataType::Int32, false),
+    ])
+}
+
+fn coordinate_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new(
+        "element",
+        DataType::Struct(coordinate_fields()),
+        false,
+    )))
+}
+
 fn lod_child_fields() -> Fields {
     Fields::from(vec![
-        Field::new("x", integer_list_type(), false),
-        Field::new("y", integer_list_type(), false),
+        Field::new("coordinates", coordinate_list_type(), false),
         Field::new("part_ends", integer_list_type(), false),
         Field::new("polygon_ends", integer_list_type(), false),
     ])
@@ -1588,7 +1437,7 @@ fn build_overviews_array(
                 Some(_) => {}
             }
         }
-        lod_arrays.push(Arc::new(build_lod_array(&values)));
+        lod_arrays.push(Arc::new(build_lod_array(&values)?));
     }
 
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(lod_arrays.len() + 1);
@@ -1607,17 +1456,38 @@ fn build_overviews_array(
     Ok(StructArray::new(fields, arrays, None))
 }
 
-fn build_lod_array(values: &[Option<QuantizedOverview>]) -> StructArray {
+fn build_lod_array(values: &[Option<QuantizedOverview>]) -> Result<StructArray> {
     let list_field = || Arc::new(Field::new("element", DataType::Int32, false));
-    let mut x = ListBuilder::new(Int32Builder::new()).with_field(list_field());
-    let mut y = ListBuilder::new(Int32Builder::new()).with_field(list_field());
+    let coordinate_builder = StructBuilder::new(
+        coordinate_fields(),
+        vec![Box::new(Int32Builder::new()), Box::new(Int32Builder::new())],
+    );
+    let coordinate_field = Arc::new(Field::new(
+        "element",
+        DataType::Struct(coordinate_fields()),
+        false,
+    ));
+    let mut coordinates = ListBuilder::new(coordinate_builder).with_field(coordinate_field);
     let mut part_ends = ListBuilder::new(Int32Builder::new()).with_field(list_field());
     let mut polygon_ends = ListBuilder::new(Int32Builder::new()).with_field(list_field());
     let mut valid = Vec::with_capacity(values.len());
     for value in values {
         if let Some(value) = value {
-            x.values().append_slice(&value.x);
-            y.values().append_slice(&value.y);
+            if value.x.len() != value.y.len() {
+                bail!("internal: quantized overview x/y lengths differ");
+            }
+            let coordinate_values = coordinates.values();
+            coordinate_values
+                .field_builder::<Int32Builder>(0)
+                .expect("coordinate x builder")
+                .append_slice(&value.x);
+            coordinate_values
+                .field_builder::<Int32Builder>(1)
+                .expect("coordinate y builder")
+                .append_slice(&value.y);
+            for _ in 0..value.x.len() {
+                coordinate_values.append(true);
+            }
             part_ends.values().append_slice(&value.part_ends);
             polygon_ends.values().append_slice(&value.polygon_ends);
             valid.push(true);
@@ -1626,21 +1496,19 @@ fn build_lod_array(values: &[Option<QuantizedOverview>]) -> StructArray {
         }
         // Child lists are required. Their values are ignored whenever the
         // enclosing LoD struct is null.
-        x.append(true);
-        y.append(true);
+        coordinates.append(true);
         part_ends.append(true);
         polygon_ends.append(true);
     }
-    StructArray::new(
+    Ok(StructArray::new(
         lod_child_fields(),
         vec![
-            Arc::new(x.finish()),
-            Arc::new(y.finish()),
+            Arc::new(coordinates.finish()),
             Arc::new(part_ends.finish()),
             Arc::new(polygon_ends.finish()),
         ],
         Some(NullBuffer::from(valid)),
-    )
+    ))
 }
 
 /// Per-row tie-break ranks derived from the `--sort-key` attribute column: a
@@ -1685,7 +1553,6 @@ fn assign_levels(
     features: FeatureMeasures<'_>,
     resolutions: &[f64],
     units: InputUnits,
-    point_thinning_factor: u32,
 ) -> Result<Vec<u16>> {
     // WGS84 equatorial circumference / 360°: meters per degree of longitude at the equator.
     // Used only as a rendering-grade scale factor — see the README note on geodesy.
@@ -1711,8 +1578,6 @@ fn assign_levels(
         })
         .collect();
 
-    let point_thin_mul = point_thinning_factor as f64;
-
     // Extended geometries use the first candidate at which their actual
     // simplification result remains renderable. Points are eligible
     // immediately and are density-thinned below.
@@ -1728,8 +1593,10 @@ fn assign_levels(
 
     let cell_key = |row: u32, prec: f64| -> (i64, i64) {
         let b = features.bboxes[row as usize];
-        let ep = prec * point_thin_mul;
-        ((b.cx() / ep).floor() as i64, (b.cy() / ep).floor() as i64)
+        (
+            (b.cx() / prec).floor() as i64,
+            (b.cy() / prec).floor() as i64,
+        )
     };
 
     let mut assigned_points: Vec<u32> = Vec::new();
@@ -2054,62 +1921,6 @@ mod tests {
     }
 
     #[test]
-    fn render_geometry_budget_uses_selected_columns() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("geometry", DataType::Binary, false),
-            Field::new("geometry_ovr_0", DataType::Binary, true),
-            Field::new("geometry_ovr_1", DataType::Binary, true),
-        ]));
-        let raw_a = vec![0u8; 10_000];
-        let raw_b = vec![0u8; 20_000];
-        let coarse_a = vec![0u8; 30];
-        let coarse_b = vec![0u8; 40];
-        let fine_a = vec![0u8; 80];
-        let fine_b = vec![0u8; 60];
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(BinaryArray::from(vec![raw_a.as_slice(), raw_b.as_slice()])),
-                Arc::new(BinaryArray::from(vec![
-                    coarse_a.as_slice(),
-                    coarse_b.as_slice(),
-                ])),
-                Arc::new(BinaryArray::from(vec![
-                    fine_a.as_slice(),
-                    fine_b.as_slice(),
-                ])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            render_geometry_bytes_per_row(&batch, &[1, 2]).unwrap(),
-            vec![80, 60]
-        );
-        assert_eq!(
-            render_geometry_bytes_per_row(&batch, &[0]).unwrap(),
-            vec![10_000, 20_000]
-        );
-    }
-
-    #[test]
-    fn wkb_budget_splits_before_overflow_and_isolates_oversized_rows() {
-        assert_eq!(
-            rows_within_render_geometry_budget(&[40, 50, 20], 3, 100, true),
-            2
-        );
-        assert_eq!(rows_within_render_geometry_budget(&[20], 1, 10, false), 0);
-        assert_eq!(
-            rows_within_render_geometry_budget(&[120, 5], 2, 100, true),
-            1
-        );
-        assert_eq!(
-            rows_within_render_geometry_budget(&[0, 0, 0], 2, 0, true),
-            2
-        );
-    }
-
-    #[test]
     fn detect_input_units_branches() {
         // No metadata at all → degrees (CRS84 fallback).
         assert!(matches!(
@@ -2221,7 +2032,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![0, 0]);
@@ -2230,8 +2040,8 @@ mod tests {
     #[test]
     fn assign_levels_thins_dense_points_to_finer_levels() {
         // Two points falling into the same level-0 grid cell (`prec=100`):
-        // one wins level 0, the other gets deferred. With point_thin=1
-        // they're both in cell `(0, 0)` at the coarse level.
+        // one wins level 0, the other gets deferred. Cell pitch is exactly the
+        // level resolution, so both are in cell `(0, 0)` at the coarse level.
         let bboxes = vec![bb(10.0, 10.0, 10.0, 10.0), bb(20.0, 20.0, 20.0, 20.0)];
         let kinds = vec![GeomKind::Point, GeomKind::Point];
         let gsds = vec![100.0, 10.0];
@@ -2244,7 +2054,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         let mut sorted = out.clone();
@@ -2269,7 +2078,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![1, 0]);
@@ -2321,7 +2129,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![1]);
@@ -2341,7 +2148,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![1]);
@@ -2363,7 +2169,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![0, 1]);
@@ -2397,7 +2202,6 @@ mod tests {
             },
             &gsds,
             InputUnits::Meters,
-            1,
         )
         .unwrap();
         assert_eq!(out, vec![0, 0, 0, 0]);

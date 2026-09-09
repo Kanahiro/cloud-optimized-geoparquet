@@ -65,18 +65,13 @@ Other important options:
 - `--simplification-tolerance-factor` — simplification tolerance as a multiple
   of each level resolution; default `1`.
 - `--row-group-size` — maximum number of rows per Parquet row group; default
-  `65536`. Level boundaries and `--row-group-max-bytes` may produce smaller
-  row groups, but geometry type and bbox size do not change this row limit.
-- `--row-group-max-bytes` — approximate maximum uncompressed render-geometry
-  bytes in a row group: the largest usable overview for Line/Polygon or primary
-  WKB for Point; default 4 MiB.
+  `65536`. Level boundaries and the end of the input may produce smaller row
+  groups.
 - `--input-units auto|degrees|meters` — coordinate-unit handling. `auto`
   inspects GeoParquet CRS metadata. Reproject high-latitude or
   antimeridian-spanning data to a meter-based CRS for predictable tolerances.
-- `--point-thinning-factor` — point grid spacing relative to resolution;
-  default `4`.
 - `--sort-key` / `--sort-order` — choose the winning point when several occupy
-  one thinning cell.
+  one resolution-sized thinning cell.
 - `--geometry-column` — override primary geometry auto-detection.
 
 The producer:

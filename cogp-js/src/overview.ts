@@ -15,10 +15,12 @@ export interface OverviewFileMetadata extends FileMetadataLike {
 export type OverviewGeometryType = 1 | 2 | 3 | 4 | 5 | 6;
 
 type NumberArray = ArrayLike<number> & { readonly length: number };
+type QuantizedCoordinateArray = ArrayLike<{ readonly x: number; readonly y: number }>
+  & { readonly length: number };
 
 /**
- * A zero-copy view over one quantized overview geometry. Custom renderers can
- * consume this directly instead of first materializing nested GeoJSON arrays.
+ * A view over one quantized overview geometry. Custom renderers can consume
+ * this directly instead of first materializing nested GeoJSON arrays.
  */
 export interface QuantizedOverviewGeometry {
   readonly type: OverviewGeometryType;
@@ -93,11 +95,32 @@ export function parseOverview(
   const lodName = Object.keys(root).find((name) => name !== 'geometry_type');
   const lod = lodName ? root[lodName] as Record<string, unknown> | undefined : undefined;
   if (!lod) return null;
-  const xs = asNumberArray(lod['x']);
-  const ys = asNumberArray(lod['y']);
-  if (xs.length !== ys.length) throw new Error('overview x/y lengths differ');
+  const coordinates = asCoordinateArray(lod['coordinates']);
+  const xs = new Int32Array(coordinates.length);
+  const ys = new Int32Array(coordinates.length);
+  for (let i = 0; i < coordinates.length; i++) {
+    const coordinate = coordinates[i]!;
+    xs[i] = Number(coordinate.x);
+    ys[i] = Number(coordinate.y);
+  }
   const partEnds = asNumberArray(lod['part_ends']);
   const polygonEnds = asNumberArray(lod['polygon_ends']);
+  return parseOverviewColumns(geometryType, xs, ys, partEnds, polygonEnds, metadata);
+}
+
+/** Build a validated overview view from independently decoded physical leaves. */
+export function parseOverviewColumns(
+  geometryType: number,
+  xs: NumberArray,
+  ys: NumberArray,
+  partEnds: NumberArray,
+  polygonEnds: NumberArray,
+  metadata: LodMetadata,
+): QuantizedOverviewGeometry {
+  if (!isOverviewGeometryType(geometryType)) {
+    throw new Error(`unsupported overview geometry type ${geometryType}`);
+  }
+  if (xs.length !== ys.length) throw new Error('overview x/y lengths differ');
   if (geometryType === 3 || geometryType === 5 || geometryType === 6) {
     validateEnds(partEnds, xs.length, 'overview part');
   }
@@ -129,6 +152,13 @@ export function decodeQuantizedOverview(value: QuantizedOverviewGeometry | null)
       return { type: 'MultiPolygon', coordinates: splitParts(rings, value.polygonEnds) };
     }
   }
+}
+
+function asCoordinateArray(value: unknown): QuantizedCoordinateArray {
+  if (!Array.isArray(value)) {
+    throw new Error('overview coordinates field is not an array');
+  }
+  return value as QuantizedCoordinateArray;
 }
 
 function asNumberArray(value: unknown): NumberArray {

@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsc -p tsconfig.test.json && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@hpcc-js/wasm-zstd": "1.15.0",
     "cogp": "workspace:*",
+    "lineclip": "^2.0.0",
     "maplibre-gl": "^4.7.0"
   },
   "devDependencies": {

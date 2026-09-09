@@ -1,15 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { decodeOverview, parseOverview, projectOverviewMetadata } from '../dist/overview.js';
+import {
+  decodeOverview,
+  parseOverview,
+  parseOverviewColumns,
+  projectOverviewMetadata,
+} from '../dist/overview.js';
 
 test('decodes quantized multipolygon coordinates and topology', () => {
   const geometry = decodeOverview(
     {
       geometry_type: 6,
       l1: {
-        x: [0, 2, 2, 0, 0],
-        y: [0, 0, 2, 2, 0],
+        coordinates: [
+          { x: 0, y: 0 },
+          { x: 2, y: 0 },
+          { x: 2, y: 2 },
+          { x: 0, y: 2 },
+          { x: 0, y: 0 },
+        ],
         part_ends: [5],
         polygon_ends: [1],
       },
@@ -28,13 +38,12 @@ test('decodes quantized multipolygon coordinates and topology', () => {
   });
 });
 
-test('decodes typed overview arrays without changing topology', () => {
+test('decodes an overview coordinate struct list without changing topology', () => {
   const geometry = decodeOverview(
     {
       geometry_type: 5,
       l1: {
-        x: new Int32Array([0, 2, 4]),
-        y: new Int32Array([1, 3, 5]),
+        coordinates: [{ x: 0, y: 1 }, { x: 2, y: 3 }, { x: 4, y: 5 }],
         part_ends: new Int32Array([2, 3]),
         polygon_ends: new Int32Array(0),
       },
@@ -50,24 +59,42 @@ test('decodes typed overview arrays without changing topology', () => {
   });
 });
 
-test('exposes a zero-copy quantized overview view for custom renderers', () => {
-  const x = new Int32Array([1, 2]);
-  const y = new Int32Array([3, 4]);
+test('turns the row-oriented coordinate structs into typed axis arrays', () => {
+  const coordinates = [{ x: 1, y: 3 }, { x: 2, y: 4 }];
   const partEnds = new Int32Array([2]);
   const polygonEnds = new Int32Array(0);
   const overview = parseOverview(
     {
       geometry_type: 5,
-      l1: { x, y, part_ends: partEnds, polygon_ends: polygonEnds },
+      l1: { coordinates, part_ends: partEnds, polygon_ends: polygonEnds },
     },
+    { scale: [0.5, 2], offset: [10, 20] },
+  );
+  assert.deepEqual(overview.x, new Int32Array([1, 2]));
+  assert.deepEqual(overview.y, new Int32Array([3, 4]));
+  assert.equal(overview.partEnds, partEnds);
+  assert.equal(overview.polygonEnds, polygonEnds);
+  assert.deepEqual(overview.scale, [0.5, 2]);
+  assert.deepEqual(overview.offset, [10, 20]);
+});
+
+test('keeps directly decoded physical leaves without cloning them', () => {
+  const x = new Int32Array([1, 2]);
+  const y = new Int32Array([3, 4]);
+  const partEnds = new Int32Array([2]);
+  const polygonEnds = new Int32Array(0);
+  const overview = parseOverviewColumns(
+    5,
+    x,
+    y,
+    partEnds,
+    polygonEnds,
     { scale: [0.5, 2], offset: [10, 20] },
   );
   assert.equal(overview.x, x);
   assert.equal(overview.y, y);
   assert.equal(overview.partEnds, partEnds);
   assert.equal(overview.polygonEnds, polygonEnds);
-  assert.deepEqual(overview.scale, [0.5, 2]);
-  assert.deepEqual(overview.offset, [10, 20]);
 });
 
 test('metadata projection removes sibling LoDs from range planning', () => {

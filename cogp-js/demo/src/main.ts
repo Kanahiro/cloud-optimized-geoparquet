@@ -245,6 +245,7 @@ interface ActiveDataset {
 
 let active: ActiveDataset | null = null;
 let latestUrl = '';
+let datasetLoadController: AbortController | null = null;
 
 loadBtn.addEventListener('click', () => {
   void loadDataset(urlInput.value.trim());
@@ -272,9 +273,12 @@ async function loadDataset(url: string): Promise<void> {
   }
   loadBtn.disabled = true;
   setStatus(`Opening ${url} …`);
+  datasetLoadController?.abort();
+  const controller = new AbortController();
+  datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { summary, dataBbox } = await openCogpDataset(url);
+    const { summary, dataBbox } = await openCogpDataset(url, controller.signal);
     if (latestUrl !== url) return;
     active = {
       url,
@@ -291,12 +295,14 @@ async function loadDataset(url: string): Promise<void> {
     );
   } catch (err) {
     if (latestUrl !== url) return;
+    if (controller.signal.aborted) return;
     console.error(err);
     setStatus(`Error: ${(err as Error).message}`);
     active = null;
     datasetRevision += 1;
     removeCogpLayersAndSource();
   } finally {
+    if (datasetLoadController === controller) datasetLoadController = null;
     if (latestUrl === url) loadBtn.disabled = false;
   }
 }

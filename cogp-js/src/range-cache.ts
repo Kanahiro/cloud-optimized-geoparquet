@@ -1,4 +1,5 @@
 import type { AsyncBufferLike } from './coalescing-buffer.js';
+import { abortReason, raceAbort } from './abort.js';
 
 export interface RangeCacheOptions {
   /** Maximum compressed bytes retained by one reader. Defaults to 64 MiB. */
@@ -10,6 +11,8 @@ interface CacheEntry {
   end: number;
   bytes: number;
   settled: boolean;
+  consumers: number;
+  controller: AbortController;
   promise: Promise<ArrayBuffer>;
 }
 
@@ -65,17 +68,55 @@ export function rangeCachedAsyncBuffer(
     return best;
   };
 
-  const fetchWithoutCaching = (start: number, end: number): Promise<ArrayBuffer> => {
+  const fetchWithoutCaching = (
+    start: number,
+    end: number,
+    signal?: AbortSignal,
+  ): Promise<ArrayBuffer> => {
     try {
-      return Promise.resolve(source.slice(start, end));
+      return raceAbort(source.slice(start, end, signal), signal);
     } catch (error) {
       return Promise.reject(error);
     }
   };
 
+  const subscribe = (
+    entry: CacheEntry,
+    start: number,
+    end: number,
+    signal?: AbortSignal,
+  ): Promise<ArrayBuffer> => {
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
+    entry.consumers++;
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      let done = false;
+      const release = (): void => {
+        entry.consumers--;
+        if (entry.consumers === 0 && !entry.settled) {
+          // An in-flight entry without consumers must not poison a later lookup.
+          remove(entry);
+          entry.controller.abort();
+        }
+      };
+      const finish = (callback: () => void): void => {
+        if (done) return;
+        done = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        release();
+        callback();
+      };
+      const onAbort = (): void => finish(() => reject(abortReason(signal!)));
+      signal?.addEventListener('abort', onAbort, { once: true });
+      entry.promise.then(
+        buffer => finish(() => resolve(buffer.slice(start - entry.start, end - entry.start))),
+        error => finish(() => reject(error)),
+      );
+    });
+  };
+
   return {
     byteLength: source.byteLength,
-    slice(start: number, end = source.byteLength): Promise<ArrayBuffer> {
+    slice(start: number, end = source.byteLength, signal?: AbortSignal): Promise<ArrayBuffer> {
       if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
         return Promise.reject(new Error(`slice bounds must be safe integers, got [${start}, ${end})`));
       }
@@ -84,21 +125,19 @@ export function rangeCachedAsyncBuffer(
           new Error(`slice [${start}, ${end}) is outside buffer length ${source.byteLength}`),
         );
       }
+      if (signal?.aborted) return Promise.reject(abortReason(signal));
       if (start === end) return Promise.resolve(new ArrayBuffer(0));
 
       const container = findContainer(start, end);
-      if (container) {
-        return container.promise.then(buffer =>
-          buffer.slice(start - container.start, end - container.start),
-        );
-      }
+      if (container) return subscribe(container, start, end, signal);
 
       const bytes = end - start;
-      if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end);
+      if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end, signal);
 
       let fetched: Promise<ArrayBuffer>;
+      const controller = new AbortController();
       try {
-        fetched = Promise.resolve(source.slice(start, end));
+        fetched = Promise.resolve(source.slice(start, end, controller.signal));
       } catch (error) {
         return Promise.reject(error);
       }
@@ -128,13 +167,13 @@ export function rangeCachedAsyncBuffer(
         remove(entry);
         throw error;
       });
-      entry = { start, end, bytes, settled: false, promise };
+      entry = { start, end, bytes, settled: false, consumers: 0, controller, promise };
       entries.add(entry);
       cachedBytes += bytes;
       evict();
 
       // Never expose the cached ArrayBuffer itself to mutable callers.
-      return promise.then(buffer => buffer.slice(0));
+      return subscribe(entry, start, end, signal);
     },
   };
 }

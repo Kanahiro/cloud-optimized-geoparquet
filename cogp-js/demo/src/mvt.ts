@@ -1,9 +1,22 @@
 import type { QuantizedOverviewGeometry } from 'cogp';
 
-import { MVT_LAYER_NAME } from './cogp-types';
+import { MVT_LAYER_NAME } from './cogp-types.js';
+import {
+  clipLineString,
+  clipPolygonRing,
+  pointInBbox,
+  type ClipBbox,
+  type Position,
+} from './clip.js';
 
 export const MVT_EXTENT = 4096;
 export const MVT_BUFFER = 64;
+const MVT_CLIP_BBOX: ClipBbox = [
+  -MVT_BUFFER,
+  -MVT_BUFFER,
+  MVT_EXTENT + MVT_BUFFER,
+  MVT_EXTENT + MVT_BUFFER,
+];
 
 const MAX_MERCATOR_LATITUDE = 85.0511287798066;
 const textEncoder = new TextEncoder();
@@ -16,9 +29,8 @@ export type EncodedMvtFeature = Uint8Array;
  * typed arrays in place and writes MVT command integers directly: no WKB,
  * GeoJSON coordinate tree, geojson-vt index, or Point wrapper is allocated.
  *
- * Features are already bbox-filtered to the buffered tile by CogpReader.
- * Coordinates outside the extent are intentionally retained; MapLibre clips
- * buffered vector geometry at the tile boundary.
+ * Features are first bbox-filtered by CogpReader, then clipped here to the
+ * buffered MVT extent so large geometries are not repeatedly sent to MapLibre.
  */
 export function createOverviewMvtEncoder(
   z: number,
@@ -49,19 +61,24 @@ export function encodePointFeature(
   if (value.type === 'Point') {
     const coordinate = value.coordinates as readonly number[];
     if (!validCoordinate(coordinate)) return null;
-    commands.writeVarint(command(1, 1));
     const px = projection.x(coordinate[0]!);
     const py = projection.y(coordinate[1]!);
+    if (!pointInBbox(px, py, MVT_CLIP_BBOX)) return null;
+    commands.writeVarint(command(1, 1));
     commands.writeVarint(zigZag(px - cursorX));
     commands.writeVarint(zigZag(py - cursorY));
   } else if (value.type === 'MultiPoint') {
     const coordinates = value.coordinates as readonly (readonly number[])[];
-    const valid = coordinates.filter(validCoordinate);
-    if (valid.length === 0) return null;
-    commands.writeVarint(command(1, valid.length));
-    for (const coordinate of valid) {
-      const px = projection.x(coordinate[0]!, cursorX);
+    const clipped: Position[] = [];
+    for (const coordinate of coordinates) {
+      if (!validCoordinate(coordinate)) continue;
+      const px = projection.x(coordinate[0]!);
       const py = projection.y(coordinate[1]!);
+      if (pointInBbox(px, py, MVT_CLIP_BBOX)) clipped.push([px, py]);
+    }
+    if (clipped.length === 0) return null;
+    commands.writeVarint(command(1, clipped.length));
+    for (const [px, py] of clipped) {
       commands.writeVarint(zigZag(px - cursorX));
       commands.writeVarint(zigZag(py - cursorY));
       cursorX = px;
@@ -100,12 +117,16 @@ function encodeOverviewFeature(
   if (mvtType === 1) {
     writeOverviewPoints(commands, overview, projection, cursor);
   } else if (overview.type === 2) {
-    writeOverviewPart(commands, overview, projection, cursor, 0, overview.x.length, false);
+    writeOverviewLine(commands, overview, projection, cursor, 0, overview.x.length);
   } else {
     let start = 0;
     for (let i = 0; i < overview.partEnds.length; i++) {
       const end = Number(overview.partEnds[i]);
-      writeOverviewPart(commands, overview, projection, cursor, start, end, mvtType === 3);
+      if (mvtType === 3) {
+        writeOverviewPolygonRing(commands, overview, projection, cursor, start, end);
+      } else {
+        writeOverviewLine(commands, overview, projection, cursor, start, end);
+      }
       start = end;
     }
   }
@@ -121,48 +142,89 @@ function writeOverviewPoints(
 ): void {
   const count = overview.x.length;
   if (count === 0) return;
-  commands.writeVarint(command(1, count));
-  let previousPartX: number | undefined;
+  const coordinates: Position[] = [];
   for (let i = 0; i < count; i++) {
-    const px = projectOverviewX(overview, projection, i, previousPartX);
+    const px = projectOverviewX(overview, projection, i);
     const py = projectOverviewY(overview, projection, i);
+    if (!pointInBbox(px, py, MVT_CLIP_BBOX)) continue;
+    coordinates.push([px, py]);
+  }
+  if (coordinates.length === 0) return;
+  commands.writeVarint(command(1, coordinates.length));
+  for (const [px, py] of coordinates) {
     commands.writeVarint(zigZag(px - cursor.x));
     commands.writeVarint(zigZag(py - cursor.y));
     cursor.x = px;
     cursor.y = py;
-    previousPartX = px;
   }
 }
 
-function writeOverviewPart(
+function writeOverviewLine(
   commands: ByteWriter,
   overview: QuantizedOverviewGeometry,
   projection: TileProjection,
   cursor: { x: number; y: number },
   start: number,
   end: number,
-  close: boolean,
 ): void {
-  const repeatsFirst = close
+  const coordinates = projectOverviewPart(overview, projection, start, end, false);
+  for (const part of clipLineString(coordinates, MVT_CLIP_BBOX)) {
+    writePath(commands, cursor, part, false);
+  }
+}
+
+function writeOverviewPolygonRing(
+  commands: ByteWriter,
+  overview: QuantizedOverviewGeometry,
+  projection: TileProjection,
+  cursor: { x: number; y: number },
+  start: number,
+  end: number,
+): void {
+  const coordinates = projectOverviewPart(overview, projection, start, end, true);
+  const clipped = clipPolygonRing(coordinates, MVT_CLIP_BBOX);
+  writePath(commands, cursor, clipped, true);
+}
+
+function projectOverviewPart(
+  overview: QuantizedOverviewGeometry,
+  projection: TileProjection,
+  start: number,
+  end: number,
+  closed: boolean,
+): Position[] {
+  const repeatsFirst = closed
     && end - start > 1
     && Number(overview.x[start]) === Number(overview.x[end - 1])
     && Number(overview.y[start]) === Number(overview.y[end - 1]);
-  const count = end - start - (repeatsFirst ? 1 : 0);
-  const minimum = close ? 3 : 2;
-  if (count < minimum) return;
+  const limit = end - (repeatsFirst ? 1 : 0);
+  const coordinates: Position[] = [];
+  let previousPartX: number | undefined;
+  for (let index = start; index < limit; index++) {
+    const px = projectOverviewX(overview, projection, index, previousPartX);
+    coordinates.push([px, projectOverviewY(overview, projection, index)]);
+    previousPartX = px;
+  }
+  return coordinates;
+}
+
+function writePath(
+  commands: ByteWriter,
+  cursor: { x: number; y: number },
+  coordinates: readonly Position[],
+  close: boolean,
+): void {
+  const count = coordinates.length;
+  if (count < (close ? 3 : 2)) return;
 
   commands.writeVarint(command(1, 1));
-  let previousPartX: number | undefined;
   for (let i = 0; i < count; i++) {
     if (i === 1) commands.writeVarint(command(2, count - 1));
-    const index = start + i;
-    const px = projectOverviewX(overview, projection, index, previousPartX);
-    const py = projectOverviewY(overview, projection, index);
+    const [px, py] = coordinates[i]!;
     commands.writeVarint(zigZag(px - cursor.x));
     commands.writeVarint(zigZag(py - cursor.y));
     cursor.x = px;
     cursor.y = py;
-    previousPartX = px;
   }
   if (close) commands.writeVarint(command(7, 1));
 }

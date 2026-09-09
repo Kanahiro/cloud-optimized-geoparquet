@@ -52,8 +52,8 @@ function call<T>(payload: WorkerEnvelope['payload'], signal?: AbortSignal): Prom
   });
 }
 
-export function openDataset(url: string): Promise<OpenResult> {
-  return call<OpenResult>({ type: 'open', url });
+export function openDataset(url: string, signal?: AbortSignal): Promise<OpenResult> {
+  return call<OpenResult>({ type: 'open', url }, signal);
 }
 
 export function readTile(

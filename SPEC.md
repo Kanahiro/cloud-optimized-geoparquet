@@ -227,8 +227,10 @@ Line- and Polygon-family files MUST contain exactly one top-level column named
 overviews: required struct<
   geometry_type: required int8,
   <lod>: nullable struct<
-    x: required list<required int32>,
-    y: required list<required int32>,
+    coordinates: required list<required struct<
+      x: required int32,
+      y: required int32
+    >>,
     part_ends: required list<required int32>,
     polygon_ends: required list<required int32>
   >,
@@ -245,8 +247,10 @@ that row. In particular, a producer whose polygon repair can split a Polygon
 at some resolutions MUST encode all of that row's polygon LoDs as MultiPolygon;
 an unsplit Polygon is represented as a one-member MultiPolygon in those LoDs.
 
-`x` and `y` are parallel flattened coordinate arrays and MUST have equal
-lengths. A coordinate is decoded using the LoD metadata:
+`coordinates` is the flattened coordinate sequence. Its separated `x` and `y`
+leaves share the list's single offset buffer, so coordinate pairing and equal
+axis lengths are structural properties of the schema. A coordinate is decoded
+using the LoD metadata:
 
 ```text
 x_decoded = offset[0] + scale[0] * x_integer

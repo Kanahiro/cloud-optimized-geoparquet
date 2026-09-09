@@ -29,6 +29,9 @@ importers:
       cogp:
         specifier: workspace:*
         version: link:..
+      lineclip:
+        specifier: ^2.0.0
+        version: 2.0.0
       maplibre-gl:
         specifier: ^4.7.0
         version: 4.7.1
@@ -430,6 +433,9 @@ packages:
     resolution: {integrity: sha512-dcS1ul+9tmeD95T+x28/ehLgd9mENa3LsvDTtzm3vyBEO7RPptvAD+t44WVXaUjTBRcrpFeFlC8WCruUR456hw==}
     engines: {node: '>=0.10.0'}
 
+  lineclip@2.0.0:
+    resolution: {integrity: sha512-PosanfyLckGXZbCX+aWmfmHWWhVPnLf9iKcUefaSGGw2IBOef5XdBdyl175LEqRy/sEOZ2SEz/l7K5S93BZlYQ==}
+
   maplibre-gl@4.7.1:
     resolution: {integrity: sha512-lgL7XpIwsgICiL82ITplfS7IGwrB1OJIw/pCvprDp2dhmSSEBgmPzYRvwYYYvJGJD7fxUv1Tvpih4nZ6VrLuaA==}
     engines: {node: '>=16.14.0', npm: '>=8.1.0'}
@@ -797,6 +803,8 @@ snapshots:
   kdbush@4.1.0: {}
 
   kind-of@6.0.3: {}
+
+  lineclip@2.0.0: {}
 
   maplibre-gl@4.7.1:
     dependencies:

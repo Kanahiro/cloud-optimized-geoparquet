@@ -1,13 +1,11 @@
+import { abortReason } from './abort.js';
+
 export interface AsyncBufferLike {
   byteLength: number;
-  slice(start: number, end?: number): ArrayBuffer | Promise<ArrayBuffer>;
+  slice(start: number, end?: number, signal?: AbortSignal): ArrayBuffer | Promise<ArrayBuffer>;
 }
 
-export interface RangeCoalescingOptions {
-  /** Maximum unrequested gap included to eliminate one range request. */
-  maxGapBytes?: number;
-  /** Maximum merged bytes / uniquely requested bytes; must be at least 1. */
-  maxOverfetchRatio?: number;
+interface CoalescingOptions {
   /** Byte intervals that must neither be requested nor crossed by a merge. */
   protectedRanges?: readonly ByteRange[];
 }
@@ -22,6 +20,9 @@ interface PendingSlice {
   end: number;
   resolve: (buffer: ArrayBuffer) => void;
   reject: (reason: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  settled: boolean;
 }
 
 interface SliceRun {
@@ -31,8 +32,9 @@ interface SliceRun {
   slices: PendingSlice[];
 }
 
-const DEFAULT_MAX_GAP_BYTES = 128 * 1024;
-const DEFAULT_MAX_OVERFETCH_RATIO = 1.25;
+// This is the measured knee across polygon, line, and building workloads:
+// larger budgets add transfer much faster than they reduce concurrent reads.
+const MAX_OVERFETCH_BYTES = 32 * 1024;
 
 /**
  * Batch concurrent AsyncBuffer slices into nearby contiguous reads.
@@ -40,22 +42,15 @@ const DEFAULT_MAX_OVERFETCH_RATIO = 1.25;
  * Parquet page pruning can issue one small slice per physical column and row
  * group. Waiting until the current microtask finishes exposes that batch
  * without adding a timer delay. Nearby slices are fetched as one ordinary HTTP
- * Range and split back into exact per-caller buffers. The gap limit makes the
- * request-count/extra-byte tradeoff explicit and bounded.
+ * Range and split back into exact per-caller buffers. The cumulative
+ * overfetch budget is deliberately the only merge policy: it bounds wasted
+ * transfer and avoids exposing transport-tuning details to callers.
  */
 export function coalescingAsyncBuffer(
   source: AsyncBufferLike,
-  options: RangeCoalescingOptions = {},
+  options: CoalescingOptions = {},
 ): AsyncBufferLike {
-  const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES;
-  const maxOverfetchRatio = options.maxOverfetchRatio ?? DEFAULT_MAX_OVERFETCH_RATIO;
   const protectedRanges = normalizeRanges(options.protectedRanges ?? [], source.byteLength);
-  if (!Number.isSafeInteger(maxGapBytes) || maxGapBytes < 0) {
-    throw new Error(`maxGapBytes must be a non-negative safe integer, got ${maxGapBytes}`);
-  }
-  if (!Number.isFinite(maxOverfetchRatio) || maxOverfetchRatio < 1) {
-    throw new Error(`maxOverfetchRatio must be a finite number >= 1, got ${maxOverfetchRatio}`);
-  }
 
   let pending: PendingSlice[] = [];
   let flushScheduled = false;
@@ -64,13 +59,13 @@ export function coalescingAsyncBuffer(
     flushScheduled = false;
     const batch = pending;
     pending = [];
-    const runs = makeRuns(batch, maxGapBytes, maxOverfetchRatio, protectedRanges);
+    const runs = makeRuns(batch, protectedRanges);
     for (const run of runs) void fetchRun(source, run);
   };
 
   return {
     byteLength: source.byteLength,
-    slice(start: number, end = source.byteLength): Promise<ArrayBuffer> {
+    slice(start: number, end = source.byteLength, signal?: AbortSignal): Promise<ArrayBuffer> {
       if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
         return Promise.reject(new Error(`slice bounds must be safe integers, got [${start}, ${end})`));
       }
@@ -80,12 +75,18 @@ export function coalescingAsyncBuffer(
         );
       }
       if (start === end) return Promise.resolve(new ArrayBuffer(0));
+      if (signal?.aborted) return Promise.reject(abortReason(signal));
       if (intersectsAny(start, end, protectedRanges)) {
         return Promise.reject(new Error(`slice [${start}, ${end}) intersects a protected range`));
       }
 
       const result = new Promise<ArrayBuffer>((resolve, reject) => {
-        pending.push({ start, end, resolve, reject });
+        const slice: PendingSlice = { start, end, resolve, reject, signal, settled: false };
+        if (signal) {
+          slice.onAbort = () => rejectSlice(slice, abortReason(signal));
+          signal.addEventListener('abort', slice.onAbort, { once: true });
+        }
+        pending.push(slice);
       });
       if (!flushScheduled) {
         flushScheduled = true;
@@ -98,11 +99,10 @@ export function coalescingAsyncBuffer(
 
 function makeRuns(
   batch: PendingSlice[],
-  maxGapBytes: number,
-  maxOverfetchRatio: number,
   protectedRanges: readonly ByteRange[],
 ): SliceRun[] {
-  const sorted = batch.sort((a, b) => a.start - b.start || a.end - b.end);
+  const sorted = batch.filter(slice => !slice.settled)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
   const runs: SliceRun[] = [];
   for (const slice of sorted) {
     const run = runs[runs.length - 1];
@@ -121,13 +121,12 @@ function makeRuns(
     const mergedSpan = mergedEnd - run.start;
     const addedRequestedBytes = Math.max(0, slice.end - Math.max(slice.start, run.end));
     const mergedRequestedBytes = run.requestedBytes + addedRequestedBytes;
-    const overfetchRatio = mergedSpan / mergedRequestedBytes;
-    // Overlapping ranges never add transfer bytes, so merge them even when an
-    // individual request is already larger than either configured budget.
+    const overfetchBytes = mergedSpan - mergedRequestedBytes;
+    // Overlapping ranges never add transfer bytes, so merge them regardless
+    // of the overfetch budget.
     if (
       gap <= 0 ||
-      (gap <= maxGapBytes
-        && overfetchRatio <= maxOverfetchRatio
+      (overfetchBytes <= MAX_OVERFETCH_BYTES
         && !intersectsAny(run.end, slice.start, protectedRanges))
     ) {
       run.end = mergedEnd;
@@ -167,8 +166,13 @@ function intersectsAny(start: number, end: number, ranges: readonly ByteRange[])
 }
 
 async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {
+  const controller = new AbortController();
+  const abortIfUnused = (): void => {
+    if (run.slices.every(slice => slice.settled)) controller.abort();
+  };
+  for (const slice of run.slices) slice.signal?.addEventListener('abort', abortIfUnused);
   try {
-    const buffer = await source.slice(run.start, run.end);
+    const buffer = await source.slice(run.start, run.end, controller.signal);
     const expected = run.end - run.start;
     if (buffer.byteLength < expected) {
       throw new Error(
@@ -179,10 +183,27 @@ async function fetchRun(source: AsyncBufferLike, run: SliceRun): Promise<void> {
       // The common one-request run already has the exact ArrayBuffer the
       // caller asked for. Passing it through avoids copying every compressed
       // Parquet page solely because it traversed the coalescing layer.
-      if (slice.start === run.start && slice.end === run.end) slice.resolve(buffer);
-      else slice.resolve(buffer.slice(slice.start - run.start, slice.end - run.start));
+      if (slice.start === run.start && slice.end === run.end) resolveSlice(slice, buffer);
+      else resolveSlice(slice, buffer.slice(slice.start - run.start, slice.end - run.start));
     }
   } catch (error) {
-    for (const slice of run.slices) slice.reject(error);
+    for (const slice of run.slices) rejectSlice(slice, error);
+  } finally {
+    for (const slice of run.slices) slice.signal?.removeEventListener('abort', abortIfUnused);
   }
+}
+
+function finishSlice(slice: PendingSlice): boolean {
+  if (slice.settled) return false;
+  slice.settled = true;
+  if (slice.signal && slice.onAbort) slice.signal.removeEventListener('abort', slice.onAbort);
+  return true;
+}
+
+function resolveSlice(slice: PendingSlice, value: ArrayBuffer): void {
+  if (finishSlice(slice)) slice.resolve(value);
+}
+
+function rejectSlice(slice: PendingSlice, error: unknown): void {
+  if (finishSlice(slice)) slice.reject(error);
 }

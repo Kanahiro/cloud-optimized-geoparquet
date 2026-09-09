@@ -391,14 +391,30 @@ fn validate_lod_field(field: &Field, errors: &mut Vec<String>) {
         errors.push(format!("`overviews.{}` must be a struct", field.name()));
         return;
     };
-    let expected = ["x", "y", "part_ends", "polygon_ends"];
+    let expected = ["coordinates", "part_ends", "polygon_ends"];
     if children.len() != expected.len() {
         errors.push(format!(
-            "`overviews.{}` must contain exactly x, y, part_ends, polygon_ends",
+            "`overviews.{}` must contain exactly coordinates, part_ends, polygon_ends",
             field.name()
         ));
     }
-    for name in expected {
+    let coordinates_valid = children.find("coordinates").is_some_and(|(_, child)| {
+        !child.is_nullable()
+            && matches!(child.data_type(), DataType::List(element)
+                if !element.is_nullable()
+                    && matches!(element.data_type(), DataType::Struct(axes)
+                        if axes.len() == 2
+                            && ["x", "y"].iter().all(|name| axes.find(name).is_some_and(|(_, axis)|
+                                !axis.is_nullable() && axis.data_type() == &DataType::Int32)))
+            )
+    });
+    if !coordinates_valid {
+        errors.push(format!(
+            "`overviews.{}.coordinates` must be required list<required struct<x: required int32, y: required int32>>",
+            field.name()
+        ));
+    }
+    for name in ["part_ends", "polygon_ends"] {
         let valid = children.find(name).is_some_and(|(_, child)| {
             !child.is_nullable()
                 && matches!(
@@ -427,5 +443,53 @@ fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     }
     for e in errors {
         println!("  error:   {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn integer_list() -> DataType {
+        DataType::List(Arc::new(Field::new("element", DataType::Int32, false)))
+    }
+
+    #[test]
+    fn lod_schema_requires_one_coordinate_list_with_struct_axes() {
+        let old_layout = Field::new(
+            "l0",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", integer_list(), false),
+                Field::new("y", integer_list(), false),
+                Field::new("part_ends", integer_list(), false),
+                Field::new("polygon_ends", integer_list(), false),
+            ])),
+            true,
+        );
+        let mut errors = Vec::new();
+        validate_lod_field(&old_layout, &mut errors);
+        assert!(errors.iter().any(|error| error.contains("coordinates")));
+
+        let coordinate = DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]));
+        let current_layout = Field::new(
+            "l0",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "coordinates",
+                    DataType::List(Arc::new(Field::new("element", coordinate, false))),
+                    false,
+                ),
+                Field::new("part_ends", integer_list(), false),
+                Field::new("polygon_ends", integer_list(), false),
+            ])),
+            true,
+        );
+        errors.clear();
+        validate_lod_field(&current_layout, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

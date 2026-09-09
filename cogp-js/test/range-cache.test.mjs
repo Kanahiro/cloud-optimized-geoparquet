@@ -96,3 +96,51 @@ test('validates the cache budget and slice bounds', async () => {
   await assert.rejects(file.slice(-1, 2), /outside buffer/);
   await assert.rejects(file.slice(0, 257), /outside buffer/);
 });
+
+test('aborting one consumer preserves a shared in-flight read', async () => {
+  const bytes = Uint8Array.from({ length: 32 }, (_, i) => i);
+  let complete;
+  let sourceAborted = false;
+  const source = {
+    byteLength: bytes.byteLength,
+    slice(start, end, signal) {
+      signal?.addEventListener('abort', () => { sourceAborted = true; }, { once: true });
+      return new Promise(resolve => {
+        complete = () => resolve(bytes.slice(start, end).buffer);
+      });
+    },
+  };
+  const file = rangeCachedAsyncBuffer(source);
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const first = file.slice(4, 12, firstController.signal);
+  const second = file.slice(4, 12, secondController.signal);
+
+  firstController.abort();
+  await assert.rejects(first, error => error.name === 'AbortError');
+  assert.equal(sourceAborted, false);
+  complete();
+  assert.deepEqual([...new Uint8Array(await second)], [4, 5, 6, 7, 8, 9, 10, 11]);
+});
+
+test('aborts an in-flight source read after its last consumer leaves', async () => {
+  let sourceAborted = false;
+  const source = {
+    byteLength: 32,
+    slice(_start, _end, signal) {
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          sourceAborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+  };
+  const file = rangeCachedAsyncBuffer(source);
+  const controller = new AbortController();
+  const read = file.slice(4, 12, controller.signal);
+
+  controller.abort();
+  await assert.rejects(read, error => error.name === 'AbortError');
+  assert.equal(sourceAborted, true);
+});

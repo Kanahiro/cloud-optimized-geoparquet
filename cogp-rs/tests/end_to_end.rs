@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, StructArray,
+    ArrayRef, BinaryArray, Float64Array, Int32Array, ListArray, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
@@ -196,12 +197,10 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
-        row_group_max_bytes: None,
         simplification_tolerance_factor: 1.0,
         input_units: InputUnits::Degrees,
         geometry_column: None,
         webmerc_resolution: 1024,
-        point_thinning_factor: 4,
         sort_key: None,
         sort_order: SortKeyOrder::Desc,
     }
@@ -367,7 +366,34 @@ fn convert_reader_validate_pipeline() {
         panic!("overviews must be a struct")
     };
     for lod in geometry_boundaries.keys() {
-        assert!(overview_fields.iter().any(|field| field.name() == *lod));
+        let lod_field = overview_fields
+            .iter()
+            .find(|field| field.name() == *lod)
+            .unwrap();
+        let DataType::Struct(lod_fields) = lod_field.data_type() else {
+            panic!("overview LoD must be a struct")
+        };
+        assert_eq!(
+            lod_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["coordinates", "part_ends", "polygon_ends"]
+        );
+        let DataType::List(coordinate_element) =
+            lod_fields.find("coordinates").unwrap().1.data_type()
+        else {
+            panic!("overview coordinates must be a list")
+        };
+        let DataType::Struct(axes) = coordinate_element.data_type() else {
+            panic!("overview coordinate must be a struct")
+        };
+        assert_eq!(
+            axes.iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
     }
     match bbox_field.data_type() {
         DataType::Struct(fs) => {
@@ -401,6 +427,24 @@ fn convert_reader_validate_pipeline() {
                         .downcast_ref::<StructArray>()
                         .unwrap();
                     let column = overviews.column_by_name(lod_name).unwrap();
+                    if let Some(lod) = column.as_any().downcast_ref::<StructArray>() {
+                        let coordinates = lod
+                            .column_by_name("coordinates")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap();
+                        let coordinate_values = coordinates
+                            .values()
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .unwrap();
+                        assert_eq!(coordinate_values.num_columns(), 2);
+                        assert_eq!(
+                            coordinate_values.column(0).len(),
+                            coordinate_values.column(1).len()
+                        );
+                    }
                     (nulls + column.null_count(), rows + batch.num_rows())
                 });
             assert_eq!(
@@ -427,7 +471,6 @@ fn convert_point_omits_overviews() {
     let mut args = convert_args(&input, &output);
     args.resolution = vec![100_000.0, 10_000.0, 1_000.0];
     args.row_group_size = 8;
-    args.row_group_max_bytes = Some(42);
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
 
@@ -435,11 +478,6 @@ fn convert_point_omits_overviews() {
     assert!(reader.cogp_meta().overviews.is_none());
     assert!(reader.levels().iter().all(|level| level.lod.is_none()));
     assert_eq!(reader.lod_for_resolution(1_000.0), None);
-    assert!(
-        reader.num_row_groups() > 1,
-        "primary Point WKB must drive the render-geometry byte budget"
-    );
-
     let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
     let batches: Vec<RecordBatch> = reader
         .sync_batch_reader(File::open(&output).unwrap(), &all_row_groups)
@@ -466,18 +504,6 @@ fn convert_rejects_non_positive_resolution() {
         msg.contains("strictly decreasing") || msg.contains("positive"),
         "unexpected error: {msg}"
     );
-}
-
-#[test]
-fn convert_rejects_zero_thinning_factor() {
-    let tmp = TempDir::new("zerofactor");
-    let input = tmp.path().join("input.parquet");
-    let output = tmp.path().join("out.parquet");
-    write_input(&input);
-    let mut args = convert_args(&input, &output);
-    args.point_thinning_factor = 0;
-    let err = cogp::convert::run(args).unwrap_err();
-    assert!(format!("{err}").contains("point-thinning-factor"));
 }
 
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead
@@ -624,7 +650,6 @@ fn convert_row_group_size_is_a_row_limit() {
     // footprint must not reduce the configured eight-row group limit.
     args.resolution = vec![1.0];
     args.row_group_size = 8;
-    args.row_group_max_bytes = None;
     cogp::convert::run(args).unwrap();
 
     let reader = Reader::open(&output).unwrap();
@@ -634,25 +659,4 @@ fn convert_row_group_size_is_a_row_limit() {
         .row_groups()
         .iter()
         .all(|group| group.num_rows() <= 8));
-}
-
-#[test]
-fn convert_respects_render_overview_row_group_budget() {
-    let tmp = TempDir::new("overview-budget");
-    let input = tmp.path().join("input.parquet");
-    let output = tmp.path().join("out.cogp.parquet");
-    write_input(&input);
-
-    let mut args = convert_args(&input, &output);
-    args.resolution = vec![100_000.0];
-    args.row_group_size = 40;
-    args.row_group_max_bytes = Some(200);
-    cogp::convert::run(args).unwrap();
-    cogp::validate::run(&output).unwrap();
-
-    let reader = Reader::open(&output).unwrap();
-    assert!(
-        reader.num_row_groups() > 1,
-        "overview budget must split the level"
-    );
 }

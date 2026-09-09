@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/clip-test",
+    "rootDir": "src"
+  },
+  "include": ["src/clip.ts", "src/cogp-types.ts", "src/lineclip.d.ts", "src/mvt.ts"]
+}

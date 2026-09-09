@@ -36,15 +36,17 @@ interface ActiveDataset {
 let active: ActiveDataset | null = null;
 let latestUrl = '';
 const zstdDecoder = Zstd.load();
-const runningRequests = new Set<number>();
-const cancelledRequests = new Set<number>();
+const requestControllers = new Map<number, AbortController>();
 
-async function openDataset(url: string): Promise<OpenResult> {
+async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult> {
   latestUrl = url;
   const zstd = await zstdDecoder;
+  signal.throwIfAborted();
   const reader = await CogpReader.open(url, {
     compressors: { ZSTD: (input) => zstd.decompress(input) },
+    signal,
   });
+  signal.throwIfAborted();
   if (latestUrl !== url) throw new Error('Dataset open was superseded');
 
   const dataBbox = computeDataBbox(reader);
@@ -62,7 +64,7 @@ async function readTile(
   z: number,
   x: number,
   y: number,
-  isCancelled: () => boolean,
+  signal: AbortSignal,
 ): Promise<TileResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
@@ -77,21 +79,23 @@ async function readTile(
     columns: [geomColumn],
     maxLevel,
     maxRows: TILE_MAX_ROWS,
+    signal,
   };
   if (usesOverviews) {
-    // Keep the selected overview as its zero-copy typed-array view. The MVT
-    // encoder below consumes it without constructing GeoJSON geometry.
+    // Keep the selected overview in its quantized form. The MVT encoder below
+    // consumes it without constructing a GeoJSON geometry tree.
     readOptions.overviewDecoder = (overview) => overview;
   }
   const readStartedAt = performance.now();
   const rows = await ds.reader.readRows(readOptions);
   const readMs = performance.now() - readStartedAt;
-  if (isCancelled()) throw new DOMException('COGP tile request aborted', 'AbortError');
+  signal.throwIfAborted();
 
   const encodeStartedAt = performance.now();
   const overviewEncoder = createOverviewMvtEncoder(z, x, y);
   let featureCount = 0;
   for (let i = 0; i < rows.length; i++) {
+    if ((i & 1023) === 0) signal.throwIfAborted();
     const row = rows[i]!;
     const feature = usesOverviews
       ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null)
@@ -102,6 +106,7 @@ async function readTile(
     rows[featureCount++] = feature as unknown as Record<string, unknown>;
   }
   rows.length = featureCount;
+  signal.throwIfAborted();
   const data = encodeMvtTile(rows as unknown as EncodedMvtFeature[]);
   const encodeMs = performance.now() - encodeStartedAt;
   return {
@@ -173,14 +178,15 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   if ('type' in e.data) {
-    if (runningRequests.has(e.data.id)) cancelledRequests.add(e.data.id);
+    requestControllers.get(e.data.id)?.abort();
     return;
   }
   const { id, payload } = e.data;
-  runningRequests.add(id);
+  const controller = new AbortController();
+  requestControllers.set(id, controller);
   try {
     if (payload.type === 'open') {
-      const result: OpenResult = await openDataset(payload.url);
+      const result: OpenResult = await openDataset(payload.url, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response);
     } else {
@@ -189,7 +195,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         payload.z,
         payload.x,
         payload.y,
-        () => cancelledRequests.has(id),
+        controller.signal,
       );
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response, { transfer: [result.data] });
@@ -198,7 +204,6 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     const response: WorkerResponse = { id, ok: false, error: (err as Error).message };
     self.postMessage(response);
   } finally {
-    runningRequests.delete(id);
-    cancelledRequests.delete(id);
+    requestControllers.delete(id);
   }
 };
