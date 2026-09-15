@@ -66,6 +66,10 @@ For example:
 
 A logical rendering detail level.
 
+Each level selects a prefix of feature rows and, for Line and Polygon
+families, an overview LoD. A finer level may refine the geometry representation
+without adding feature rows.
+
 Levels are represented by metadata and row group boundaries. This profile does not require a `level`, `zoom`, or `zoomlevel` column in the data.
 
 ### 4.2 Ground resolution
@@ -173,11 +177,17 @@ Point families, `lod` MUST be absent.
 
 `row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
 
-`row_group_end` values MUST be strictly monotonically increasing across the `levels` array.
+`row_group_end` values MUST be monotonically non-decreasing across the `levels`
+array. Consecutive levels MAY select the same row group prefix while selecting
+different LoDs.
 
 The first level entry covers row groups from row group `0` through its `row_group_end`, inclusive.
 
 The row groups belonging to the second and later levels are the row groups after the previous level entry's `row_group_end` through the current level entry's `row_group_end`, inclusive.
+
+When consecutive boundaries are equal, the later level adds no row groups.
+Its selected prefix still includes every row group from `0` through that
+boundary. Levels MUST NOT select an empty prefix.
 
 The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the levels collectively cover every row group in the file.
 
@@ -211,8 +221,12 @@ is producer-specific.
 This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
 
 Producers SHOULD preserve each requested candidate ground resolution that
-introduces at least one feature. A producer MAY omit candidates to which no
-features are assigned.
+introduces at least one feature. For Line and Polygon families, producers
+SHOULD also preserve subsequent requested candidates that refine existing
+features, even when no new features are assigned to them. These candidates
+select the existing row group prefix with an appropriate LoD. Candidates
+before the first feature appears MAY be omitted. For Point families,
+candidates that introduce no features MAY be omitted.
 
 ### 5.5 Overview encoding
 
@@ -239,7 +253,9 @@ overviews: required struct<
 ```
 
 Every key in `cogp.overviews.lods` MUST name exactly one `<lod>` child, and
-every `<lod>` child MUST have corresponding metadata. `geometry_type` uses the
+every `<lod>` child MUST have corresponding metadata. Every LoD MUST be
+referenced by at least one level. LoD names MUST NOT be `geometry_type`.
+`geometry_type` uses the
 base OGC WKB type codes: `2` LineString, `3` Polygon, `5` MultiLineString, and
 `6` MultiPolygon. GeometryCollection is not permitted. A row's `geometry_type`
 MUST describe every non-null LoD in
@@ -264,11 +280,13 @@ contains the exclusive end of each ring and `polygon_ends` contains the
 exclusive end, in ring count, of each polygon. Empty and null primary
 geometries are outside this version of the profile.
 
-The LoD referenced by a level MUST be non-null for every row from row group `0`
-through that level's `row_group_end`, inclusive. It MUST be null in every later
-row group. This makes each selected prefix independently renderable without a
-per-row fallback. In particular, a rendering reader MUST NOT fall back to the
-primary WKB column when an overview value is absent.
+For each LoD, its effective boundary is the maximum `row_group_end` among all
+levels referencing it. The LoD MUST be non-null for every row from row group
+`0` through that effective boundary, inclusive, and MUST be null in every
+later row group. Multiple levels MAY reference the same LoD. This makes each
+selected prefix independently renderable without a per-row fallback. In
+particular, a rendering reader MUST NOT fall back to the primary WKB column
+when an overview value is absent.
 
 For each LoD, producers MUST choose one positive scale per axis and apply it to
 all rows. The quantization scale and simplification tolerance SHOULD be derived
@@ -279,6 +297,12 @@ simplifying the previous LoD. The primary geometry remains unchanged.
 
 Only XY is represented in `overviews`. Z and M ordinates, when present in the
 primary geometry, are intentionally omitted.
+
+Decoded overview coordinates use the primary geometry's CRS, XY axis order,
+and coordinate units. Spatial selection MUST evaluate the primary geometry's
+covering bbox, independent of the selected LoD. Overviews represent the
+selected features for rendering; their bounds MUST NOT replace or expand the
+primary bbox predicate.
 
 ## 6. Metadata
 
@@ -292,18 +316,29 @@ The value MUST be a UTF-8 JSON object.
 
 ### 6.1 Versioning and forward compatibility
 
-The `version` field is a string of the form `MAJOR.MINOR.PATCH` and identifies the COGP profile version. It follows semantic versioning:
+The `version` field is a string of the form `MAJOR.MINOR.PATCH` and identifies
+the COGP profile version.
 
-* a minor version increment (for example `0.1.0` to `0.2.0`, or `1.0.0` to `1.1.0`) MAY add new optional fields, but MUST NOT change the meaning or requirements of existing fields;
-* a major version increment (for example `0.x.y` to `1.0.0`, or `1.x.y` to `2.0.0`) MAY introduce breaking changes.
+* Before `1.0.0`, minor versions are development drafts and MAY introduce
+  breaking changes. Readers MUST explicitly support a draft's major/minor
+  version before interpreting its metadata as conforming.
+* From `1.0.0`, minor versions MAY add optional fields but MUST NOT change the
+  meaning or requirements of existing fields. Major versions MAY introduce
+  breaking changes.
+* Patch versions MUST NOT introduce breaking changes.
 
-Readers MUST ignore unrecognized fields in `cogp` metadata so that files written against a newer minor version of the profile remain readable.
+Readers MUST ignore unrecognized fields in supported `cogp` metadata versions.
 
 Readers MUST NOT interpret `cogp` metadata with an unsupported major version as conforming to this version of the profile.
 
+Version `0.2.0` allows equal consecutive row group boundaries and shared LoDs
+with an effective boundary. Support for `0.2` does not imply support for every
+`0.x` draft.
+
 ### 6.2 Minimal example
 
-Line/Polygon example:
+Line/Polygon example, using a primary CRS whose coordinate units are meters.
+The transform values are illustrative:
 
 ```json
 {
@@ -315,12 +350,17 @@ Line/Polygon example:
       "lod": "l0"
     },
     {
-      "row_group_end": 3,
+      "row_group_end": 0,
       "resolution": 500,
       "lod": "l1"
     },
     {
-      "row_group_end": 12,
+      "row_group_end": 3,
+      "resolution": 250,
+      "lod": "l1"
+    },
+    {
+      "row_group_end": 3,
       "resolution": 100,
       "lod": "l2"
     }
@@ -328,13 +368,19 @@ Line/Polygon example:
   "overviews": {
     "encoding": "quantized_xy_v1",
     "lods": {
-      "l0": { "scale": [1, 1], "offset": [140, 36] },
-      "l1": { "scale": [0.5, 0.5], "offset": [140, 36] },
-      "l2": { "scale": [0.125, 0.125], "offset": [140, 36] }
+      "l0": { "scale": [256, 256], "offset": [0, 0] },
+      "l1": { "scale": [64, 64], "offset": [0, 0] },
+      "l2": { "scale": [32, 32], "offset": [0, 0] }
     }
   }
 }
 ```
+
+This example has four row groups. At resolution 500, the feature prefix is
+unchanged and the reader switches to `l1`. At resolution 250, row groups 1–3
+are added using the same `l1`. At resolution 100, the reader switches the same
+prefix to `l2`. The effective boundaries of `l0`, `l1`, and `l2` are 0, 3,
+and 3, respectively.
 
 Point-family example:
 
@@ -354,9 +400,9 @@ Point-family example:
 | --- | ---: | --- |
 | `version` | Yes | Profile metadata version. |
 | `levels` | Yes | Ordered level entries from coarse to fine. |
-| `levels[].row_group_end` | Yes | Inclusive row group index ending this level. |
+| `levels[].row_group_end` | Yes | Inclusive end of the selected row group prefix; non-decreasing across levels. |
 | `levels[].resolution` | Yes | Nominal ground resolution for which the level is intended, in meters. |
-| `levels[].lod` | Line/Polygon only | Required child name in both the physical `overviews` struct and `overviews.lods`; absent for Point families. |
+| `levels[].lod` | Line/Polygon only | Required child name in both the physical `overviews` struct and `overviews.lods`; may be shared by levels; absent for Point families. |
 | `overviews` | Line/Polygon only | Metadata for the fixed physical `overviews` column; absent for Point families. |
 | `overviews.encoding` | Line/Polygon only | Must be `quantized_xy_v1` for this version. |
 | `overviews.lods` | Line/Polygon only | Non-empty object keyed by LoD child name. |
@@ -407,9 +453,20 @@ For viewport-driven applications, three complementary spatial filters can apply 
 
 Page statistics are conservative: a retained page can still contain features
 outside the viewport. Readers MUST still apply the per-feature bbox predicate
-to produce exact query results.
+to produce exact bbox query results. All three filters evaluate the primary
+geometry's covering bbox. A selected feature is rendered using the selected
+LoD, even if simplification or quantization changes its bounds. Conversely, an
+overview entering the viewport does not select a feature whose primary bbox
+misses it. Bbox intersection does not guarantee that the primary geometry
+itself intersects the viewport; exact geometry intersection is a separate
+operation.
 
-If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
+When zooming in, a reader fetches any newly selected row groups. For Line and
+Polygon families, a change of LoD also requires fetching that LoD's columns
+for previously selected rows, unless they are already cached. Attributes and
+other unchanged columns can be reused. A level with the same row group
+boundary may therefore require new geometry data. Point-family rendering has
+no LoD switch.
 
 ### 7.3 Overview selection
 

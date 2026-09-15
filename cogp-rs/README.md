@@ -6,7 +6,22 @@ GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparque
 `convert` assigns each feature to one coarse-to-fine level, spatially packs the
 rows, and preserves the primary WKB. Line and Polygon files add an `overviews`
 struct whose LoDs store simplified, quantized XY integer lists. Point files do
-not create overviews. `validate` checks the structural rules in SPEC §5.
+not create overviews. The producer, readers, and validator support COGP 0.2,
+including compatible patch versions; other drafts are rejected.
+
+For Line/Polygon data, requested resolutions from the first visible feature
+onward are retained, including levels that add no rows. Consecutive levels may
+select the same prefix and different LoDs. Shared LoDs are supported on read;
+the producer creates one LoD per retained level.
+
+Spatial filters always evaluate primary geometry covering bboxes. Selected
+features are rendered using the chosen LoD; overview bounds do not change the
+selection. Switching LoD requires reading that LoD for existing rows as well.
+
+`validate` checks metadata, physical schema and the null/non-null coverage of
+LoDs through their maximum referenced boundary. It reads a topology leaf per
+LoD to check coverage. It does not validate all geometry contents or semantic
+coarse-to-fine ordering.
 
 ## Install
 
@@ -147,7 +162,7 @@ Reader selectors include:
 cogp validate <FILE>
 ```
 
-Validation covers GeoParquet bbox metadata and statistics, level ordering and
+Validation covers GeoParquet bbox metadata and statistics, versioned level ordering and
 coverage, per-level `resolution`, conditional Line/Polygon `lod` and
 `quantized_xy_v1` metadata, and the conditional physical `overviews` schema.
 Semantic rendering quality remains a producer responsibility.

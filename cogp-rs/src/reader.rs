@@ -91,6 +91,7 @@ impl Reader {
     /// S3) and wants to skip even the initial range request.
     pub fn from_arrow_metadata(arrow_meta: ArrowReaderMetadata) -> Result<Self> {
         let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata())?;
+        cogp_meta.validate(arrow_meta.metadata().num_row_groups())?;
         let primary = geo_meta
             .columns
             .get(&geo_meta.primary_column)
@@ -193,9 +194,9 @@ impl Reader {
         self.arrow_meta.metadata().num_row_groups()
     }
 
-    /// Row groups belonging to a single level (start..=end), or `None` if `level`
-    /// is out of range. Row groups within one level are STR-packed so reading in
-    /// natural order yields a spatially coherent stream.
+    /// Row groups newly added by a level (start..end), or `None` if `level`
+    /// is out of range. A geometry-only refinement adds an empty range. Row groups
+    /// within one level are STR-packed for a spatially coherent stream.
     pub fn row_groups_in_level(&self, level: usize) -> Option<Range<usize>> {
         let l = self.cogp_meta.levels.get(level)?;
         let start = if level == 0 {
@@ -473,8 +474,8 @@ mod tests {
 
     /// Construct a `Reader` whose footer carries the supplied COGP levels.
     /// The Arrow schema and row-group count are minimal — only the selector
-    /// tests below read them. The construction path itself goes through the
-    /// real `from_arrow_metadata`, so the metadata-parse code runs as well.
+    /// tests below read them. This synthetic fixture bypasses file validation;
+    /// integration tests exercise opening files with actual row groups.
     fn reader_with_metadata(mut levels: Vec<Level>, geometry_types: Vec<String>) -> Reader {
         let point_family = geometry_family(&geometry_types) == Some(GeometryFamily::Point);
         if point_family {
@@ -556,7 +557,14 @@ mod tests {
             });
             w.close().unwrap();
         }
-        Reader::try_new(bytes::Bytes::from(buf)).unwrap()
+        let arrow_meta =
+            ArrowReaderMetadata::load(&bytes::Bytes::from(buf), Default::default()).unwrap();
+        let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata()).unwrap();
+        Reader {
+            arrow_meta,
+            geo_meta,
+            cogp_meta,
+        }
     }
 
     fn reader_with_levels(levels: Vec<Level>) -> Reader {

@@ -1,10 +1,17 @@
 # COGP仕様・Parquet内部設計の修正計画
 
-ステータス: 提案。レビュー指摘への対応順序と設計案を記録する。実装はまだ変更しない。
+ステータス: 0.2.0のmetadata・Level/LoD規則をwriter、Rust/JavaScript reader、validatorに反映済み。空間検索はprimary geometryのbboxで地物を選ぶ契約を採用し、相互運用テストを追加した。
+
+## 今回の実装範囲
+
+- 実施済み: 同一row group境界での精細化、共有LoDの有効範囲、0.2の明示的な対応version検査、producerの0.2.0出力。
+- 実施済み: validatorでのLoD null範囲検査。座標全体ではなく、LoDごとに必須のtopology leafを読み親structのnull状態を確認する。
+- 実施済み: primary bboxによる選択の契約テスト、Rust生成ファイルをJavaScriptで読むテスト、CIでのJavaScript reader・デモテスト実行。
+- 未実施: §4のGeoParquetメタデータ保存・スキーマ修正、§5の全geometry内容・統計のデータ検査、§6の性能再測定と設定調整。既存レビューのこれらの作業は引き続き別段階として残す。
 
 ## 目的
 
-地物の追加と形状の精細化を独立して扱えるようにし、描画時の欠落を防ぎ、GeoParquetとしての意味を保持する。既存のrow group、列投影、PageIndexを使う構造は維持する。
+地物の追加と形状の精細化を独立して扱えるようにし、空間検索の対象を明確にし、GeoParquetとしての意味を保持する。既存のrow group、列投影、PageIndexを使う構造は維持する。
 
 現状の未コミット変更を作業開始点とし、既存の変更を巻き戻さない。単一ファイル、地物行の非重複、lossless primary WKB、描画専用overviewという基本契約は維持する。
 
@@ -13,7 +20,7 @@
 レビューで確認したケースを、小さな入力から生成できる回帰fixtureにする。
 
 - 線1本に解像度 `8,1` を指定すると、現在は細かいLoDが消える。
-- primary bboxの外へ量子化された線が、全件描画では見えるのにviewport検索では消える。
+- 空間検索がprimary bboxに従うことを確認する。overviewだけが領域に入っても、その地物は選択しない。これは不具合の再現ではなく、合意した検索契約の確認とする。
 - `crs: null` が省略される。`edges`などのメタデータが変換で失われる。CRS不明とspherical edgesの検証には別々の適切な入力を使う。
 - OPTIONALなprimary geometryに対してREQUIREDなbboxが出力され、validatorも成功する。
 - 異なるprefixから同じLoDを参照すると、現在のnull規則を同時に満たせない。
@@ -43,42 +50,29 @@ Rust readerのレベル別範囲APIでは、追加行がないレベルは空の
 
 同一境界を拒否する旧readerとの互換性はない。既存バージョン番号のまま出力形式を変更しない。
 
-実装前に既存公開版とfixtureの対応を確認し、次のドラフトを`0.3.0`とする案を確定する。この案では、現行§6.1の「0.xのminor間でも互換」という規則を修正し、1.0未満では互換性を保証しないこと、readerが対応するminorを明示的に検査することを定める。1.0以降のminorは互換変更に限定する。
+SPEC.mdと実装はドラフト`0.2.0`に統一した。§6.1は1.0未満のminor間で互換性を保証しない規則に改め、readerが対応するmajor/minorを明示的に検査することを定めた。1.0以降のminorは互換変更に限定する。既存公開版とfixtureの対応を確認して反映する。
 
 旧`0.2`ファイルの読取りは明示的に残す。未知の0.xをmajorが0という理由だけで受け入れない。writerは新形式のみ出力し、旧形式のwriter分岐は増やさない。
 
 完了条件: 線1本でも細かいLoDが残る。同一prefixのズーム変更、同じLoDの共有、最後のprefixが全行を覆うことをRustとJavaScriptで検証できる。
 
-## 3. 描画形状に対して安全なbbox検索を定義する
+## 3. primary bboxによる地物選択を明記する
 
-### 採用する案: LoDごとの実測padding
+空間検索はprimary geometryのGeoParquet covering bboxに対して行う。選択された地物の指定LoDのoverviewを描画する。
 
-primary geometryのGeoParquet bboxは変更しない。描画用のbbox列は追加せず、各LoDのメタデータに`bbox_padding: [px, py]`を追加する。値はprimary geometryと同じ座標単位で、非負の有限値とする。
+1. 指定された検索範囲とprimary bboxの統計からrow group・pageの候補を絞る。
+2. 各行のprimary bboxと検索範囲を比較し、地物を選択する。
+3. 選択した地物のoverviewを取得・復号し、描画する。
 
-各行についてprimary bboxをB、最終的に復号されるoverviewのbboxをRとし、そのLoDが有効な全行から次を求める。
+readerはこの意味を保ったまま取得と評価の順序を最適化できる。overview自身のbboxは地物選択の条件にしない。描画時のクリッピングは検索とは別の処理とする。
 
-```text
-px = max_over_rows(0, B.xmin - R.xmin, R.xmax - B.xmax)
-py = max_over_rows(0, B.ymin - R.ymin, R.ymax - B.ymax)
-```
+bboxの交差判定は、primary geometryそのものとの厳密な交差判定とは区別する。Rustの候補抽出APIは、行単位の最終bboxフィルタを行うかどうかを契約に明記する。
 
-これにより、RがBを軸ごとにpadding分広げた範囲に含まれることを保証する。量子化だけから推定せず、polygon repair、縮退形状の救済、coarse fallbackをすべて適用した最終形状を使う。paddingは描画誤差や位置精度の保証とは区別する。
+以前のpadding提案と「overviewが画面内なのに取得されないため不具合」という指摘は撤回する。`bbox_padding`、描画用bbox列、検索範囲の拡張、旧ファイルでpruningを無効化する分岐は追加しない。既存のbboxとPageIndexを利用する。
 
-readerは以下の順序で処理する。
+関連箇所: `SPEC.md` §5.5・§7.2、Rust/JavaScript readerのドキュメントと契約テスト。
 
-1. 描画用viewportを選択LoDのpaddingで広げる。
-2. 広げたviewportを用いて、primary bboxのrow group、page、行の候補を絞る。
-3. 選択LoDを復号し、overview自身のbboxと元のviewportを比較して返却行を決める。
-
-検索の「exact」はbboxの交差に関するもので、geometryとviewportの厳密な空間交差とは区別する。分析用WKB検索はprimary bboxを使い、paddingを適用しない。Rustの候補抽出APIは最終フィルタを行うかどうかを契約に明記し、WKB用と描画用の経路を混同させない。
-
-旧ファイルでpaddingがない場合、overview描画ではprimary bboxによる事前pruningを使わず、選択prefixのoverviewを読み、最後に絞る。根拠なくpaddingを0やscale/2と仮定しない。Pointの経路はprimary geometryをそのまま使う。
-
-paddingの集計はoverview生成と同時に行い、writerが最終footerに書く。二度目の簡略化や全overviewのメモリ保持は不要にする。境界の丸めは外向きに保守的に扱う。
-
-関連箇所: `SPEC.md`、`cogp-rs/src/{meta,convert,reader,page_index}.rs`、`cogp-js/src/{meta,reader,bbox,overview}.ts`。
-
-完了条件: bboxありの描画結果が「同じLoDをpruningなしで全件読み、復号後bboxで絞った結果」と一致する。量子化、救済形状、共有LoD、PageIndexあり・なし、viewport境界、旧ファイルを含める。
+完了条件: bbox検索の結果ID集合が「選択prefixの全行をprimary bboxで絞った結果」と一致し、LoDを変えても同一prefix内の選択ID集合が変わらない。overviewだけが領域内のケース、primary bboxだけが領域と交差するケース、PageIndexあり・なしを含める。
 
 ## 4. GeoParquetの意味と物理スキーマを保存する
 
@@ -98,17 +92,17 @@ paddingの集計はoverview生成と同時に行い、writerが最終footerに�
 
 ### 構造検査
 
-version、境界、LoD参照、scale/offset/padding、物理スキーマ、primary/bboxの型とrepetition、必要な統計、GeoParquetメタデータを検査する。出力は「構造検査成功」であり、全要件への適合とは表示しない。
+version、境界、LoD参照、scale/offset、物理スキーマ、primary/bboxの型とrepetition、必要な統計、GeoParquetメタデータを検査する。出力は「構造検査成功」であり、全要件への適合とは表示しない。
 
 ### データ検査
 
-バッチ単位で全行を走査し、primaryのnull/empty・型、bboxの妥当性と包含、LoDの有効範囲とnull、geometry_type、座標とend配列の境界・全要素の消費、定義したリング構造、paddingの包含契約を検査する。プルーニングに使う統計が実データに対して保守的であることも確認する。
+バッチ単位で全行を走査し、primaryのnull/empty・型、bboxの妥当性と包含、LoDの有効範囲とnull、geometry_type、座標とend配列の境界・全要素の消費、定義したリング構造を検査する。プルーニングに使う統計が実データに対して保守的であることも確認する。
 
 自己交差等の全般的な位相保証は新たに追加せず、仕様が要求する符号化上の構造と区別する。地物の視覚的重要度、元入力との同一性など、出力単体で証明できないことは検証結果に含めない。
 
 CLIの通常の`validate`はデータ検査まで行い、明示的な`--metadata-only`で構造検査だけを選べる案とする。結果には実施した検証範囲を表示する。
 
-完了条件: 必須LoDのnull、範囲外のnon-null、誤ったend配列・型・padding・repetition・統計をそれぞれ独立したfixtureで拒否する。正常ファイルは両検査に通る。
+完了条件: 必須LoDのnull、範囲外のnon-null、誤ったend配列・型・repetition・統計をそれぞれ独立したfixtureで拒否する。正常ファイルは両検査に通る。
 
 ## 6. Parquetのコストとズーム時の読取りを検証する
 
@@ -133,13 +127,13 @@ LoD数L・row group数Gに対してoverviewだけで約`4LG`個のcolumn chunk�
 - コールド初期取得と、同じprefixでLoDだけ変えるズームの転送量・request数・時間。
 - Point、細かい地物を含むLine/Polygon、大きな地物だけのLine/Polygon。
 - geometryのみ、ID込み、実際に利用する属性込みの投影。
-- paddingによって増えた候補数と、pruningなしに対する取得量。
+- primary bboxの候補数と、pruningなしに対する取得量。
 
 既存ベンチマークの過去のwriter設定は現在と一致するとは限らないため、比較用baselineを再計測する。全データの組合せ総当たりはせず、小さい代表セットで絞ってから大きなデータで確認する。
 
 辞書上限やrow group/pageサイズのデフォルト変更は測定後に決める。LoD数増加への対応として自動重複排除や新しい設定項目を先に追加しない。性能基準は変更前の実測値から定め、正確性を満たしたうえで、footer増加・検索量削減・初期表示時間のトレードオフを記録する。
 
-完了条件: 描画対象の欠落がなく、取得範囲が選択した列・LoDに対応することを確認できる。新しいLoD保持とpaddingの性能コストが測定され、採用するデフォルトの根拠が残る。
+完了条件: primary bboxで選択した地物の取得漏れがなく、取得範囲が選択した列・LoDに対応することを確認できる。新しいLoD保持の性能コストが測定され、採用するデフォルトの根拠が残る。
 
 ## 7. 統合と完了判定
 
@@ -148,7 +142,7 @@ LoD数L・row group数Gに対してoverviewだけで約`4LG`個のcolumn chunk�
 1. 仕様・version方針・共通fixture。
 2. GeoParquetメタデータ保存と物理スキーマ修正。
 3. Level/LoDのwriter、Rust/JavaScript readerの変更。
-4. padding生成と描画検索経路の変更。
+4. primary bboxによる検索契約の文書化と検証。
 5. validatorと相互運用テスト。
 6. デモ・ドキュメント・性能測定、必要と判断した調整。
 
@@ -161,7 +155,7 @@ LoD数L・row group数Gに対してoverviewだけで約`4LG`個のcolumn chunk�
 | 指摘 | 対応段階 |
 | --- | --- |
 | 新規地物がない解像度のLoD消失 | 1、2 |
-| 量子化後のbbox検索で描画欠落 | 1、3 |
+| overviewのboundsと検索対象の混同（不具合指摘を撤回） | 1、3でprimary bboxによる選択契約を明記 |
 | GeoParquetメタデータの意味の消失 | 1、4 |
 | geometry/bboxのrepetition不一致 | 1、4、5 |
 | 共有LoDのnull規則の矛盾 | 2、5 |

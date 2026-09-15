@@ -101,7 +101,7 @@ A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://git
 
 ## Status and feedback
 
-COGP v0.2 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
+COGP v0.2 is an early draft. Readers and the producer support the 0.2 draft, including compatible patch versions. Feedback, issues, and discussion are welcome via GitHub Issues.
 
 ## License
 

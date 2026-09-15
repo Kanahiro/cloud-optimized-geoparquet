@@ -1,6 +1,9 @@
 use anyhow::{bail, Context, Result};
+use arrow::array::{Array, StructArray};
 use arrow::datatypes::{DataType, Field, Fields};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::parquet_to_arrow_schema;
+use parquet::arrow::ProjectionMask;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use std::fs::File;
@@ -8,7 +11,7 @@ use std::path::Path;
 
 use crate::meta::{
     geometry_family, CogpMeta, GeoMeta, GeometryFamily, COGP_METADATA_KEY, COGP_VERSION,
-    GEO_METADATA_KEY, OVERVIEWS_COLUMN, OVERVIEWS_ENCODING,
+    GEO_METADATA_KEY, OVERVIEWS_COLUMN,
 };
 
 pub fn run(path: &Path) -> Result<()> {
@@ -106,134 +109,18 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
 
-    let major: u32 = cogp
-        .version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if major != 0 {
-        errors.push(format!(
-            "unsupported cogp major version `{}`; this validator implements 0.x",
-            cogp.version
-        ));
-    }
-    if cogp.levels.is_empty() {
-        errors.push("`cogp.levels` must be non-empty".into());
-    }
-
     let num_rgs = metadata.num_row_groups();
-    if num_rgs == 0 {
-        errors.push("file has zero row groups".into());
+    if let Err(error) = cogp.validate(num_rgs) {
+        errors.push(error.to_string());
     }
-
-    let mut prev_rge: Option<i64> = None;
-    let mut prev_resolution: Option<f64> = None;
     match geometry_family {
-        Some(GeometryFamily::Point) => {
-            if cogp.overviews.is_some() {
-                errors.push("Point-family files must not declare `cogp.overviews`".into());
-            }
+        Some(GeometryFamily::Point) if cogp.overviews.is_some() => {
+            errors.push("Point-family files must not declare overviews".into())
         }
-        Some(GeometryFamily::Line | GeometryFamily::Polygon) => match &cogp.overviews {
-            None => errors.push("Line/Polygon files must declare `cogp.overviews`".into()),
-            Some(overviews) => {
-                if overviews.encoding != OVERVIEWS_ENCODING {
-                    errors.push(format!(
-                        "cogp.overviews.encoding must be `{OVERVIEWS_ENCODING}`, got `{}`",
-                        overviews.encoding
-                    ));
-                }
-                if overviews.lods.is_empty() {
-                    errors.push("`cogp.overviews.lods` must be non-empty".into());
-                }
-                for (lod, metadata) in &overviews.lods {
-                    if lod.is_empty() {
-                        errors.push("overview LoD names must be non-empty".into());
-                    }
-                    for axis in 0..2 {
-                        if metadata.scale[axis].partial_cmp(&0.0)
-                            != Some(std::cmp::Ordering::Greater)
-                        {
-                            errors.push(format!(
-                                "overviews.lods.{lod}.scale[{axis}] must be positive and finite"
-                            ));
-                        }
-                        if !metadata.offset[axis].is_finite() {
-                            errors.push(format!(
-                                "overviews.lods.{lod}.offset[{axis}] must be finite"
-                            ));
-                        }
-                    }
-                }
-            }
-        },
-        None => {}
-    }
-    for (i, level) in cogp.levels.iter().enumerate() {
-        if level.row_group_end < 0 || (level.row_group_end as usize) >= num_rgs {
-            errors.push(format!(
-                "levels[{i}].row_group_end={} out of range [0, {})",
-                level.row_group_end, num_rgs
-            ));
+        Some(GeometryFamily::Line | GeometryFamily::Polygon) if cogp.overviews.is_none() => {
+            errors.push("Line/Polygon files must declare overviews".into())
         }
-        if let Some(p) = prev_rge {
-            if level.row_group_end <= p {
-                errors.push(format!(
-                    "levels[{i}].row_group_end={} must be strictly greater than previous ({})",
-                    level.row_group_end, p
-                ));
-            }
-        }
-        prev_rge = Some(level.row_group_end);
-        // partial_cmp so NaN values also fall into the error branch.
-        if level.resolution.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            errors.push(format!(
-                "levels[{i}].resolution={} must be positive",
-                level.resolution
-            ));
-        }
-        if let Some(previous) = prev_resolution {
-            if level.resolution.partial_cmp(&previous) != Some(std::cmp::Ordering::Less) {
-                errors.push(format!(
-                    "levels[{i}].resolution={} must be strictly less than previous ({previous})",
-                    level.resolution
-                ));
-            }
-        }
-        prev_resolution = Some(level.resolution);
-        match geometry_family {
-            Some(GeometryFamily::Point) => {
-                if level.lod.is_some() {
-                    errors.push(format!("Point-family levels[{i}] must not declare lod"));
-                }
-            }
-            Some(GeometryFamily::Line | GeometryFamily::Polygon) => {
-                let Some(lod) = level.lod.as_deref().filter(|lod| !lod.is_empty()) else {
-                    errors.push(format!("levels[{i}].lod must be a non-empty string"));
-                    continue;
-                };
-                if !cogp
-                    .overviews
-                    .as_ref()
-                    .is_some_and(|overviews| overviews.lods.contains_key(lod))
-                {
-                    errors.push(format!(
-                        "levels[{i}].lod `{lod}` is missing from cogp.overviews.lods"
-                    ));
-                }
-            }
-            None => {}
-        }
-    }
-    if let Some(last) = cogp.levels.last() {
-        if num_rgs > 0 && last.row_group_end != (num_rgs as i64) - 1 {
-            errors.push(format!(
-                "final levels[].row_group_end={} must equal num_row_groups-1={}",
-                last.row_group_end,
-                num_rgs - 1
-            ));
-        }
+        _ => {}
     }
 
     let parquet_schema = metadata.file_metadata().schema_descr();
@@ -334,9 +221,67 @@ pub fn run(path: &Path) -> Result<()> {
         }
     }
 
+    if errors.is_empty() && cogp.overviews.is_some() {
+        if let Err(error) = validate_lod_coverage(path, &cogp) {
+            errors.push(format!("{error:#}"));
+        }
+    }
     print_report(path, &errors, &warnings);
     if !errors.is_empty() {
         bail!("validation failed: {} error(s)", errors.len());
+    }
+    Ok(())
+}
+
+/// One required child preserves its optional LoD parent's definition level.
+/// Read the small topology leaf, not every coordinate or primary WKB page.
+fn validate_lod_coverage(path: &Path, cogp: &CogpMeta) -> Result<()> {
+    let file = File::open(path)?;
+    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let schema = metadata.metadata().file_metadata().schema_descr();
+    let projection = ProjectionMask::leaves(
+        schema,
+        schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                let parts = column.path().parts();
+                parts.first().is_some_and(|name| name == OVERVIEWS_COLUMN)
+                    && parts.get(2).is_some_and(|name| name == "part_ends")
+            })
+            .map(|(index, _)| index),
+    );
+    for group in 0..metadata.metadata().num_row_groups() {
+        let batches =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file.try_clone()?, metadata.clone())
+                .with_projection(projection.clone())
+                .with_row_groups(vec![group])
+                .build()?;
+        for batch in batches {
+            let batch = batch?;
+            let root = batch
+                .column_by_name(OVERVIEWS_COLUMN)
+                .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+                .context("missing overviews while checking LoD coverage")?;
+            for lod in cogp.overviews.as_ref().unwrap().lods.keys() {
+                let boundary = cogp
+                    .lod_row_group_end(lod)
+                    .context("validated overview LoD is not referenced by a level")?;
+                let values = root
+                    .column_by_name(lod)
+                    .context("missing LoD in coverage projection")?;
+                let expected_nulls = if group as i64 <= boundary {
+                    0
+                } else {
+                    batch.num_rows()
+                };
+                if values.null_count() != expected_nulls {
+                    bail!("row group {group} overview `{lod}` must be {} (effective boundary {boundary})",
+                        if expected_nulls == 0 { "non-null" } else { "null" });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -434,7 +379,10 @@ fn validate_lod_field(field: &Field, errors: &mut Vec<String>) {
 
 fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     if errors.is_empty() {
-        println!("OK: {} conforms to COGP {COGP_VERSION}", path.display());
+        println!(
+            "OK: {} passed metadata, schema and LoD coverage checks",
+            path.display()
+        );
     } else {
         println!("FAIL: {} ({} error(s))", path.display(), errors.len());
     }

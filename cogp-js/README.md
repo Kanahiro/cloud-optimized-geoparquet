@@ -2,14 +2,19 @@
 
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
-metadata and fetches only the Parquet ranges needed for a requested geographic
+metadata for draft 0.2 (including patch versions) and fetches only the Parquet ranges needed for a requested geographic
 area and ground resolution. Bbox reads use covering-column statistics to prune
 row groups and, when present, PageIndex metadata to prune pages inside surviving
 row groups. They then apply an exact per-feature bbox filter to the surviving
 rows; files without page indexes fall back safely to row-group pruning.
 For Line and Polygon files, rendering geometry is decoded from the selected
 integer XY child of the `overviews` struct and the browser projection excludes
-WKB. Point files have no overviews and use hyparquet's primary-WKB decoding.
+WKB. Spatial filtering always uses primary geometry bboxes, so changing LoD
+on the same prefix does not change the selected feature IDs. Consecutive
+levels may share a row-group boundary, and several levels may reference one
+LoD. A zoom that changes LoD fetches its columns for existing rows as needed;
+unchanged byte ranges can be reused from cache. Unknown drafts are rejected.
+Point files have no overviews and use hyparquet's primary-WKB decoding.
 
 Remote reads bypass the browser HTTP cache and use a per-reader, in-memory
 range cache instead. The cache shares duplicate in-flight reads, retains up to

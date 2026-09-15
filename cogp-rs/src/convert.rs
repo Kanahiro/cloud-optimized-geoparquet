@@ -251,7 +251,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         }
     }
     for resolution in &resolutions {
-        if resolution.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        if !resolution.is_finite()
+            || resolution.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        {
             bail!("resolution values must be positive, got {:?}", resolutions);
         }
     }
@@ -413,16 +415,24 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         &resolutions,
         input_units,
     )?;
-    let occupied_candidates = occupied_level_candidates(&assignment, resolutions.len())?;
-    let mut per_level = remap_levels(&assignment, &occupied_candidates)?;
-    let resolutions: Vec<f64> = occupied_candidates
+    let candidate_count = resolutions.len();
+    let occupied_candidates = occupied_level_candidates(&assignment, candidate_count)?;
+    // Once any feature is visible, every requested rendering resolution can
+    // refine it, even when that candidate introduces no additional rows.
+    let selected_candidates = if declared_geometry_family == GeometryFamily::Point {
+        occupied_candidates
+    } else {
+        (occupied_candidates[0]..candidate_count).collect()
+    };
+    let mut per_level = remap_levels(&assignment, &selected_candidates)?;
+    let resolutions: Vec<f64> = selected_candidates
         .iter()
         .map(|candidate| resolutions[*candidate])
         .collect();
     eprintln!(
-        "      retained {} of {} candidate level(s) after removing empty levels",
-        occupied_candidates.len(),
-        resolutions.len()
+        "      retained {} of {} candidate level(s)",
+        selected_candidates.len(),
+        candidate_count
     );
     for (level, rows) in per_level.iter().enumerate() {
         eprintln!(
@@ -647,11 +657,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         if let Some(prev) = last_level {
             if prev != level_i {
                 writer.flush()?;
-                levels_meta.push(Level {
-                    row_group_end: flushed_row_group_end(&writer)?,
-                    resolution: resolutions[prev],
-                    lod: overview_plan.get(prev).map(|overview| overview.id.clone()),
-                });
+                let boundary = flushed_row_group_end(&writer)?;
+                for (level, &resolution) in resolutions.iter().enumerate().take(level_i).skip(prev)
+                {
+                    levels_meta.push(Level {
+                        row_group_end: boundary,
+                        resolution,
+                        lod: overview_plan.get(level).map(|overview| overview.id.clone()),
+                    });
+                }
             }
         }
         write_with_row_group_limit(&mut writer, &batch, args.row_group_size)?;
@@ -659,11 +673,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
     if let Some(prev) = last_level {
         writer.flush()?;
-        levels_meta.push(Level {
-            row_group_end: flushed_row_group_end(&writer)?,
-            resolution: resolutions[prev],
-            lod: overview_plan.get(prev).map(|overview| overview.id.clone()),
-        });
+        let boundary = flushed_row_group_end(&writer)?;
+        for (level, &resolution) in resolutions.iter().enumerate().skip(prev) {
+            levels_meta.push(Level {
+                row_group_end: boundary,
+                resolution,
+                lod: overview_plan.get(level).map(|overview| overview.id.clone()),
+            });
+        }
     }
     producer
         .join()

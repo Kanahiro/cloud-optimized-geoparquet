@@ -252,7 +252,7 @@ fn convert_reader_validate_pipeline() {
     let mut previous_resolution: Option<f64> = None;
     for l in &cogp.levels {
         if let Some(p) = prev_rge {
-            assert!(l.row_group_end > p);
+            assert!(l.row_group_end >= p);
         }
         prev_rge = Some(l.row_group_end);
         assert!(l.resolution > 0.0);
@@ -659,4 +659,242 @@ fn convert_row_group_size_is_a_row_limit() {
         .row_groups()
         .iter()
         .all(|group| group.num_rows() <= 8));
+}
+
+fn write_line_input(path: &std::path::Path, lines: &[Vec<(f64, f64)>]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+    let geometries: Vec<Vec<u8>> = lines
+        .iter()
+        .map(|points| {
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(&2_u32.to_le_bytes());
+            bytes.extend_from_slice(&(points.len() as u32).to_le_bytes());
+            for (x, y) in points {
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+            }
+            bytes
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..lines.len() as i32)),
+            Arc::new(BinaryArray::from_iter_values(geometries.iter())),
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue {
+        key: GEO_METADATA_KEY.into(),
+        value: Some(
+            serde_json::json!({
+                "version": "1.1.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["LineString"]}}
+            })
+            .to_string(),
+        ),
+    });
+    writer.close().unwrap();
+}
+
+#[test]
+fn convert_preserves_refinement_without_new_features() {
+    let tmp = TempDir::new("refinement");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    write_line_input(&input, &[vec![(0.4, 0.4), (50.4, 3.4), (100.4, 0.4)]]);
+    let mut args = convert_args(&input, &output);
+    args.input_units = InputUnits::Meters;
+    args.resolution = vec![256.0, 8.0, 4.0, 1.0, 0.5];
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(reader.cogp_meta().version, "0.2.0");
+    assert_eq!(
+        reader
+            .levels()
+            .iter()
+            .map(|level| level.resolution)
+            .collect::<Vec<_>>(),
+        vec![8.0, 4.0, 1.0, 0.5]
+    );
+    assert_eq!(reader.num_row_groups(), 1);
+    for index in 0..4 {
+        assert_eq!(reader.row_groups_up_to_level(index), 0..1);
+        assert_eq!(
+            reader.row_groups_in_level(index),
+            Some(if index == 0 { 0..1 } else { 1..1 })
+        );
+    }
+    let batch = reader
+        .sync_batch_reader(File::open(&output).unwrap(), &[0])
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let root = batch
+        .column_by_name("overviews")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let coordinate_count = |lod| {
+        root.column_by_name(lod)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column_by_name("coordinates")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value_length(0)
+    };
+    assert_eq!(coordinate_count("l0"), 2);
+    assert_eq!(coordinate_count("l3"), 3);
+}
+
+// Preserve row-group boundaries and data while varying only the contract under
+// test. This also supplies a bbox-without-ColumnIndex interoperability fixture.
+fn rewrite_contract(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    cogp: &cogp::meta::CogpMeta,
+) {
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::schema::types::ColumnPath;
+    let reader = Reader::open(source).unwrap();
+    let props = WriterProperties::builder()
+        .set_column_statistics_enabled(ColumnPath::from("geometry"), EnabledStatistics::None)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(output).unwrap(),
+        reader.arrow_metadata().schema().clone(),
+        Some(props),
+    )
+    .unwrap();
+    for group in 0..reader.num_row_groups() {
+        for batch in reader
+            .sync_batch_reader(File::open(source).unwrap(), &[group])
+            .unwrap()
+        {
+            writer.write(&batch.unwrap()).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    for entry in reader
+        .parquet_metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+    {
+        if entry.key != "ARROW:schema" && entry.key != "cogp" {
+            writer.append_key_value_metadata(entry.clone());
+        }
+    }
+    writer.append_key_value_metadata(KeyValue {
+        key: "cogp".into(),
+        value: Some(serde_json::to_string(cogp).unwrap()),
+    });
+    writer.close().unwrap();
+}
+
+#[test]
+fn shared_lod_contract_and_legacy_interoperability() {
+    let tmp = TempDir::new("shared-lod");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("refinement.parquet");
+    write_line_input(
+        &input,
+        &[
+            vec![(0.4, 0.4), (50.4, 3.4), (100.4, 0.4)],
+            vec![(10.4, 20.4), (13.4, 20.4)],
+        ],
+    );
+    let mut args = convert_args(&input, &output);
+    args.input_units = InputUnits::Meters;
+    args.resolution = vec![8.0, 1.0, 0.5];
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(
+        reader
+            .levels()
+            .iter()
+            .map(|level| level.row_group_end)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1]
+    );
+
+    let mut shared = reader.cogp_meta().clone();
+    shared.levels.insert(
+        1,
+        cogp::meta::Level {
+            row_group_end: 0,
+            resolution: 4.0,
+            lod: Some("l1".into()),
+        },
+    );
+    let shared_file = tmp.path().join("shared.parquet");
+    rewrite_contract(&output, &shared_file, &shared);
+    cogp::validate::run(&shared_file).unwrap();
+    let shared_reader = Reader::open(&shared_file).unwrap();
+    assert_eq!(shared_reader.cogp_meta().lod_row_group_end("l1"), Some(1));
+    assert_eq!(shared_reader.row_groups_in_level(1), Some(1..1));
+    assert_eq!(shared_reader.row_groups_up_to_resolution(4.0), 0..1);
+    assert_eq!(shared_reader.lod_for_resolution(4.0), Some("l1"));
+    assert_eq!(shared_reader.lod_for_resolution(1.0), Some("l1"));
+
+    let mut invalid = shared.clone();
+    // l0 is physically null in RG 1, but this new reference requires it there.
+    invalid.levels.insert(
+        3,
+        cogp::meta::Level {
+            row_group_end: 1,
+            resolution: 0.75,
+            lod: Some("l0".into()),
+        },
+    );
+    invalid.validate(2).unwrap();
+    let invalid_file = tmp.path().join("invalid.parquet");
+    rewrite_contract(&output, &invalid_file, &invalid);
+    assert!(cogp::validate::run(&invalid_file).is_err());
+    // l1 is physically non-null in RG 1; no reference now permits it there.
+    let mut invalid = shared.clone();
+    invalid.levels[2].row_group_end = 0;
+    invalid.validate(2).unwrap();
+    rewrite_contract(&output, &invalid_file, &invalid);
+    assert!(cogp::validate::run(&invalid_file).is_err());
+
+    // A strict-boundary 0.2 file remains interoperable with the refined rules.
+    let legacy_output = tmp.path().join("legacy-source.parquet");
+    let mut args = convert_args(&input, &legacy_output);
+    args.input_units = InputUnits::Meters;
+    args.resolution = vec![8.0, 1.0];
+    cogp::convert::run(args).unwrap();
+    let mut legacy = Reader::open(&legacy_output).unwrap().cogp_meta().clone();
+    legacy.version = "0.2.0".into();
+    let legacy_file = tmp.path().join("legacy.parquet");
+    rewrite_contract(&legacy_output, &legacy_file, &legacy);
+    cogp::validate::run(&legacy_file).unwrap();
+    assert_eq!(
+        Reader::open(&legacy_file).unwrap().cogp_meta().version,
+        "0.2.0"
+    );
+
+    // Explicit opt-in regenerates the small checked-in JS contract fixtures.
+    if let Some(directory) = std::env::var_os("COGP_TEST_FIXTURE_DIR") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        for file in [&output, &shared_file, &legacy_file] {
+            std::fs::copy(file, directory.join(file.file_name().unwrap())).unwrap();
+        }
+    }
 }

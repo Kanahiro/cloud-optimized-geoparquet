@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "levels": [
+    {
+      "row_group_end": 0,
+      "resolution": 1000,
+      "lod": "l0"
+    },
+    {
+      "row_group_end": 0,
+      "resolution": 500,
+      "lod": "l1"
+    },
+    {
+      "row_group_end": 3,
+      "resolution": 250,
+      "lod": "l1"
+    },
+    {
+      "row_group_end": 3,
+      "resolution": 100,
+      "lod": "l2"
+    }
+  ],
+  "overviews": {
+    "encoding": "quantized_xy_v1",
+    "lods": {
+      "l0": {
+        "scale": [256, 256],
+        "offset": [0, 0]
+      },
+      "l1": {
+        "scale": [64, 64],
+        "offset": [0, 0]
+      },
+      "l2": {
+        "scale": [32, 32],
+        "offset": [0, 0]
+      }
+    }
+  }
+}

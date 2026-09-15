@@ -88,7 +88,7 @@ const RUN_MAX_ROWS = 50_000;
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
-  /** Spatial filter; row groups whose covering envelope misses this bbox are skipped. */
+  /** Filters primary geometry covering bboxes; the selected overview only controls rendering. */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];

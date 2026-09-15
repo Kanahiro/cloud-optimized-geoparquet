@@ -16,6 +16,106 @@ pub struct CogpMeta {
     pub overviews: Option<OverviewsMeta>,
 }
 
+impl CogpMeta {
+    /// Validate the versioned metadata contract before interpreting row ranges.
+    /// Physical schema and per-row values are checked separately by the validator.
+    pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
+        use anyhow::{bail, ensure};
+        let parts: Vec<_> = self.version.split('.').collect();
+        ensure!(
+            parts.len() == 3
+                && parts.iter().all(|part| !part.is_empty()
+                    && part.bytes().all(|b| b.is_ascii_digit())
+                    && (part.len() == 1 || !part.starts_with('0'))),
+            "invalid cogp version `{}`; expected MAJOR.MINOR.PATCH",
+            self.version
+        );
+        ensure!(
+            (parts[0], parts[1]) == ("0", "2"),
+            "unsupported cogp version `{}`; supported draft is 0.2",
+            self.version
+        );
+        ensure!(!self.levels.is_empty(), "cogp.levels must be non-empty");
+        ensure!(num_row_groups > 0, "file has zero row groups");
+        let mut previous_end = -1;
+        let mut previous_resolution = f64::INFINITY;
+        let mut referenced = BTreeMap::new();
+        for (index, level) in self.levels.iter().enumerate() {
+            ensure!(
+                level.row_group_end >= 0 && (level.row_group_end as u64) < num_row_groups as u64,
+                "levels[{index}].row_group_end out of range"
+            );
+            ensure!(
+                level.row_group_end >= previous_end,
+                "levels[{index}].row_group_end must be non-decreasing"
+            );
+            ensure!(
+                level.resolution.is_finite()
+                    && level.resolution > 0.0
+                    && level.resolution < previous_resolution,
+                "levels[{index}].resolution must be positive, finite and strictly decreasing"
+            );
+            match (&self.overviews, &level.lod) {
+                (Some(overviews), Some(lod)) => {
+                    ensure!(
+                        !lod.is_empty()
+                            && lod != "geometry_type"
+                            && overviews.lods.contains_key(lod),
+                        "levels[{index}].lod does not name an overview LoD"
+                    );
+                    referenced.insert(lod.as_str(), level.row_group_end);
+                }
+                (None, None) => {}
+                _ => bail!("levels[{index}].lod is required exactly when overviews are declared"),
+            }
+            previous_end = level.row_group_end;
+            previous_resolution = level.resolution;
+        }
+        ensure!(
+            previous_end as u64 == num_row_groups as u64 - 1,
+            "final row_group_end must equal num_row_groups-1"
+        );
+        if let Some(overviews) = &self.overviews {
+            ensure!(
+                overviews.encoding == OVERVIEWS_ENCODING,
+                "unsupported overviews.encoding"
+            );
+            ensure!(
+                !overviews.lods.is_empty(),
+                "overviews.lods must be non-empty"
+            );
+            for (lod, transform) in &overviews.lods {
+                ensure!(
+                    !lod.is_empty() && lod != "geometry_type",
+                    "invalid overview LoD name `{lod}`"
+                );
+                ensure!(
+                    referenced.contains_key(lod.as_str()),
+                    "overview LoD `{lod}` is not referenced by a level"
+                );
+                ensure!(
+                    transform.scale.iter().all(|v| v.is_finite() && *v > 0.0),
+                    "overview `{lod}` scale must be positive and finite"
+                );
+                ensure!(
+                    transform.offset.iter().all(|v| v.is_finite()),
+                    "overview `{lod}` offset must be finite"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The shared LoD is present through the largest prefix that selects it.
+    pub fn lod_row_group_end(&self, lod: &str) -> Option<i64> {
+        self.levels
+            .iter()
+            .filter(|level| level.lod.as_deref() == Some(lod))
+            .map(|level| level.row_group_end)
+            .max()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
@@ -111,6 +211,53 @@ mod tests {
             None
         );
         assert_eq!(geometry_family(&[]), None);
+    }
+
+    #[test]
+    fn draft_contracts_and_shared_lod_boundaries() {
+        let metadata: CogpMeta =
+            serde_json::from_str(include_str!("../tests/fixtures/metadata-0.2.json")).unwrap();
+        metadata.validate(4).unwrap();
+        assert_eq!(metadata.lod_row_group_end("l0"), Some(0));
+        assert_eq!(metadata.lod_row_group_end("l1"), Some(3));
+        assert_eq!(metadata.lod_row_group_end("missing"), None);
+        for version in [
+            "0.1.0",
+            "0.4.0",
+            "1.0.0",
+            "garbage",
+            "0.3",
+            "0.2",
+            "0.2.01",
+            "0.2.0-extra",
+            "0.3.0",
+        ] {
+            let mut invalid = metadata.clone();
+            invalid.version = version.into();
+            assert!(invalid.validate(4).is_err(), "{version}");
+        }
+        for version in ["0.2.0", "0.2.9"] {
+            let mut compatible = metadata.clone();
+            compatible.version = version.into();
+            compatible.validate(4).unwrap();
+        }
+        let mut invalid = metadata.clone();
+        invalid.levels[2].row_group_end = -1;
+        assert!(invalid.validate(4).is_err());
+        let mut invalid = metadata.clone();
+        invalid.levels[2].resolution = 500.0;
+        assert!(invalid.validate(4).is_err());
+        let mut invalid = metadata.clone();
+        invalid.overviews.as_mut().unwrap().lods.insert(
+            "unused".into(),
+            LodMeta {
+                scale: [1.0; 2],
+                offset: [0.0; 2],
+            },
+        );
+        assert!(invalid.validate(4).is_err());
+        assert!(metadata.validate(3).is_err());
+        assert!(metadata.validate(0).is_err());
     }
 
     #[test]

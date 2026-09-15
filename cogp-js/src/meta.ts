@@ -59,8 +59,12 @@ export interface GeoMeta {
 
 export function parseCogpMeta(json: string): CogpMeta {
   const parsed = JSON.parse(json) as CogpMeta;
+  if (!parsed || typeof parsed !== 'object') throw new Error('cogp metadata must be an object');
   if (typeof parsed.version !== 'string') {
     throw new Error('cogp metadata: missing `version`');
+  }
+  if (!/^0\.2\.(0|[1-9][0-9]*)$/.test(parsed.version)) {
+    throw new Error(`cogp metadata: unsupported version \`${parsed.version}\`; supported draft is 0.2`);
   }
   if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
     throw new Error('cogp metadata: `levels` must be a non-empty array');
@@ -77,7 +81,7 @@ export function parseCogpMeta(json: string): CogpMeta {
       throw new Error('cogp metadata: `overviews.lods` must be non-empty');
     }
     for (const [lod, metadata] of lodEntries) {
-      if (!lod) throw new Error('cogp metadata: overview LoD names must be non-empty');
+      if (!lod || lod === 'geometry_type') throw new Error('cogp metadata: invalid overview LoD name');
       if (!validPair(metadata?.scale, true)) {
         throw new Error(`cogp metadata: overviews.lods.${lod}.scale must contain two positive numbers`);
       }
@@ -86,18 +90,23 @@ export function parseCogpMeta(json: string): CogpMeta {
       }
     }
   }
+  const referenced = new Set<string>();
   let previousRowGroupEnd = -1;
   let previousResolution = Number.POSITIVE_INFINITY;
   for (const [index, level] of parsed.levels.entries()) {
     if (parsed.overviews !== undefined
-      && (typeof level.lod !== 'string' || !parsed.overviews.lods[level.lod])) {
+      && (typeof level.lod !== 'string' || !Object.prototype.hasOwnProperty.call(parsed.overviews.lods, level.lod))) {
       throw new Error(`cogp metadata: levels[${index}].lod does not name an overview LoD`);
     }
     if (parsed.overviews === undefined && level.lod !== undefined) {
       throw new Error(`cogp metadata: levels[${index}].lod requires overviews`);
     }
-    if (!Number.isSafeInteger(level.row_group_end) || level.row_group_end <= previousRowGroupEnd) {
-      throw new Error(`cogp metadata: levels[${index}].row_group_end must strictly increase`);
+    if (!Number.isSafeInteger(level.row_group_end) || level.row_group_end < 0
+      || level.row_group_end < previousRowGroupEnd) {
+      throw new Error(`cogp metadata: levels[${index}].row_group_end must be non-decreasing`);
+    }
+    if (level.lod !== undefined) {
+      referenced.add(level.lod);
     }
     if (!(Number.isFinite(level.resolution) && level.resolution > 0)) {
       throw new Error(`cogp metadata: levels[${index}].resolution must be positive`);
@@ -108,11 +117,10 @@ export function parseCogpMeta(json: string): CogpMeta {
     previousRowGroupEnd = level.row_group_end;
     previousResolution = level.resolution;
   }
-  const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
-  if (major !== 0) {
-    throw new Error(
-      `cogp metadata: unsupported major version \`${parsed.version}\` (this reader implements 0.x)`,
-    );
+  if (parsed.overviews) {
+    for (const lod of Object.keys(parsed.overviews.lods)) {
+      if (!referenced.has(lod)) throw new Error(`cogp metadata: overview LoD \`${lod}\` is not referenced by a level`);
+    }
   }
   return parsed;
 }
