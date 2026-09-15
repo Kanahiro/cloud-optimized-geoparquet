@@ -48,9 +48,10 @@ https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
 ## Sample data
 
-- [pois.cogp.parquet](https://cogp-demo.spatialty.io/pois.cogp.parquet) (OpenStreetMap)
-- [segments.cogp.parquet](https://cogp-demo.spatialty.io/segments.cogp.parquet) (OvertureMaps)
-- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/buildings.cogp.parquet) (OvertureMaps)
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v0.2.0/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v0.2.0/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v0.2.0/buildings.cogp.parquet) (OvertureMaps)
+- [admin.cogp.parquet](https://cogp-demo.spatialty.io/v0.2.0/admin.cogp.parquet) (administrative boundaries)
 
 ## When COGP works well
 
