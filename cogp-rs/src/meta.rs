@@ -261,6 +261,24 @@ mod tests {
     }
 
     #[test]
+    fn overviews_are_optional_but_lod_is_conditional() {
+        let metadata = CogpMeta {
+            version: COGP_VERSION.into(),
+            levels: vec![Level {
+                row_group_end: 0,
+                resolution: 1000.0,
+                lod: None,
+            }],
+            overviews: None,
+        };
+        metadata.validate(1).unwrap();
+
+        let mut stray_lod = metadata;
+        stray_lod.levels[0].lod = Some("l0".into());
+        assert!(stray_lod.validate(1).is_err());
+    }
+
+    #[test]
     fn cogp_meta_roundtrip() {
         let m = CogpMeta {
             version: COGP_VERSION.to_string(),

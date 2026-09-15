@@ -118,7 +118,8 @@ pub fn run(path: &Path) -> Result<()> {
             errors.push("Point-family files must not declare overviews".into())
         }
         Some(GeometryFamily::Line | GeometryFamily::Polygon) if cogp.overviews.is_none() => {
-            errors.push("Line/Polygon files must declare overviews".into())
+            warnings
+                .push("Line/Polygon files should declare overviews for efficient rendering".into())
         }
         _ => {}
     }
@@ -134,6 +135,11 @@ pub fn run(path: &Path) -> Result<()> {
             Some(GeometryFamily::Line | GeometryFamily::Polygon) => {
                 if let Some(overviews) = &cogp.overviews {
                     validate_overviews_schema(schema.fields(), overviews, &mut errors);
+                } else if schema.field_with_name(OVERVIEWS_COLUMN).is_ok() {
+                    errors.push(
+                        "files without overviews metadata must not contain an `overviews` column"
+                            .into(),
+                    );
                 }
             }
             None => {}

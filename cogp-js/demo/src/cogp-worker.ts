@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 import {
+  COGP_ROW_INDEX,
   CogpReader,
   type QuantizedOverviewGeometry,
   type ReadOptions,
@@ -8,6 +9,7 @@ import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import type {
   MetadataSummary,
+  FeatureProperties,
   OpenResult,
   TileResult,
   ViewportBbox,
@@ -23,7 +25,6 @@ import {
   MVT_EXTENT,
 } from './mvt';
 
-const TILE_MAX_ROWS = 50_000;
 const VECTOR_TILE_SIZE = 512;
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
@@ -31,6 +32,7 @@ interface ActiveDataset {
   url: string;
   reader: CogpReader;
   dataBbox: [[number, number], [number, number]] | null;
+  propertyColumns: string[];
 }
 
 let active: ActiveDataset | null = null;
@@ -54,6 +56,7 @@ async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult
     url,
     reader,
     dataBbox,
+    propertyColumns: propertyColumnNames(reader),
   };
 
   return { summary: metadataSummary(reader), dataBbox };
@@ -77,8 +80,8 @@ async function readTile(
   const readOptions: ReadOptions = {
     bbox: tileBounds(z, x, y),
     columns: [geomColumn],
+    includeRowIndex: true,
     maxLevel,
-    maxRows: TILE_MAX_ROWS,
     signal,
   };
   if (usesOverviews) {
@@ -97,9 +100,11 @@ async function readTile(
   for (let i = 0; i < rows.length; i++) {
     if ((i & 1023) === 0) signal.throwIfAborted();
     const row = rows[i]!;
+    const rowIndex = (row as Record<PropertyKey, unknown>)[COGP_ROW_INDEX];
+    if (!Number.isSafeInteger(rowIndex)) throw new Error('COGP row is missing its source index');
     const feature = usesOverviews
-      ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null)
-      : encodePointFeature(row[geomColumn], z, x, y);
+      ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null, rowIndex as number)
+      : encodePointFeature(row[geomColumn], z, x, y, rowIndex as number);
     if (!feature) continue;
     // Reuse the rows array so a dense tile does not need a second 10k-entry
     // container solely for its already-encoded protobuf feature messages.
@@ -116,6 +121,29 @@ async function readTile(
     encodeMs,
     maxLevel,
   };
+}
+
+async function readProperties(
+  url: string,
+  rowIndex: number,
+  signal: AbortSignal,
+): Promise<FeatureProperties> {
+  const ds = active;
+  if (!ds || ds.url !== url) throw new Error('Dataset is no longer active');
+  return ds.reader.readRow(rowIndex, { columns: ds.propertyColumns, signal });
+}
+
+function propertyColumnNames(reader: CogpReader): string[] {
+  const excluded = new Set<string>(['overviews', ...Object.keys(reader.geo.columns)]);
+  for (const column of Object.values(reader.geo.columns)) {
+    const covering = column.covering?.bbox;
+    for (const path of covering
+      ? [covering.xmin, covering.ymin, covering.xmax, covering.ymax]
+      : []) {
+      if (path[0]) excluded.add(path[0]);
+    }
+  }
+  return reader.columnNames.filter((name) => !excluded.has(name) && !name.startsWith('__'));
 }
 
 function tileBounds(z: number, x: number, y: number): ViewportBbox {
@@ -189,7 +217,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       const result: OpenResult = await openDataset(payload.url, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response);
-    } else {
+    } else if (payload.type === 'readTile') {
       const result: TileResult = await readTile(
         payload.url,
         payload.z,
@@ -199,6 +227,10 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       );
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response, { transfer: [result.data] });
+    } else {
+      const result = await readProperties(payload.url, payload.rowIndex, controller.signal);
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response);
     }
   } catch (err) {
     const response: WorkerResponse = { id, ok: false, error: (err as Error).message };

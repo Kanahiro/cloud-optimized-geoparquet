@@ -85,6 +85,9 @@ export interface OpenOptions {
 // memory still scales with this value.
 const RUN_MAX_ROWS = 50_000;
 
+/** Optional, non-enumerable source-row identity attached by `readRows`. */
+export const COGP_ROW_INDEX = Symbol('cogp.rowIndex');
+
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
@@ -110,6 +113,8 @@ export interface ReadOptions {
   maxRows?: number;
   /** Abort pending Range requests and stop before decoding further runs. */
   signal?: AbortSignal;
+  /** Attach the source's zero-based row index under `COGP_ROW_INDEX`. */
+  includeRowIndex?: boolean;
 }
 
 export class CogpReader {
@@ -157,6 +162,7 @@ export class CogpReader {
   readonly geo: GeoMeta;
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
+  private readonly rowCount: number;
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
   private readonly bboxColIdx: BboxColumnIndexes;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
@@ -181,6 +187,13 @@ export class CogpReader {
     this.geo = doc.geo;
     this.compressors = { ...defaultCompressors, ...compressors };
     this.usesOverviews = this.cogp.overviews !== undefined;
+    const hasOverviewsColumn = rootColumnNames(metadata.schema).includes('overviews');
+    if (this.usesOverviews && !hasOverviewsColumn) {
+      throw new Error('cogp file is missing declared `overviews` column');
+    }
+    if (!this.usesOverviews && hasOverviewsColumn) {
+      throw new Error('cogp file contains an `overviews` column without overviews metadata');
+    }
     const finalBoundary = this.cogp.levels[this.cogp.levels.length - 1]!.row_group_end;
     if (finalBoundary !== metadata.row_groups.length - 1) {
       throw new Error(
@@ -195,6 +208,7 @@ export class CogpReader {
       acc += Number(rg.num_rows ?? 0);
     }
     this.rowOffsets = offsets;
+    this.rowCount = acc;
 
     // SPEC: COGP mandates a per-feature bbox covering on the primary
     // geometry column. Surface a clear error rather than silently falling
@@ -228,6 +242,10 @@ export class CogpReader {
     return this.metadata.row_groups.length;
   }
 
+  get columnNames(): readonly string[] {
+    return rootColumnNames(this.metadata.schema);
+  }
+
   get primaryGeometryColumn(): string {
     return this.geo.primary_column;
   }
@@ -241,6 +259,33 @@ export class CogpReader {
   selectLevel(targetResolution?: number): number {
     if (targetResolution === undefined) return this.levels.length - 1;
     return selectLevelByResolution(this.levels, targetResolution);
+  }
+
+  /** Read selected top-level columns for one absolute source row. */
+  async readRow(
+    rowIndex: number,
+    opts: Pick<ReadOptions, 'columns' | 'signal'> = {},
+  ): Promise<Record<string, unknown>> {
+    if (!Number.isSafeInteger(rowIndex) || rowIndex < 0 || rowIndex >= this.rowCount) {
+      throw new Error(`rowIndex ${rowIndex} out of range [0, ${this.rowCount})`);
+    }
+    throwIfAborted(opts.signal);
+    const columns = opts.columns ?? this.columnNames;
+    const values = await this.readColumnValues(
+      bindAbortSignal(this.file as AsyncBufferLike, opts.signal),
+      this.metadata,
+      rowIndex,
+      rowIndex + 1,
+      [...columns],
+    );
+    const row: Record<string, unknown> = {};
+    for (const column of columns) {
+      const value = values.get(column)?.[0];
+      if (value === undefined) throw new Error(`column \`${column}\` is missing row ${rowIndex}`);
+      row[column] = value;
+    }
+    throwIfAborted(opts.signal);
+    return row;
   }
 
   /**
@@ -316,6 +361,7 @@ export class CogpReader {
       wantsGeometry ? lod : undefined,
       wantsGeometry ? lodMetadata : undefined,
       opts.signal,
+      opts.includeRowIndex ?? false,
     )) {
       throwIfAborted(opts.signal);
       if (!paths) {
@@ -386,6 +432,7 @@ export class CogpReader {
     lod?: string,
     lodMetadata?: LodMetadata,
     signal?: AbortSignal,
+    includeRowIndex = false,
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
@@ -438,6 +485,9 @@ export class CogpReader {
           row[column] = values[localRow];
         }
         if (overviewSelection) row['overviews'] = overviewSelection.values[i]!;
+        if (includeRowIndex) {
+          Object.defineProperty(row, COGP_ROW_INDEX, { value: rowStart + localRow });
+        }
         rows[i] = row;
       }
       throwIfAborted(signal);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { CogpReader } from '../dist/index.js';
+import { COGP_ROW_INDEX, CogpReader } from '../dist/index.js';
 
 async function openFixture(name) {
   const bytes = await readFile(new URL(`../../test-data/${name}.parquet`, import.meta.url));
@@ -65,4 +65,24 @@ test('shared LoD remains readable beyond its first referenced prefix', async () 
   assert.equal(first.length, 1);
   assert.equal(extended.length, 2);
   assert.deepEqual(first[0], extended[0]);
+});
+
+test('readRows can attach a stable, non-enumerable source row index', async () => {
+  const { reader } = await openFixture('refinement');
+  const rows = await reader.readRows({
+    columns: ['id', 'geometry'],
+    includeRowIndex: true,
+    maxLevel: 2,
+  });
+  assert.deepEqual(rows.map(row => row[COGP_ROW_INDEX]), [0, 1]);
+  assert.deepEqual(Object.keys(rows[0]), ['id', 'geometry']);
+  assert.deepEqual({ ...rows[0] }, { id: 0, geometry: rows[0].geometry });
+});
+
+test('readRow projects one source row without requiring geometry', async () => {
+  const { reader } = await openFixture('refinement');
+  assert.ok(reader.columnNames.includes('id'));
+  assert.deepEqual(await reader.readRow(1, { columns: ['id'] }), { id: 1 });
+  await assert.rejects(() => reader.readRow(-1), /rowIndex/);
+  await assert.rejects(() => reader.readRow(2), /rowIndex/);
 });

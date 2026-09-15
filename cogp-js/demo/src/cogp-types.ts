@@ -31,9 +31,12 @@ export interface TileResult {
   maxLevel: number;
 }
 
+export type FeatureProperties = Record<string, unknown>;
+
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readTile'; url: string; z: number; x: number; y: number };
+  | { type: 'readTile'; url: string; z: number; x: number; y: number }
+  | { type: 'readProperties'; url: string; rowIndex: number };
 
 export interface WorkerEnvelope {
   id: number;
@@ -48,5 +51,5 @@ export interface WorkerCancel {
 export type WorkerMessage = WorkerEnvelope | WorkerCancel;
 
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | TileResult }
+  | { id: number; ok: true; result: OpenResult | TileResult | FeatureProperties }
   | { id: number; ok: false; error: string };

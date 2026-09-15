@@ -1,4 +1,4 @@
-export { CogpReader } from './reader.js';
+export { COGP_ROW_INDEX, CogpReader } from './reader.js';
 export type {
   BboxInput,
   OpenOptions,

@@ -4,8 +4,9 @@ Rust reference producer, validator, CLI, and reader for the [Cloud Optimized
 GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` assigns each feature to one coarse-to-fine level, spatially packs the
-rows, and preserves the primary WKB. Line and Polygon files add an `overviews`
-struct whose LoDs store simplified, quantized XY integer lists. Point files do
+rows, and preserves the primary WKB. For Line and Polygon files it adds an
+`overviews` struct whose LoDs store simplified, quantized XY integer lists.
+COGP files may omit overviews and render primary WKB instead; Point files do
 not create overviews. The producer, readers, and validator support COGP 0.2,
 including compatible patch versions; other drafts are rejected.
 
@@ -131,8 +132,8 @@ let batches = reader.sync_batch_reader_with_bbox(
 for batch in batches {
     let batch = batch?;
     // Page pruning is conservative; apply the exact bbox predicate to rows.
-    // For Line/Polygon, project/decode `overviews.geometry_type` and
-    // `overviews.{lod}`. For Point (or lossless analysis), project primary WKB.
+    // When present, project/decode `overviews.geometry_type` and
+    // `overviews.{lod}`. Otherwise (or for lossless analysis), project primary WKB.
     let _ = (&batch, lod);
 }
 # Ok::<(), anyhow::Error>(())
@@ -163,8 +164,8 @@ cogp validate <FILE>
 ```
 
 Validation covers GeoParquet bbox metadata and statistics, versioned level ordering and
-coverage, per-level `resolution`, conditional Line/Polygon `lod` and
-`quantized_xy_v1` metadata, and the conditional physical `overviews` schema.
+coverage, per-level `resolution`, conditional `lod` and `quantized_xy_v1`
+metadata, and the conditional physical `overviews` schema.
 Semantic rendering quality remains a producer responsibility.
 
 ## Benchmarks

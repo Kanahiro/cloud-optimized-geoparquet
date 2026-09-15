@@ -76,6 +76,26 @@ test('Point-family metadata omits overviews and level LoDs', () => {
   ]), /must not declare overviews/);
 });
 
+test('Line and Polygon metadata may omit overviews and level LoDs', () => {
+  const cogp = JSON.stringify({
+    version: '0.2.0',
+    levels: [{ row_group_end: 0, resolution: 1000 }],
+  });
+  for (const geometryType of ['LineString', 'Polygon']) {
+    const geo = JSON.stringify({
+      version: '1.1.0',
+      primary_column: 'geometry',
+      columns: { geometry: { encoding: 'WKB', geometry_types: [geometryType] } },
+    });
+    const parsed = extractCogpDocument([
+      { key: 'cogp', value: cogp },
+      { key: 'geo', value: geo },
+    ]);
+    assert.equal(parsed.cogp.overviews, undefined);
+    assert.equal(parsed.cogp.levels[0].lod, undefined);
+  }
+});
+
 const specExample = JSON.parse(readFileSync(new URL('../../cogp-rs/tests/fixtures/metadata-0.2.json', import.meta.url), 'utf8'));
 
 test('0.2 selects a new LoD on the same prefix and shares LoDs across prefixes', () => {

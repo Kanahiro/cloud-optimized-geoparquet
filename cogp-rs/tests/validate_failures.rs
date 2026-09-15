@@ -11,8 +11,11 @@ use cogp::meta::{
     BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, LodMeta, OverviewsMeta,
     COGP_METADATA_KEY, COGP_VERSION, GEOPARQUET_VERSION, GEO_METADATA_KEY, OVERVIEWS_ENCODING,
 };
+use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 
 struct TempDir(PathBuf);
 impl TempDir {
@@ -105,7 +108,10 @@ fn write_file(path: &std::path::Path, geo: Option<GeoMeta>, cogp: Option<CogpMet
     ));
     let geometry: ArrayRef = Arc::new(BinaryArray::from(vec![&[1_u8][..]]));
     let file = File::create(path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    let props = WriterProperties::builder()
+        .set_column_statistics_enabled(ColumnPath::from("geometry"), EnabledStatistics::None)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
     writer
         .write(&RecordBatch::try_new(schema, vec![bbox, geometry]).unwrap())
         .unwrap();
@@ -126,6 +132,29 @@ fn write_file(path: &std::path::Path, geo: Option<GeoMeta>, cogp: Option<CogpMet
 
 fn assert_invalid(path: &std::path::Path) {
     assert!(cogp::validate::run(path).is_err());
+}
+
+#[test]
+fn accepts_polygon_without_overviews() {
+    let dir = TempDir::new("polygon-primary-wkb");
+    let path = dir.0.join("valid.parquet");
+    write_file(
+        &path,
+        Some(standard_geo()),
+        Some(CogpMeta {
+            version: COGP_VERSION.into(),
+            levels: vec![Level {
+                row_group_end: 0,
+                resolution: 100.0,
+                lod: None,
+            }],
+            overviews: None,
+        }),
+    );
+    cogp::validate::run(&path).unwrap();
+    let reader = Reader::open(&path).unwrap();
+    assert!(reader.cogp_meta().overviews.is_none());
+    assert_eq!(reader.lod_for_resolution(100.0), None);
 }
 
 #[test]

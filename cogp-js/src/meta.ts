@@ -194,8 +194,6 @@ export function extractCogpDocument(
     if (cogp.overviews !== undefined || cogp.levels.some(level => level.lod !== undefined)) {
       throw new Error('cogp metadata: Point-family files must not declare overviews or level lods');
     }
-  } else if (cogp.overviews === undefined) {
-    throw new Error('cogp metadata: Line/Polygon files require overviews');
   }
   return { cogp, geo };
 }

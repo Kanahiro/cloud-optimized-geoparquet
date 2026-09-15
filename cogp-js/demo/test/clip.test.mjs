@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { clipLineString, clipPolygonRing, pointInBbox } from '../dist/clip-test/clip.js';
-import { createOverviewMvtEncoder, encodePointFeature } from '../dist/clip-test/mvt.js';
+import {
+  createOverviewMvtEncoder,
+  encodeMvtTile,
+  encodePointFeature,
+} from '../dist/clip-test/mvt.js';
 
 const bbox = [0, 0, 10, 10];
 
@@ -50,12 +54,29 @@ test('encodes only the clipped boundary of a huge polygon', () => {
     polygonEnds: new Int32Array([1]),
     scale: [0.001, 0.001],
     offset: [0, 0],
-  });
+  }, 17);
 
   assert.ok(feature);
-  assert.ok(feature.byteLength < 100, `expected clipped MVT feature, got ${feature.byteLength} bytes`);
+  assert.equal(feature.id, 17);
+  assert.ok(
+    feature.geometry.byteLength < 100,
+    `expected clipped MVT geometry, got ${feature.geometry.byteLength} bytes`,
+  );
 });
 
 test('drops point-family coordinates outside the buffered tile', () => {
   assert.equal(encodePointFeature({ type: 'Point', coordinates: [120, 45] }, 10, 512, 512), null);
+});
+
+test('encodes a source-row reference instead of eager properties', () => {
+  const feature = encodePointFeature(
+    { type: 'Point', coordinates: [0, 0] },
+    0,
+    0,
+    0,
+    42,
+  );
+  assert.ok(feature);
+  assert.equal(feature.id, 42);
+  assert.ok(encodeMvtTile([feature]).byteLength > feature.geometry.byteLength);
 });

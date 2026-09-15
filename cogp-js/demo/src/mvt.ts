@@ -21,8 +21,12 @@ const MVT_CLIP_BBOX: ClipBbox = [
 const MAX_MERCATOR_LATITUDE = 85.0511287798066;
 const textEncoder = new TextEncoder();
 
-/** A complete, property-free Vector Tile Feature protobuf message. */
-export type EncodedMvtFeature = Uint8Array;
+/** Geometry plus its stable source-row identity. */
+export interface EncodedMvtFeature {
+  id: number;
+  type: 1 | 2 | 3;
+  geometry: Uint8Array;
+}
 
 /**
  * Build a decoder for CogpReader.readRows. It consumes the selected overview's
@@ -36,17 +40,23 @@ export function createOverviewMvtEncoder(
   z: number,
   x: number,
   y: number,
-): (overview: QuantizedOverviewGeometry | null) => EncodedMvtFeature | null {
+): (
+  overview: QuantizedOverviewGeometry | null,
+  id: number,
+) => EncodedMvtFeature | null {
   const projection = new TileProjection(z, x, y);
-  return (overview) => overview ? encodeOverviewFeature(overview, projection) : null;
+  return (overview, id) => overview
+    ? encodeOverviewFeature(overview, projection, id)
+    : null;
 }
 
-/** Point-family COGP files have no overview and therefore retain this fallback. */
+/** Files without overviews retain this primary-WKB fallback for point geometry. */
 export function encodePointFeature(
   geometry: unknown,
   z: number,
   x: number,
   y: number,
+  id = 0,
 ): EncodedMvtFeature | null {
   const value = geometry as {
     type?: string;
@@ -87,14 +97,14 @@ export function encodePointFeature(
   } else {
     return null;
   }
-  return encodeFeature(1, commands.finish());
+  return { id, type: 1, geometry: commands.finish() };
 }
 
 export function encodeMvtTile(features: readonly EncodedMvtFeature[]): ArrayBuffer {
   const layer = new ByteWriter();
   layer.writeVarintField(15, 2);
   layer.writeStringField(1, MVT_LAYER_NAME);
-  for (const feature of features) layer.writeBytesField(2, feature);
+  for (const feature of features) layer.writeBytesField(2, encodeFeature(feature));
   layer.writeVarintField(5, MVT_EXTENT);
 
   const tile = new ByteWriter(layer.length + 16);
@@ -105,6 +115,7 @@ export function encodeMvtTile(features: readonly EncodedMvtFeature[]): ArrayBuff
 function encodeOverviewFeature(
   overview: QuantizedOverviewGeometry,
   projection: TileProjection,
+  id: number,
 ): EncodedMvtFeature | null {
   const mvtType = overview.type === 1 || overview.type === 4
     ? 1
@@ -131,7 +142,9 @@ function encodeOverviewFeature(
     }
   }
 
-  return commands.length === 0 ? null : encodeFeature(mvtType, commands.finish());
+  return commands.length === 0
+    ? null
+    : { id, type: mvtType, geometry: commands.finish() };
 }
 
 function writeOverviewPoints(
@@ -249,10 +262,11 @@ function projectOverviewY(
   return projection.y(overview.offset[1] + overview.scale[1] * Number(overview.y[index]));
 }
 
-function encodeFeature(type: 1 | 2 | 3, geometry: Uint8Array): Uint8Array {
-  const feature = new ByteWriter(geometry.byteLength + 16);
-  feature.writeVarintField(3, type);
-  feature.writeBytesField(4, geometry);
+function encodeFeature(value: EncodedMvtFeature): Uint8Array {
+  const feature = new ByteWriter(value.geometry.byteLength + 32);
+  feature.writeVarintField(1, value.id);
+  feature.writeVarintField(3, value.type);
+  feature.writeBytesField(4, value.geometry);
   return feature.finish();
 }
 

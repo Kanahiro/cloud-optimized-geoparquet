@@ -119,30 +119,34 @@ impl Reader {
                 }
             }
             GeometryFamily::Line | GeometryFamily::Polygon => {
-                let overviews = cogp_meta
-                    .overviews
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("COGP file is missing required overviews metadata"))?;
-                if overviews.encoding != OVERVIEWS_ENCODING {
-                    bail!(
-                        "unsupported COGP overviews encoding `{}`",
-                        overviews.encoding
-                    );
-                }
-                if arrow_meta
+                let has_overviews_column = arrow_meta
                     .schema()
                     .field_with_name(OVERVIEWS_COLUMN)
-                    .is_err()
-                {
-                    bail!("COGP file is missing required `{OVERVIEWS_COLUMN}` column");
-                }
-                for (index, level) in cogp_meta.levels.iter().enumerate() {
-                    let lod = level.lod.as_deref().ok_or_else(|| {
-                        anyhow!("COGP levels[{index}].lod is required for {family:?} data")
-                    })?;
-                    if !overviews.lods.contains_key(lod) {
-                        bail!("COGP levels[{index}].lod `{lod}` is missing from overviews.lods");
+                    .is_ok();
+                match &cogp_meta.overviews {
+                    Some(overviews) => {
+                        if overviews.encoding != OVERVIEWS_ENCODING {
+                            bail!(
+                                "unsupported COGP overviews encoding `{}`",
+                                overviews.encoding
+                            );
+                        }
+                        if !has_overviews_column {
+                            bail!("COGP file is missing declared `{OVERVIEWS_COLUMN}` column");
+                        }
+                        for (index, level) in cogp_meta.levels.iter().enumerate() {
+                            let lod = level.lod.as_deref().ok_or_else(|| {
+                                anyhow!("COGP levels[{index}].lod is required when overviews are declared")
+                            })?;
+                            if !overviews.lods.contains_key(lod) {
+                                bail!("COGP levels[{index}].lod `{lod}` is missing from overviews.lods");
+                            }
+                        }
                     }
+                    None if has_overviews_column => {
+                        bail!("COGP file contains an `{OVERVIEWS_COLUMN}` column without overviews metadata");
+                    }
+                    None => {}
                 }
             }
         }
@@ -178,8 +182,8 @@ impl Reader {
     }
 
     /// Select the overview LoD declared by the level appropriate for the
-    /// target ground resolution. Returns `None` for Point-family files, which
-    /// render primary WKB instead of overviews.
+    /// target ground resolution. Returns `None` when the file has no overviews
+    /// and renders primary WKB instead.
     pub fn lod_for_resolution(&self, target_resolution: f64) -> Option<&str> {
         let level = self
             .cogp_meta

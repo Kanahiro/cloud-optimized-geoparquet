@@ -2,6 +2,7 @@ import maplibregl, { type LngLatBoundsLike } from 'maplibre-gl';
 
 import {
   openDataset as openCogpDataset,
+  readProperties,
   readTile,
   type MetadataSummary,
 } from './dataset-service';
@@ -85,11 +86,41 @@ map.on('click', (e) => {
   const features = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS });
   const feature = features[0];
   if (!feature) return;
-  new maplibregl.Popup({ maxWidth: '360px' })
-    .setLngLat(e.lngLat)
-    .setHTML(renderPropertiesHtml(feature.properties))
-    .addTo(map);
+  void showFeatureProperties(feature.id, e.lngLat);
 });
+
+async function showFeatureProperties(
+  featureId: string | number | undefined,
+  lngLat: maplibregl.LngLat,
+): Promise<void> {
+  const rowIndex = Number(featureId);
+  const dataset = active;
+  if (!dataset || !Number.isSafeInteger(rowIndex) || rowIndex < 0) return;
+
+  propertyLoadController?.abort();
+  propertyPopup?.remove();
+  const controller = new AbortController();
+  const revision = datasetRevision;
+  propertyLoadController = controller;
+  const popup = new maplibregl.Popup({ maxWidth: '360px' })
+    .setLngLat(lngLat)
+    .setHTML('<div class="cogp-popup"><em>Loading properties…</em></div>')
+    .addTo(map);
+  propertyPopup = popup;
+  try {
+    const properties = await readProperties(dataset.url, rowIndex, controller.signal);
+    if (active?.url !== dataset.url || datasetRevision !== revision || propertyPopup !== popup) return;
+    popup.setHTML(renderPropertiesHtml(properties));
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    console.error(error);
+    popup.setHTML(
+      `<div class="cogp-popup"><em>${escapeHtml((error as Error).message)}</em></div>`,
+    );
+  } finally {
+    if (propertyLoadController === controller) propertyLoadController = null;
+  }
+}
 
 for (const layerId of COGP_INTERACTIVE_LAYERS) {
   map.on('mouseenter', layerId, () => {
@@ -121,7 +152,11 @@ function formatValue(value: unknown): string {
   if (value instanceof Date) return value.toISOString();
   if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
   try {
-    return JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    return JSON.stringify(value, (_k, v) => {
+      if (typeof v === 'bigint') return v.toString();
+      if (v instanceof Map) return Object.fromEntries(v);
+      return v;
+    });
   } catch {
     return String(value);
   }
@@ -246,6 +281,8 @@ interface ActiveDataset {
 let active: ActiveDataset | null = null;
 let latestUrl = '';
 let datasetLoadController: AbortController | null = null;
+let propertyLoadController: AbortController | null = null;
+let propertyPopup: maplibregl.Popup | null = null;
 
 loadBtn.addEventListener('click', () => {
   void loadDataset(urlInput.value.trim());
@@ -273,6 +310,9 @@ async function loadDataset(url: string): Promise<void> {
   }
   loadBtn.disabled = true;
   setStatus(`Opening ${url} …`);
+  propertyLoadController?.abort();
+  propertyPopup?.remove();
+  propertyPopup = null;
   datasetLoadController?.abort();
   const controller = new AbortController();
   datasetLoadController = controller;
