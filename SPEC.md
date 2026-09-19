@@ -1,13 +1,12 @@
----
-title: Cloud Optimized GeoParquet (COGP)
-version: "1.0.0"
-status: Stable
-license: CC BY 4.0
----
+# [Proposal] Coarse-to-fine layout extension
 
-# Cloud Optimized GeoParquet (COGP) v1.0.0
+This document proposes an optional GeoParquet extension for progressive feature access.
 
-COGP implements the GeoParquet coarse-to-fine layout extension.
+## Motivation
+
+Spatial ordering and bounding box statistics help readers find features within a viewport. They do not tell a reader how much of that viewport's data is useful at a given display scale. A world view may intersect almost every row group even though only a small subset of features can be distinguished on screen.
+
+This proposal adds a second selection dimension: rendering resolution. Features useful at coarse resolutions are stored in earlier row groups; later row groups add finer detail. Small metadata describes cumulative row group prefixes, allowing readers to fetch a coarse view first and progressively add features as needed.
 
 ## Scope
 
@@ -19,7 +18,7 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 ## Physical layout
 
-A file using this extension MUST conform to the [GeoParquet specification](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/geoparquet.md).
+A file using this extension MUST conform to the [GeoParquet specification](geoparquet.md).
 
 Features MUST be assigned to ordered detail levels, from coarse to fine. A level represents the features selected for display at a nominal rendering resolution. Earlier levels should provide a useful view of the dataset; later levels may add features that the producer has deferred at coarser resolutions.
 
@@ -73,7 +72,7 @@ For a file containing `N` row groups:
 * The final boundary MUST equal `N - 1`.
 * Empty files MUST omit this extension. A non-empty file MAY declare a single level covering all its row groups.
 
-Boundaries refer to this file's footer, not to row numbers, byte offsets, or row groups in another file. Partitioned datasets apply the extension independently to each file; this specification does not define a dataset-wide level index.
+Boundaries refer to this file's footer, not to row numbers, byte offsets, or row groups in another file. Partitioned datasets apply the extension independently to each file; this draft does not define a dataset-wide level index.
 
 ### Resolution
 
@@ -89,7 +88,7 @@ The target resolution is interpreted in the same CRS units as `resolution`. If t
 
 Readers that do not support this extension can ignore `coarse_to_fine` and read the file as ordinary GeoParquet. Extension-aware readers MUST validate the required fields and boundary constraints before using the levels to exclude row groups. If the metadata is invalid, readers MUST NOT use it for prefix selection and SHOULD report the problem. They MAY fall back to ordinary GeoParquet access.
 
-Readers MUST ignore unrecognized fields within `coarse_to_fine`. This extension does not introduce an independent extension version field.
+Readers MUST ignore unrecognized fields within `coarse_to_fine`. This proposal does not introduce an independent extension version field.
 
 ## Reader behavior
 
@@ -127,7 +126,3 @@ Any operation that changes row order, row group boundaries, feature membership, 
 A structural validator can check the metadata types, non-empty levels, positive finite and strictly decreasing resolutions, and non-decreasing row group boundaries. It can verify that each boundary is within the footer's row group count and that the final boundary includes the last row group. It can also validate the underlying GeoParquet file.
 
 Structural validation confirms only that the metadata is consistent with the file's row groups. It does not verify that every source row was preserved, nor that early levels form a useful coarse view; both require comparison with the source data or dataset-specific evaluation.
-
-## License
-
-This specification is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See [LICENSE-SPEC](./LICENSE-SPEC).
