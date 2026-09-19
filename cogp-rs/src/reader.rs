@@ -1,6 +1,6 @@
 //! Reader for COGP (Cloud Optimized GeoParquet Profile) files.
 //!
-//! The Parquet footer (and the `geo` / `cogp` key-value metadata it carries) is
+//! The Parquet footer (and the `geo.lod` metadata it carries) is
 //! parsed exactly once when the reader is constructed and cached as an
 //! [`ArrowReaderMetadata`]. All later reads — sync or async, local or remote —
 //! reuse that cached metadata via `new_with_metadata`, so the footer is never
@@ -43,7 +43,7 @@ pub use parquet::arrow::async_reader::ParquetObjectReader;
 #[cfg(feature = "async")]
 pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
 
-use crate::meta::{CogpMeta, GeoMeta, Level, COGP_METADATA_KEY, GEO_METADATA_KEY};
+use crate::meta::{CogpMeta, GeoMeta, Level, GEO_METADATA_KEY};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
 /// Cheap to clone (the underlying `ArrowReaderMetadata` is `Arc`-backed) and
@@ -149,15 +149,18 @@ impl Reader {
         0..(self.cogp_meta.levels[i].row_group_end + 1) as usize
     }
 
-    /// Row groups for every level whose GSD is `>= min_gsd` (coarser than the
-    /// caller's target resolution). Use this when you have a target ground
-    /// resolution (e.g. screen meters/pixel) and want every level that's
-    /// still useful at that scale, plus all coarser overviews.
-    pub fn row_groups_up_to_gsd(&self, min_gsd: f64) -> Range<usize> {
-        let last = self.cogp_meta.levels.iter().rposition(|l| l.gsd >= min_gsd);
+    /// Row groups for every level whose Resolution is `>= min_resolution` (coarser than the
+    /// target resolution in primary geometry CRS units). Targets coarser than
+    /// all levels clamp to the first prefix.
+    pub fn row_groups_up_to_resolution(&self, min_resolution: f64) -> Range<usize> {
+        let last = self
+            .cogp_meta
+            .levels
+            .iter()
+            .rposition(|l| l.resolution >= min_resolution);
         match last {
             Some(i) => 0..(self.cogp_meta.levels[i].row_group_end + 1) as usize,
-            None => 0..0,
+            None => self.row_groups_up_to_level(0),
         }
     }
 
@@ -277,7 +280,7 @@ impl Reader {
     /// `AsyncFileReader`, reusing the cached footer metadata. The Parquet
     /// reader fetches only the byte ranges for the selected row groups, so
     /// pairing this with [`Self::row_groups_intersecting_bbox`] and/or
-    /// [`Self::row_groups_up_to_gsd`] gives you a near-minimal remote read.
+    /// [`Self::row_groups_up_to_resolution`] gives you a near-minimal remote read.
     #[cfg(feature = "async")]
     pub fn async_batch_stream<R: AsyncFileReader + Send + 'static>(
         &self,
@@ -368,22 +371,22 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
         .ok_or_else(|| anyhow!("missing `geo` key-value metadata (not a GeoParquet file)"))?;
     let geo_meta: GeoMeta = serde_json::from_str(geo_str)
         .map_err(|e| anyhow!("`geo` metadata is not valid JSON: {e}"))?;
-    let cogp_str = kv
-        .iter()
-        .find(|kv| kv.key == COGP_METADATA_KEY)
-        .and_then(|kv| kv.value.as_deref())
-        .ok_or_else(|| anyhow!("missing `cogp` key-value metadata"))?;
-    let cogp_meta: CogpMeta = serde_json::from_str(cogp_str)
-        .map_err(|e| anyhow!("`cogp` metadata is not valid JSON: {e}"))?;
+    let cogp_meta = geo_meta
+        .lod
+        .clone()
+        .ok_or_else(|| anyhow!("missing geo.lod metadata"))?;
+    cogp_meta.validate(metadata.num_row_groups())?;
+    anyhow::ensure!(
+        metadata.file_metadata().num_rows() > 0,
+        "empty files must omit geo.lod"
+    );
     Ok((geo_meta, cogp_meta))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::{
-        BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, COGP_VERSION, GEOPARQUET_VERSION,
-    };
+    use crate::meta::{BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GEOPARQUET_VERSION};
     use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
@@ -421,8 +424,11 @@ mod tests {
         }
     }
 
-    fn level(row_group_end: i64, gsd: f64) -> Level {
-        Level { row_group_end, gsd }
+    fn level(row_group_end: i64, resolution: f64) -> Level {
+        Level {
+            row_group_end,
+            resolution,
+        }
     }
 
     /// Construct a `Reader` whose footer carries the supplied COGP levels.
@@ -452,23 +458,28 @@ mod tests {
                     crs: None,
                 },
             );
-            let geo = GeoMeta {
+            let mut geo = GeoMeta {
+                lod: None,
                 version: GEOPARQUET_VERSION.into(),
                 primary_column: "geometry".into(),
                 columns: cols,
             };
-            let cogp = CogpMeta {
-                version: COGP_VERSION.into(),
-                levels,
-            };
+            let cogp = CogpMeta { levels };
+            for _ in 0..cogp.levels.last().map(|l| l.row_group_end + 1).unwrap_or(0) {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow_array::Int32Array::from(vec![1]))],
+                )
+                .unwrap();
+                w.write(&batch).unwrap();
+                w.flush().unwrap();
+            }
+            geo.lod = Some(cogp);
             w.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
             });
-            w.append_key_value_metadata(KeyValue {
-                key: COGP_METADATA_KEY.into(),
-                value: Some(serde_json::to_string(&cogp).unwrap()),
-            });
+
             w.close().unwrap();
         }
         Reader::try_new(bytes::Bytes::from(buf)).unwrap()
@@ -494,24 +505,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "empty files")]
     fn row_groups_up_to_level_empty_when_no_levels() {
         let r = reader_with_levels(vec![]);
         assert!(r.row_groups_up_to_level(0).is_empty());
     }
 
     #[test]
-    fn row_groups_up_to_gsd_picks_last_level_above_target() {
+    fn row_groups_up_to_resolution_picks_last_level_above_target() {
         let r = reader_with_levels(vec![level(1, 1000.0), level(4, 100.0), level(9, 10.0)]);
         // target finer than every level → include every level
-        assert_eq!(r.row_groups_up_to_gsd(1.0), 0..10);
-        // target equal to the finest level GSD → include every level
-        assert_eq!(r.row_groups_up_to_gsd(10.0), 0..10);
+        assert_eq!(r.row_groups_up_to_resolution(1.0), 0..10);
+        // target equal to the finest level Resolution → include every level
+        assert_eq!(r.row_groups_up_to_resolution(10.0), 0..10);
         // target between levels 1 and 2 → cut off after level 1
-        assert_eq!(r.row_groups_up_to_gsd(50.0), 0..5);
+        assert_eq!(r.row_groups_up_to_resolution(50.0), 0..5);
         // target finer than the coarsest only
-        assert_eq!(r.row_groups_up_to_gsd(500.0), 0..2);
+        assert_eq!(r.row_groups_up_to_resolution(500.0), 0..2);
         // target coarser than every level → empty
-        assert!(r.row_groups_up_to_gsd(1e9).is_empty());
+        assert_eq!(r.row_groups_up_to_resolution(1e9), 0..2);
     }
 
     fn bbox_fixture(statistics: EnabledStatistics) -> bytes::Bytes {
@@ -567,23 +579,21 @@ mod tests {
                     crs: None,
                 },
             );
-            let geo = GeoMeta {
+            let mut geo = GeoMeta {
+                lod: None,
                 version: GEOPARQUET_VERSION.into(),
                 primary_column: "geometry".into(),
                 columns,
             };
             let cogp = CogpMeta {
-                version: COGP_VERSION.into(),
                 levels: vec![level(0, 1.0)],
             };
+            geo.lod = Some(cogp);
             writer.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
             });
-            writer.append_key_value_metadata(KeyValue {
-                key: COGP_METADATA_KEY.into(),
-                value: Some(serde_json::to_string(&cogp).unwrap()),
-            });
+
             writer.write(&batch).unwrap();
             writer.close().unwrap();
         }
@@ -658,12 +668,9 @@ mod tests {
 
     #[test]
     fn parse_cogp_kv_rejects_missing_geo() {
-        let cogp = CogpMeta {
-            version: COGP_VERSION.into(),
-            levels: vec![],
-        };
+        let cogp = CogpMeta { levels: vec![] };
         let err = try_open_with_kv(vec![KeyValue {
-            key: COGP_METADATA_KEY.into(),
+            key: "cogp".into(),
             value: Some(serde_json::to_string(&cogp).unwrap()),
         }])
         .err()
@@ -685,6 +692,7 @@ mod tests {
             },
         );
         let geo = GeoMeta {
+            lod: None,
             version: GEOPARQUET_VERSION.into(),
             primary_column: "geometry".into(),
             columns: cols,
@@ -695,7 +703,7 @@ mod tests {
         }])
         .err()
         .expect("expected reader construction to fail");
-        assert!(format!("{err}").contains("cogp"), "{err}");
+        assert!(format!("{err}").contains("lod"), "{err}");
     }
 
     #[test]

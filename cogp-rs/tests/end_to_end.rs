@@ -12,7 +12,7 @@ use arrow::array::{
     ArrayRef, BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
+use cogp::convert::{ConvertArgs, PriorityColumnOrder};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
 use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
@@ -114,6 +114,7 @@ fn write_input(path: &std::path::Path) {
         },
     );
     let geo = GeoMeta {
+        lod: None,
         version: "1.1.0".into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -134,21 +135,17 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
     ConvertArgs {
         input: input.to_path_buf(),
         output: output.to_path_buf(),
-        gsd: vec![],
+        resolution: vec![],
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
-        page_row_count: Some(2),
-        dictionary_page_size_limit: None,
-        row_group_max_bytes: None,
-        input_units: InputUnits::Degrees,
-        geometry_column: None,
+        page_row_count: 2,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
         line_visibility_factor: 2,
         polygon_visibility_factor: 4,
-        sort_key: None,
-        sort_order: SortKeyOrder::Desc,
+        priority_column: None,
+        priority_column_order: PriorityColumnOrder::Desc,
     }
 }
 
@@ -172,17 +169,17 @@ fn convert_reader_validate_pipeline() {
     // levels list constraints (validator already checks these but assert here
     // so the reader's view stays in sync).
     let mut prev_rge: Option<i64> = None;
-    let mut prev_gsd: Option<f64> = None;
+    let mut prev_resolution: Option<f64> = None;
     for l in &cogp.levels {
         if let Some(p) = prev_rge {
             assert!(l.row_group_end > p);
         }
         prev_rge = Some(l.row_group_end);
-        assert!(l.gsd > 0.0);
-        if let Some(p) = prev_gsd {
-            assert!(l.gsd < p);
+        assert!(l.resolution > 0.0);
+        if let Some(p) = prev_resolution {
+            assert!(l.resolution < p);
         }
-        prev_gsd = Some(l.gsd);
+        prev_resolution = Some(l.resolution);
     }
     let total_rgs = reader.num_row_groups();
     assert_eq!(
@@ -217,16 +214,16 @@ fn convert_reader_validate_pipeline() {
     let up_to_huge = reader.row_groups_up_to_level(999);
     assert_eq!(up_to_huge.end, total_rgs);
 
-    // `row_groups_up_to_gsd` returns levels whose GSD is ≥ min_gsd (i.e.
-    // coarser than the caller's target). Tiny min_gsd → every level
-    // qualifies; huge min_gsd → no level is that coarse.
-    let everything = reader.row_groups_up_to_gsd(1e-12);
-    let nothing = reader.row_groups_up_to_gsd(1e12);
+    // `row_groups_up_to_resolution` returns levels whose Resolution is ≥ min_resolution (i.e.
+    // coarser than the caller's target). Tiny min_resolution → every level
+    // qualifies; huge min_resolution → no level is that coarse.
+    let everything = reader.row_groups_up_to_resolution(1e-12);
+    let nothing = reader.row_groups_up_to_resolution(1e12);
     assert_eq!(everything.end, total_rgs);
-    assert!(nothing.is_empty());
-    // The coarsest level's own GSD must qualify itself.
-    let coarsest_gsd = reader.levels()[0].gsd;
-    let with_coarsest = reader.row_groups_up_to_gsd(coarsest_gsd);
+    assert_eq!(nothing, reader.row_groups_up_to_level(0));
+    // The coarsest level's own Resolution must qualify itself.
+    let coarsest_resolution = reader.levels()[0].resolution;
+    let with_coarsest = reader.row_groups_up_to_resolution(coarsest_resolution);
     assert!(!with_coarsest.is_empty());
 
     // The dataset spans roughly [0,0]..[10,4] in degrees; an outside query
@@ -264,13 +261,13 @@ fn convert_reader_validate_pipeline() {
 }
 
 #[test]
-fn convert_rejects_non_positive_gsd() {
-    let tmp = TempDir::new("badgsd");
+fn convert_rejects_non_positive_resolution() {
+    let tmp = TempDir::new("badresolution");
     let input = tmp.path().join("input.parquet");
     let output = tmp.path().join("out.parquet");
     write_input(&input);
     let mut args = convert_args(&input, &output);
-    args.gsd = vec![100.0, -1.0];
+    args.resolution = vec![100.0, -1.0];
     let err = cogp::convert::run(args).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -291,21 +288,8 @@ fn convert_rejects_zero_thinning_factor() {
     assert!(format!("{err}").contains("point-thinning-factor"));
 }
 
-#[test]
-fn convert_rejects_zero_dictionary_page_size_limit() {
-    let tmp = TempDir::new("zerodictionarypage");
-    let input = tmp.path().join("input.parquet");
-    let output = tmp.path().join("out.parquet");
-    write_input(&input);
-    let mut args = convert_args(&input, &output);
-    args.dictionary_page_size_limit = Some(0);
-    let err = cogp::convert::run(args).unwrap_err();
-    assert!(format!("{err}").contains("dictionary-page-size-limit"));
-}
-
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead
-/// of recomputing per-feature bboxes from WKB. The reuse path also drops
-/// the original column from the output.
+/// of recomputing per-feature bboxes from WKB, preserving the original column.
 #[test]
 fn convert_reuses_existing_bbox_column() {
     let tmp = TempDir::new("reuse-bbox");
@@ -320,7 +304,11 @@ fn convert_reuses_existing_bbox_column() {
     ]);
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("bbox", DataType::Struct(bbox_struct_fields.clone()), false),
+        Field::new(
+            "extent",
+            DataType::Struct(bbox_struct_fields.clone()),
+            false,
+        ),
         Field::new("geometry", DataType::Binary, false),
     ]));
 
@@ -335,9 +323,9 @@ fn convert_reuses_existing_bbox_column() {
         let y0 = (i / 4) as f64;
         let size = 0.5_f64;
         ids.push(i);
-        xmins.push(x0);
+        xmins.push(x0 + 100.0);
         ymins.push(y0);
-        xmaxs.push(x0 + size);
+        xmaxs.push(x0 + size + 100.0);
         ymaxs.push(y0 + size);
         geoms.push(wkb::polygon(&[
             (x0, y0),
@@ -375,10 +363,10 @@ fn convert_reuses_existing_bbox_column() {
             geometry_types: vec!["Polygon".into()],
             covering: Some(Covering {
                 bbox: BboxCovering {
-                    xmin: vec!["bbox".into(), "xmin".into()],
-                    ymin: vec!["bbox".into(), "ymin".into()],
-                    xmax: vec!["bbox".into(), "xmax".into()],
-                    ymax: vec!["bbox".into(), "ymax".into()],
+                    xmin: vec!["extent".into(), "xmin".into()],
+                    ymin: vec!["extent".into(), "ymin".into()],
+                    xmax: vec!["extent".into(), "xmax".into()],
+                    ymax: vec!["extent".into(), "ymax".into()],
                 },
             }),
             bbox: None,
@@ -386,6 +374,7 @@ fn convert_reuses_existing_bbox_column() {
         },
     );
     let geo = GeoMeta {
+        lod: None,
         version: "1.1.0".into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -404,8 +393,7 @@ fn convert_reuses_existing_bbox_column() {
     cogp::convert::run(convert_args(&input, &output)).unwrap();
     cogp::validate::run(&output).unwrap();
 
-    // Output must still have exactly one `bbox` column (the writer's own), at
-    // the same top-level position and with the same logical field types.
+    // Trust covering metadata even when its column is not named bbox.
     let reader = Reader::open(&output).unwrap();
     let rgs: Vec<usize> = (0..reader.num_row_groups()).collect();
     let f = File::open(&output).unwrap();
@@ -421,23 +409,260 @@ fn convert_reuses_existing_bbox_column() {
             .iter()
             .map(|f| f.name().as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "bbox", "geometry"]
+        vec!["id", "extent", "geometry"]
     );
     assert!(schema.field_with_name("id").is_ok());
-    assert!(schema.field_with_name("bbox").is_ok());
+    assert!(schema.field_with_name("extent").is_ok());
     assert!(schema.field_with_name("geometry").is_ok());
+    // Deliberately distinct covering values prove they were trusted, not recomputed from WKB.
+    assert_eq!(
+        reader.geo_meta().columns["geometry"].bbox.as_ref().unwrap()[0],
+        100.0
+    );
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let extent = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let xmin = extent
+            .column_by_name("xmin")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            assert_eq!(xmin.value(i), (ids.value(i) % 4) as f64 + 100.0);
+        }
+    }
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 16);
+    assert_eq!(
+        reader.geo_meta().columns["geometry"]
+            .covering
+            .as_ref()
+            .unwrap()
+            .bbox
+            .xmin,
+        vec!["extent", "xmin"]
+    );
+    // Rewriting must reuse the same covering again, without growing the schema.
+    let rewritten = tmp.path().join("rewritten.parquet");
+    cogp::convert::run(convert_args(&output, &rewritten)).unwrap();
+    let reread = Reader::open(&rewritten).unwrap();
+    assert_eq!(reread.arrow_metadata().schema().fields(), schema.fields());
 }
 
 #[test]
-fn convert_explicit_gsd_path() {
-    let tmp = TempDir::new("explicit-gsd");
+fn convert_explicit_resolution_path() {
+    let tmp = TempDir::new("explicit-resolution");
     let input = tmp.path().join("input.parquet");
     let output = tmp.path().join("out.cogp.parquet");
     write_input(&input);
     let mut args = convert_args(&input, &output);
-    args.gsd = vec![1000.0, 100.0, 10.0];
+    args.resolution = vec![1000.0, 100.0, 10.0];
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
+}
+
+#[test]
+fn preserves_null_empty_duplicate_rows_and_crs_metadata() {
+    use arrow::array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let tmp = TempDir::new("lossless");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geometry", DataType::Binary, true),
+        Field::new("bbox", DataType::Utf8, true),
+    ]));
+    let polygon = wkb::polygon(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)]);
+    let empty = vec![1, 3, 0, 0, 0, 0, 0, 0, 0];
+    let geometries = vec![
+        Some(polygon.as_slice()),
+        None,
+        Some(empty.as_slice()),
+        Some(polygon.as_slice()),
+    ];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(BinaryArray::from(geometries.clone())),
+            Arc::new(StringArray::from(vec![
+                Some("keep"),
+                None,
+                Some("empty"),
+                Some("keep"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let geo = serde_json::json!({"version":"1.1.0", "primary_column":"geometry", "columns": {
+        "geometry": {"encoding":"WKB", "geometry_types":["Polygon"], "crs":null, "edges":"planar", "future":"preserve"}
+    }, "coarse_to_fine": {"levels":[{"row_group_end":999,"resolution":42}]}});
+    let mut writer = ArrowWriter::try_new(File::create(&input).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue {
+        key: "geo".into(),
+        value: Some(geo.to_string()),
+    });
+    writer.close().unwrap();
+    let mut args = convert_args(&input, &output);
+    args.resolution = vec![1.0, 0.1];
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
+    let kv = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap();
+    assert!(!kv.iter().any(|e| e.key == "cogp"));
+    let result: serde_json::Value = serde_json::from_str(
+        kv.iter()
+            .find(|e| e.key == "geo")
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result["columns"]["geometry"]["crs"],
+        serde_json::Value::Null
+    );
+    assert_eq!(result["columns"]["geometry"]["future"], "preserve");
+    assert!(result["lod"].get("version").is_none());
+    assert!(result.get("coarse_to_fine").is_none());
+    let mut actual = Vec::new();
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let geom = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let attr = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            actual.push((
+                (!geom.is_null(i)).then(|| geom.value(i).to_vec()),
+                (!attr.is_null(i)).then(|| attr.value(i).to_string()),
+            ));
+        }
+    }
+    let mut expected = vec![
+        (Some(polygon.clone()), Some("keep".into())),
+        (None, None),
+        (Some(empty), Some("empty".into())),
+        (Some(polygon), Some("keep".into())),
+    ];
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn empty_input_omits_extension() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let tmp = TempDir::new("empty");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "geometry",
+        DataType::Binary,
+        true,
+    )]));
+    let mut writer = ArrowWriter::try_new(File::create(&input).unwrap(), schema, None).unwrap();
+    writer.append_key_value_metadata(KeyValue { key: "geo".into(), value: Some(serde_json::json!({
+        "version":"1.1.0", "primary_column":"geometry", "columns":{"geometry":{"encoding":"WKB","geometry_types":[]}},
+        "coarse_to_fine":{"levels":[{"row_group_end":0,"resolution":1}]}
+    }).to_string()) });
+    writer.close().unwrap();
+    cogp::convert::run(convert_args(&input, &output)).unwrap();
+    cogp::validate::run(&output).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
+    assert_eq!(builder.metadata().file_metadata().num_rows(), 0);
+    let kv = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap();
+    let geo: serde_json::Value = serde_json::from_str(
+        kv.iter()
+            .find(|e| e.key == "geo")
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(geo.get("lod").is_none());
+    assert!(geo.get("coarse_to_fine").is_none());
+}
+
+#[test]
+fn cli_defaults_write_page_indexes() {
+    let tmp = TempDir::new("cli-default-pages");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    write_input(&input);
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
+        .arg("convert")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
+    for group in reader.parquet_metadata().row_groups() {
+        assert!(group
+            .columns()
+            .iter()
+            .all(|c| c.offset_index_offset().is_some()));
+        assert_eq!(
+            group
+                .columns()
+                .iter()
+                .filter(|c| {
+                    c.column_path().parts().first().map(String::as_str) == Some("bbox")
+                        && c.column_index_offset().is_some()
+                })
+                .count(),
+            4
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_retired_options() {
+    for flag in [
+        "--row-group-max-bytes",
+        "--dictionary-page-size-limit",
+        "--input-units",
+        "--geometry-column",
+        "--sort-key",
+        "--sort-order",
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
+            .args(["convert", "input.parquet", "output.parquet", flag, "1"])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");
+    }
 }

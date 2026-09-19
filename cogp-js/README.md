@@ -3,7 +3,7 @@
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
-area and ground sample distance. Bbox reads use covering-column statistics to
+area and rendering resolution in primary geometry CRS units. Bbox reads use covering-column statistics to
 prune row groups, then lazily fetch Parquet PageIndexes to prune pages inside
 the surviving groups. Files without PageIndexes fall back safely to Row Group
 reads. An exact per-feature bbox filter is applied to every surviving row.
@@ -58,5 +58,30 @@ Build the browser demo with:
 pnpm --filter cogp-demo build
 ```
 
-The public entry point exports `CogpReader`, metadata parsing helpers,
-`selectLevelByGsd`, and their associated TypeScript types.
+The public entry point exports `CogpReader` and its associated configuration and
+metadata types. Metadata parsing, level-selection helpers, and cache construction
+remain internal. Read levels through `reader.geo.lod.levels`.
+Files must provide `geo.lod.levels`; there is no fallback to `geo.coarse_to_fine`.
+`CogpReader.fromAsyncBuffer(file)` accepts a custom byte source without a URL.
+
+```ts
+const reader = await CogpReader.open(url);
+const rows = await reader.readRows({
+  maxLevel: reader.selectLevel(targetResolution), // primary geometry CRS units
+  bbox: [xmin, ymin, xmax, ymax],
+  columns: [reader.primaryGeometryColumn],
+  maxRows: 10_000,
+  maxGeometryBytes: 8 * 1024 * 1024,
+});
+```
+
+`maxGeometryBytes` limits cumulative raw WKB bytes across returned geometry
+columns, not bytes per row or HTTP transfer size. A row exceeding the remaining
+budget stops the read before decoding that row. Both output caps are optional.
+
+Readers validate all level boundaries against the footer before selecting a prefix.
+Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be
+regenerated with the current converter. Bbox covering and PageIndexes are optional.
+Without covering, bbox queries decode primary WKB and filter its envelope.
+The demo expects longitude/latitude coordinates and passes degrees per pixel.
+Display prefixes are partial selections, not complete analytical query results.

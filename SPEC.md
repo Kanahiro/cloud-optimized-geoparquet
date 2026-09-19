@@ -1,269 +1,128 @@
----
-title: Cloud Optimized GeoParquet Profile (COGP)
-version: "0.1.1"
-status: Draft
-scope: A cloud-optimized progressive rendering profile for GeoParquet 1.1
-license: CC BY 4.0
----
+# [Proposal] Level of Detail (LoD) extension
 
-# Cloud Optimized GeoParquet Profile (COGP)
+This document proposes an optional GeoParquet Level of Detail (LoD) extension for progressive feature access.
 
-## 1. Summary
+## Motivation
 
-Cloud Optimized GeoParquet Profile, abbreviated as COGP, is a GeoParquet profile for progressive map rendering and partial access over HTTP range requests or object storage.
+Spatial ordering and bounding box statistics help readers find features within a viewport. They do not tell a reader how much of that viewport's data is useful at a given display scale. A world view may intersect almost every row group even though only a small subset of features can be distinguished on screen.
 
-A COGP file is:
+This proposal adds a second selection dimension: rendering resolution. Features useful at coarse resolutions are stored in earlier row groups; later row groups add finer detail. Small metadata describes cumulative row group prefixes, allowing readers to fetch a coarse view first and progressively add features as needed.
 
-1. a valid GeoParquet 1.1 file;
-2. physically ordered from coarse to fine rendering detail;
-3. organized so that each level ends at a Parquet row group boundary;
-4. annotated with minimal metadata describing those level boundaries.
+## Scope
 
-COGP is feature-level: it reorders features across row groups; it does not simplify, aggregate, or duplicate them.
+The extension describes the physical layout of one GeoParquet file with respect to its primary geometry column. It preserves the table's features, geometries, and attributes, while permitting their order to change. Each input row occurs exactly once in the output, including when the input itself contains duplicate-valued rows.
 
-## 2. Motivation
+The extension does not define a new geometry encoding, tile matrix, spatial index, or query language. It does not require a per-row level column, sidecar index, or duplicated rows for each resolution.
 
-GeoParquet is well suited for geospatial analytics and cloud storage, but ordinary GeoParquet files are not necessarily optimized for progressive visual access.
+The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
 
-For map rendering, tile serving, and viewport-driven applications, a reader often wants to:
+## Physical layout
 
-1. read a coarse overview first;
-2. stop when enough detail has been loaded;
-3. avoid reading fine-grained features that cannot be independently rendered at the current display scale.
+A file using this extension MUST conform to the [GeoParquet specification](geoparquet.md).
 
-COGP defines a conservative layout convention for this use case while keeping the file readable as ordinary GeoParquet.
+Features MUST be assigned to ordered detail levels, from coarse to fine. A level represents the features selected for display at a nominal rendering resolution. Earlier levels should provide a useful view of the dataset; later levels may add features that the producer has deferred at coarser resolutions.
 
-## 3. Core Concept
+Each input row MUST be stored exactly once. Applying this layout MUST NOT simplify, aggregate, or otherwise change its geometry or attribute values. Derived rendering representations may be defined separately, but are not selected by this extension.
 
-The core idea is:
+Rows introduced by each level MUST occupy consecutive whole Parquet row groups. A row group MUST NOT straddle a level boundary. Row groups MUST occur in coarse-to-fine order in the Parquet footer. Readers use the footer's column chunk offsets for access.
 
-> Earlier row groups contain features that are independently meaningful at coarse display resolutions. Later row groups add features that are only independently meaningful at finer display resolutions.
+A level selects **all row groups from zero through its boundary**, inclusive. Later levels may add rows to that prefix; they do not replace the earlier rows. The last level includes the entire table.
 
-COGP is a **feature-level progressive subset**, not a geometry-decimation scheme:
-
-* each source feature is placed, in full, in exactly one row group;
-* a feature's geometry is preserved verbatim — vertices, bends, and detail within a feature are never removed or simplified by this profile;
-* features are assigned to the coarsest level at which they become independently renderable as whole features.
-
-Unlike COG (TIFF) overviews or tile pyramids, COGP does not duplicate features across levels, and does not produce simplified geometries.
-
-A reader can choose how many leading row groups to load based on its target rendering resolution.
-
-For example:
-
-* at a low zoom level, only the first few row groups may be needed;
-* at a high zoom level, more row groups are read;
-* for a small viewport, bbox covering and row group statistics can further prune unnecessary row groups.
-
-## 4. Terminology
-
-### 4.1 Level
-
-A logical rendering detail level.
-
-Levels are represented by metadata and row group boundaries. This profile does not require a `level`, `zoom`, or `zoomlevel` column in the data.
-
-### 4.2 Ground sample distance (GSD)
-
-`gsd` is the approximate smallest ground distance represented as an independently meaningful unit at this level.
-
-The term is borrowed from raster imagery, where GSD denotes the ground distance represented by one pixel. In COGP it is used by analogy for vector data: the threshold below which features are not represented as independently meaningful at this level.
-
-The value is always expressed in meters of ground distance at the geographic location of the features, independent of the CRS or units used by the underlying data. For example, a file in EPSG:4326 (degrees) still expresses this value in meters.
-
-For example, a level with `gsd` equal to `1000` represents independently meaningful units at approximately 1000 meters or larger, while finer units are deferred to later levels.
-
-Because COGP is feature-level (see Section 3), `gsd` describes the threshold at which whole features become independently meaningful, not the threshold at which individual vertices within a feature are kept or removed. A feature placed in a coarse level retains its full geometry, including fine internal detail.
-
-This may apply to deferring features such as:
-
-* a pair of point features too close together to be visually distinguished;
-* a short linear feature whose overall length is too small to form a visually meaningful shape;
-* a small polygon feature that does not form a meaningful rendered shape;
-* a polygon feature too small to form at least a minimal visible area at the target display scale.
-
-This value is rendering-oriented. It does not guarantee positional accuracy, topological validity, or analytical precision.
-
-## 5. Requirements
-
-A COGP v0.1.1 file MUST satisfy the following requirements.
-
-### 5.1 GeoParquet compatibility
-
-The file MUST be a valid GeoParquet 1.1 file.
-
-The file MUST declare bounding box covering metadata under the primary geometry column, at the GeoParquet metadata path:
+For example, a file with eight row groups could have this layout:
 
 ```text
-geo.columns[<primary_column>].covering.bbox
+Row group:          0 | 1  2 | 3  4  5  6  7
+New features:   coarse | medium | fine
+
+Coarse selection: [0]
+Medium selection: [0, 1, 2]
+Fine selection:   [0, 1, 2, 3, 4, 5, 6, 7]
 ```
 
-where `<primary_column>` is the value of the GeoParquet `primary_column` field.
+Within each level's newly introduced rows, producers SHOULD spatially cluster features to improve spatial pruning. The clustering method is not prescribed: Hilbert ordering, quadtree ordering, and STR packing are possible choices. A global spatial sort that interleaves detail levels would invalidate the declared layout.
 
-Each of the bounding box columns (`xmin`, `ymin`, `xmax`, `ymax`) referenced by this covering MUST have Parquet row group min/max statistics present, so that readers can perform spatial pruning at row group granularity.
+## Metadata
 
-For COGP v0.1.1, geometries in the primary geometry column MUST NOT cross the antimeridian in a way that makes GeoParquet bbox covering unsuitable for spatial pruning. Producers SHOULD split such geometries or use another representation before writing a COGP file.
+The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet file metadata stored under the `geo` key. When present, this object MUST contain the fields below. Its levels apply to the primary geometry column identified by `geo.primary_column`.
 
-### 5.2 Physical ordering
+| Field | Type | Description |
+| --- | --- | --- |
+| `levels` | array of objects | **REQUIRED.** Non-empty list of levels, ordered from coarse to fine. |
+| `levels[].row_group_end` | integer | **REQUIRED.** Zero-based, inclusive end of the selected row group prefix. |
+| `levels[].resolution` | number | **REQUIRED.** Positive, finite nominal rendering resolution in the primary geometry column's CRS units. |
 
-The file MUST be ordered from coarse to fine rendering detail.
-
-Earlier row groups MUST contain features that are independently meaningful at coarser render resolutions.
-
-Later row groups MUST add features that are independently meaningful only at finer render resolutions.
-
-Every source feature MUST appear in exactly one row group. Feature geometry and attributes MUST NOT be simplified or aggregated.
-
-Level ordering is defined with respect to the primary geometry column. Non-primary geometry columns, if present, are not constrained by this profile.
-
-Within each level, features SHOULD be spatially clustered so that row group bounding boxes are tight and spatial pruning by readers is effective.
-
-Producers SHOULD spatially sort or pack features within each level before forming row groups. Suitable approaches include, but are not limited to, ordering features by a spatial filling curve such as a Hilbert curve, ordering features by Quadkey or another quadtree-derived key, or using a packed spatial index layout such as STR packing.
-
-### 5.3 Level boundaries
-
-Each level MUST end at a Parquet row group boundary.
-
-The file-level metadata MUST contain a non-empty ordered list of level entries.
-
-Each level entry MUST contain:
-
-* `row_group_end`
-* `gsd`
-
-`row_group_end` MUST be a JSON integer satisfying `0 <= row_group_end < num_row_groups`, where `num_row_groups` is the number of Parquet row groups in the file. Row group indices are zero-based.
-
-`row_group_end` values MUST be strictly monotonically increasing across the `levels` array.
-
-The first level entry covers row groups from row group `0` through its `row_group_end`, inclusive.
-
-The row groups belonging to the second and later levels are the row groups after the previous level entry's `row_group_end` through the current level entry's `row_group_end`, inclusive.
-
-The final `row_group_end` value MUST equal `num_row_groups - 1`, so that the levels collectively cover every row group in the file.
-
-`gsd` MUST be a positive JSON number.
-
-`gsd` values MUST be strictly monotonically decreasing from coarse to fine levels.
-
-### 5.4 Progressive access layout
-
-Producers SHOULD choose row group sizes so that each level prefix can be fetched and rendered with bounded latency over HTTP range requests or object storage.
-
-Producers SHOULD avoid placing so many bytes or features in an early row group that the first level is no longer useful as a coarse overview.
-
-This profile does not mandate a specific compressed byte size, feature count, or row group sizing algorithm.
-
-## 6. Metadata
-
-The file MUST include a Parquet file-level key-value metadata entry named:
-
-```text
-cogp
-```
-
-The value MUST be a UTF-8 JSON object.
-
-### 6.1 Versioning and forward compatibility
-
-The `version` field is a string of the form `MAJOR.MINOR.PATCH` and identifies the COGP profile version. It follows semantic versioning:
-
-* a minor version increment (for example `0.1.0` to `0.2.0`, or `1.0.0` to `1.1.0`) MAY add new optional fields, but MUST NOT change the meaning or requirements of existing fields;
-* a major version increment (for example `0.x.y` to `1.0.0`, or `1.x.y` to `2.0.0`) MAY introduce breaking changes.
-
-Readers MUST ignore unrecognized fields in `cogp` metadata so that files written against a newer minor version of the profile remain readable.
-
-Readers MUST NOT interpret `cogp` metadata with an unsupported major version as conforming to this version of the profile.
-
-### 6.2 Minimal example
+Example of the `geo.lod` object for the eight-row-group file above:
 
 ```json
 {
-  "version": "0.1.1",
   "levels": [
-    {
-      "row_group_end": 0,
-      "gsd": 1000
-    },
-    {
-      "row_group_end": 3,
-      "gsd": 500
-    },
-    {
-      "row_group_end": 12,
-      "gsd": 100
-    }
+    { "row_group_end": 0, "resolution": 1000 },
+    { "row_group_end": 2, "resolution": 100 },
+    { "row_group_end": 7, "resolution": 10 }
   ]
 }
 ```
 
-### 6.3 Field definitions
+### Boundaries
 
-| Field                  | Required | Description                                                                                                       |
-| ---------------------- | -------: | ----------------------------------------------------------------------------------------------------------------- |
-| `version`              |      Yes | Profile metadata version.                                                                                         |
-| `levels`                 |      Yes | Ordered level entries from coarse to fine.                                                                        |
-| `levels[].row_group_end` |      Yes | Inclusive row group index ending this level.                                                                      |
-| `levels[].gsd`           |      Yes | Approximate smallest independently meaningful ground distance represented by this level, in meters.                |
+For a file containing `N` row groups:
 
-## 7. Reader guidance (non-normative)
+* Each `row_group_end` MUST satisfy `0 <= row_group_end < N`.
+* Boundaries MUST be non-decreasing.
+* The final boundary MUST equal `N - 1`.
+* Empty files MUST omit this extension. A non-empty file MAY declare a single level covering all its row groups.
 
-COGP metadata describes available levels but does not prescribe how a reader uses them. This section sketches typical patterns.
+Boundaries refer to this file's footer, not to row numbers, byte offsets, or row groups in another file. Partitioned datasets apply the extension independently to each file; this draft does not define a dataset-wide level index.
 
-### 7.1 Level selection
+### Resolution
 
-A renderer can base the choice of level on zoom level, map scale, screen-space error, or any application-specific budget for bytes, features, or latency.
+`resolution` is the nominal rendering resolution for which a feature prefix is intended to be rendered.
 
-One common strategy is to derive a target ground sample distance from the current display scale and select the finest level whose `gsd` is still coarser than or equal to that target. Because `levels` are ordered from coarse to fine and `gsd` values strictly decrease, this is the last level satisfying:
+`resolution` MUST be expressed in the horizontal coordinate units of the primary geometry column's CRS. For example, a CRS using meters expresses resolution in meters, while a geographic CRS using degrees expresses it in degrees. Values MUST strictly decrease from coarse to fine.
 
-```text
-gsd >= target_gsd
-```
+Resolution is a display hint. It is not a bound on geometric error, positional accuracy, feature spacing, or analytical precision. The extension does not prescribe a projection, a zoom-to-resolution formula, or a pixel size. A renderer decides how its current display scale maps to a target resolution.
 
-If no level satisfies this condition, the target resolution is coarser than the coarsest level in the file, and the reader can select the first level.
+The target resolution is interpreted in the same CRS units as `resolution`. If the CRS is unknown, `resolution` uses the primary geometry's coordinate units without assigning them a physical unit.
 
-### 7.2 Reading the selected prefix
+### Metadata handling
 
-The prefix of row groups from `0` through the selected level's `row_group_end` is the minimal set of features needed to produce a meaningful render at the target display scale. Features that would not be visually meaningful at that scale are deferred to later levels and are not fetched. The prefix is the data appropriate for the chosen scale, not a preview to be replaced.
+Readers that do not support this extension can ignore `lod` and read the file as ordinary GeoParquet. Extension-aware readers MUST validate the required fields and boundary constraints before using the levels to exclude row groups. If the metadata is invalid, readers MUST NOT use it for prefix selection and SHOULD report the problem. They MAY fall back to ordinary GeoParquet access.
 
-Two reading styles are both valid:
+Readers MUST ignore unrecognized fields within `lod`. This proposal does not introduce an independent extension version field.
 
-* **Bounded read.** Fetch exactly the selected prefix and stop. Total transfer volume is bounded by the selected scale, which suits bandwidth-sensitive clients such as WebGIS applications.
-* **Progressive render.** Render features incrementally as row groups arrive, drawing coarser row groups first. This suits interactive viewers that want first paint as early as possible.
+## Reader behavior
 
-Implementations typically fetch the Parquet footer to obtain `cogp` metadata and per-row-group statistics, then issue HTTP range requests for the row groups in `0..row_group_end` — in parallel or in order, with rendering either streamed or deferred to completion.
+A typical rendering reader:
 
-For viewport-driven applications, two complementary spatial filters can apply within the selected prefix:
+1. Reads the Parquet footer and validates the extension metadata against the row group count.
+2. Chooses a level for its target resolution or rendering budget.
+3. Applies row group spatial pruning within the selected prefix, from `0` through `row_group_end`.
+4. Can further prune pages within the retained row groups when page indexes are available.
+5. Fetches the required geometry and attribute data and evaluates the per-feature predicate.
+6. Fetches additional data when finer detail or a different viewport is requested, reusing cached data where possible.
 
-* **Row group pruning.** Using per-row-group min/max statistics of the bbox covering columns (Section 5.1), row groups whose bbox does not intersect the viewport can be skipped, avoiding the range request entirely.
-* **Per-feature bbox filter.** Within a fetched row group, the bbox covering columns can be evaluated as a predicate to skip individual features. This is the standard GeoParquet bbox covering filter and remains fully effective in COGP files.
+One possible level-selection policy is to choose the finest level whose `resolution` is greater than or equal to the target. Clamp to the first level when the target is coarser than every level, and to the last when it is finer than every level. With the example above, a target of 250 CRS units selects the level with `resolution: 1000`; a target of 100 CRS units selects the level with `resolution: 100`. Applications may choose a finer level when visual completeness matters more than transfer cost.
 
-If the view changes — for example, the user zooms in — the reader fetches only the additional row groups it needs. Because COGP does not duplicate features across levels, previously-read row groups remain valid.
+A prefix is a partial feature selection. Readers MUST NOT treat it as a complete query result unless the selected prefix includes every row group that could contribute to that query. Analytical operations such as counts, sums, and spatial joins must consider all potentially matching row groups, independently of display resolution. Coarse prefixes are not statistically representative samples.
 
-## 8. Validation
+Reading a prefix of row groups does not mean downloading a standalone prefix of the file's bytes. The complete Parquet footer is still needed, and column projection and spatial pruning may produce multiple range requests. An ordinary reader can ignore the extension and read the complete table; the extension does not guarantee that such a reader will visit row groups in order.
 
-A validator verifies that the file meets all requirements stated in Section 5.
+## Producer guidance
 
-The semantic correctness of coarse-to-fine ordering — whether the features placed in earlier row groups are genuinely meaningful at coarser display resolutions — is not fully machine-verifiable. Validators can only check structural and metadata conformance. Achieving meaningful level semantics is a producer responsibility.
+The assignment of features to levels is intentionally producer-defined. Point data can use spatial thinning; lines and polygons can use geometric size or visibility criteria; thematic datasets can use application-specific importance. These choices affect rendering quality but do not change the reader interface.
 
-A validator MAY also compute non-conformance quality metrics such as row group touch count for sample bbox queries, prefix rendering latency, spatial spread of coarse levels, or spatial clustering quality within each level.
+Producers SHOULD distribute coarse-level features across the dataset's spatial extent where that is meaningful. Merely moving one spatial corner of a globally sorted dataset into the first level rarely provides a useful overview. Features that cannot be assigned a meaningful display scale, such as null or empty geometries, MUST still be preserved and can be assigned to the final level.
 
-## 9. Non-goals
+Producers SHOULD keep early row groups small enough for responsive initial access and provide spatial statistics appropriate to the GeoParquet version. GeoParquet 1.1 bbox covering statistics and GeoParquet 2.0 native geospatial statistics can support spatial pruning. Page indexes can refine access further. Readers must use conservative pruning and handle unavailable statistics without discarding potential matches.
 
-This profile does not define:
+No compression codec, row group size, page size, thinning algorithm, or spatial ordering algorithm is required. These choices depend on the dataset and expected access pattern. Coarse-to-fine ordering can reduce locality across levels compared with a single global spatial sort, so producers should measure both progressive rendering and full-resolution spatial queries.
 
-* a new geometry encoding;
-* a new CRS model;
-* a new tile matrix set;
-* a mandatory simplification algorithm;
-* a mandatory thinning algorithm;
-* a mandatory spatial clustering algorithm;
-* analytical accuracy guarantees;
-* topology preservation guarantees;
-* standalone prefix-Parquet semantics;
-* SQL query semantics.
+This layout reduces the number of features fetched at coarse scales. It does not reduce the vertex count of a selected feature: a large detailed polygon can still dominate transfer and decoding cost. Geometry overviews are complementary and should be specified separately.
 
-## License
+Any operation that changes row order, row group boundaries, feature membership, or the primary geometry MUST remove or regenerate the extension metadata. Copying it unchanged through a generic rewrite can silently produce incomplete rendering results.
 
-This specification is licensed under [Creative Commons Attribution 4.0
-International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
-See [`LICENSE-SPEC`](./LICENSE-SPEC) for the full license text.
+## Validation
+
+A structural validator can check the metadata types, non-empty levels, positive finite and strictly decreasing resolutions, and non-decreasing row group boundaries. It can verify that each boundary is within the footer's row group count and that the final boundary includes the last row group. It can also validate the underlying GeoParquet file.
+
+Structural validation confirms only that the metadata is consistent with the file's row groups. It does not verify that every source row was preserved, nor that early levels form a useful coarse view; both require comparison with the source data or dataset-specific evaluation.

@@ -8,7 +8,7 @@ A COGP file is a valid [GeoParquet 1.1](https://geoparquet.org/) file whose row 
 
 COGP is **feature-level**: it reorders features across row groups; it does not simplify, aggregate, or duplicate them. Each source feature appears in exactly one row group, with its geometry preserved verbatim.
 
-A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
+A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `geo.lod` metadata and read the file as ordinary GeoParquet 1.1.
 
 ## Design influences
 
@@ -28,7 +28,7 @@ COGP is a small, conservative layout convention that enables this without changi
 
 ## Benefits
 
-- **Faster overview rendering, even for non-COGP-aware software.** Because coarse-detail features are physically placed at the front of the file, any GeoParquet 1.1 reader that streams row groups in order will see a usable overview almost immediately, without needing to understand the `cogp` metadata.
+- **Faster overview rendering, even for non-COGP-aware software.** Because coarse-detail features are physically placed at the front of the file, any GeoParquet 1.1 reader that streams row groups in order will see a usable overview almost immediately, without needing to understand the `geo.lod` metadata.
 - **Efficient AoI-based spatial queries, even for non-COGP-aware software.** The layout preserves GeoParquet 1.1 semantics and row group statistics, so existing engines can still prune by bounding box and answer area-of-interest queries efficiently.
 - **Minimal, resolution-targeted streaming for COGP-aware software.** A COGP-aware reader can consult the level metadata and fetch only the leading row groups required for its target geographic resolution, enabling fast progressive streaming with the smallest possible byte footprint.
 
@@ -48,9 +48,9 @@ https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
 ## Sample data
 
-- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/pois.cogp.parquet) (OpenStreetMap)
-- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/segments.cogp.parquet) (OvertureMaps)
-- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/buildings.cogp.parquet) (OvertureMaps)
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/buildings.cogp.parquet) (OvertureMaps)
 
 ## When COGP works well
 
@@ -74,6 +74,77 @@ The implementations remain independently publishable. The repository root owns
 shared dependency locks, CI, releases, and development commands so changes to the
 profile can be tested against both implementations together.
 
+## Writer implementation
+
+[`SPEC.md`](./SPEC.md) defines the format contract. The following describes the
+current [`cogp-rs` writer](./cogp-rs/src/convert.rs): these algorithms, defaults,
+and tuning options are implementation choices, not additional format requirements.
+See the [CLI reference](./cogp-rs/README.md#convert) for conversion options.
+
+### Feature assignment to levels
+
+The writer assigns each input row to one level before spatial sorting. Explicit
+`--resolution` values use the primary geometry CRS units. By default, it derives
+17 resolutions from Web Mercator zooms 0–16 using
+`40,075,016.68557849 / (1024 × 2^zoom)` meters at the equator, then converts those
+hints to CRS units. Geographic coordinates use an approximate 111,320 meters per
+degree; this is an equatorial scale heuristic, without latitude correction.
+Coordinates themselves are not reprojected or quantized.
+
+- **Points / MultiPoints:** choose one remaining feature per bbox-center grid
+  cell, with cell width `4 × resolution` by default. Points already assigned to
+  coarser levels block their cells at the current resolution. Optional
+  `--priority-column` ranks candidates, followed by bbox diagonal and a deterministic
+  row-index hash as tie-breakers.
+- **Lines / polygons:** assign each feature to the first level where its bbox
+  diagonal reaches `4 × resolution` for both lines and polygons
+  by default. Non-empty zero-extent geometries are eligible from the coarsest
+  level. Lines and polygons do not compete for grid cells.
+- **Remaining rows:** place all deferred rows, including null/empty geometries,
+  in the finest level. No rows are discarded. Levels introducing no rows are
+  omitted from the emitted metadata.
+
+### Spatial sorting and Row Group construction
+
+Within each level, the writer uses a recursive Sort-Tile-Recursive (STR) packing
+variant. It finds the longer axis of the combined bbox, sorts feature bbox
+centers along that axis, and splits at a multiple of the target Row Group row
+count. Recursion stops when a partition fits in one Row Group. Sort directions
+follow a snake traversal, with alternating starting corners between levels, to
+keep consecutive groups spatially close. Geometry and attribute values are
+preserved while row order changes.
+
+`--row-group-size` defaults to **65,536 rows**. Each level is written in order,
+and the writer flushes at every level boundary, so a Row Group never mixes
+levels. The final group of a level may be smaller. The metadata records the
+actual zero-based index of the last flushed Row Group for each level.
+
+### Bbox covering, pages, and encoding
+
+Existing `covering.bbox` metadata determines which columns the writer uses;
+it trusts and preserves those paths and values. If covering is absent, it
+computes bboxes from geometry and adds a collision-free column named `bbox`,
+`bbox_`, etc. An existing column merely named `bbox` has no special meaning.
+
+The writer always spatially packs page-sized intervals within each Row Group,
+with `--page-row-count` defaulting to **2,048 rows**. It writes column-chunk
+statistics, page statistics / ColumnIndexes for covering bbox leaves, and
+OffsetIndexes for all leaves. Readers without Page Index support can still read
+complete column chunks.
+
+Compression is **ZSTD level 3**. Dictionary encoding is disabled for the primary
+WKB geometry and covering bbox leaves. Other columns retain the Parquet writer's
+default dictionary behavior.
+
+All three visibility factors default to **4**, expressing a common four-resolution-
+unit scale. Points use that scale as grid width; lines and polygons use it as a
+bbox-diagonal threshold, so equal factors do not imply equal visual density.
+Each factor remains independently configurable.
+
+The published v1.0.0 samples were generated with 65,536-row groups, 2,048-row
+pages, and point/line/polygon factors **4/4/4**. Their level metadata is stored
+in `geo.lod.levels`.
+
 ## Development
 
 Install JavaScript dependencies once from the repository root:
@@ -95,13 +166,11 @@ See each implementation's README for its public API and focused workflows.
 ## Roadmap
 
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
-- [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [x] Reader implementation: a client that interprets the `geo.lod` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [ ] Propose the level-of-detail layout as a GeoParquet extension.
+- [ ] Add geometry overviews for scale-dependent rendering while preserving the lossless primary geometry.
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
-
-## Status and feedback
-
-COGP v0.1.1 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
 
 ## License
 

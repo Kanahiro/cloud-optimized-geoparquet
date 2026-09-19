@@ -1,25 +1,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const COGP_METADATA_KEY: &str = "cogp";
 pub const GEO_METADATA_KEY: &str = "geo";
-pub const COGP_VERSION: &str = "0.1.1";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CogpMeta {
-    pub version: String,
     pub levels: Vec<Level>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub row_group_end: i64,
-    pub gsd: f64,
+    pub resolution: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lod: Option<CogpMeta>,
     pub version: String,
     pub primary_column: String,
     pub columns: BTreeMap<String, GeoColumn>,
@@ -50,26 +49,81 @@ pub struct BboxCovering {
     pub ymax: Vec<String>,
 }
 
+impl CogpMeta {
+    /// Validate before using a prefix to exclude any row groups.
+    pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(num_row_groups > 0, "empty files must omit geo.lod");
+        anyhow::ensure!(!self.levels.is_empty(), "geo.lod.levels must be non-empty");
+        for (i, level) in self.levels.iter().enumerate() {
+            anyhow::ensure!(
+                level.row_group_end >= 0 && (level.row_group_end as usize) < num_row_groups,
+                "levels[{i}].row_group_end out of range"
+            );
+            anyhow::ensure!(
+                level.resolution.is_finite() && level.resolution > 0.0,
+                "levels[{i}].resolution must be positive and finite"
+            );
+            if i > 0 {
+                let prev = &self.levels[i - 1];
+                anyhow::ensure!(
+                    level.row_group_end >= prev.row_group_end,
+                    "levels[{i}].row_group_end must be non-decreasing"
+                );
+                anyhow::ensure!(
+                    level.resolution < prev.resolution,
+                    "levels[{i}].resolution must strictly decrease"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.levels.last().unwrap().row_group_end as usize == num_row_groups - 1,
+            "final row_group_end must equal num_row_groups - 1"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
+    fn only_lod_supplies_levels() {
+        let mut value = json!({
+            "version": "1.1.0", "primary_column": "geometry", "columns": {},
+            "coarse_to_fine": {"levels": [{"row_group_end": 0, "resolution": 1.0}]}
+        });
+        let parsed: GeoMeta = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.lod.is_none());
+        value["lod"] = json!({"levels": []});
+        let parsed: GeoMeta = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.lod.unwrap().validate(1).is_err());
+        value["lod"] = value["coarse_to_fine"].clone();
+        let parsed: GeoMeta = serde_json::from_value(value).unwrap();
+        parsed.lod.unwrap().validate(1).unwrap();
+    }
+
+    #[test]
     fn cogp_meta_roundtrip() {
         let m = CogpMeta {
-            version: COGP_VERSION.to_string(),
             levels: vec![
-                Level { row_group_end: 0, gsd: 1000.0 },
-                Level { row_group_end: 3, gsd: 250.0 },
+                Level {
+                    row_group_end: 0,
+                    resolution: 1000.0,
+                },
+                Level {
+                    row_group_end: 3,
+                    resolution: 250.0,
+                },
             ],
         };
         let s = serde_json::to_string(&m).unwrap();
         let parsed: CogpMeta = serde_json::from_str(&s).unwrap();
-        assert_eq!(parsed.version, COGP_VERSION);
+
         assert_eq!(parsed.levels.len(), 2);
         assert_eq!(parsed.levels[0].row_group_end, 0);
-        assert_eq!(parsed.levels[1].gsd, 250.0);
+        assert_eq!(parsed.levels[1].resolution, 250.0);
     }
 
     #[test]
@@ -122,10 +176,7 @@ mod tests {
     fn version_constants_match_spec() {
         // Catch accidental edits — these strings appear in on-disk files.
         assert_eq!(GEOPARQUET_VERSION, "1.1.0");
-        assert_eq!(COGP_METADATA_KEY, "cogp");
+
         assert_eq!(GEO_METADATA_KEY, "geo");
-        // COGP_VERSION must be SemVer-like; major must parse.
-        let major: u32 = COGP_VERSION.split('.').next().unwrap().parse().unwrap();
-        assert_eq!(major, 0);
     }
 }

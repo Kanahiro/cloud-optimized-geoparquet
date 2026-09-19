@@ -6,7 +6,7 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-export type { MetadataSummary, OpenResult, ViewportResult } from './cogp-types';
+export type { OpenResult, ViewportResult } from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 
@@ -41,7 +41,7 @@ export function openDataset(url: string): Promise<OpenResult> {
 export function readViewport(
   url: string,
   bbox: ViewportBbox,
-  targetGsd: number,
+  targetResolution: number,
 ): Promise<ViewportResult> {
-  return call<ViewportResult>({ type: 'readViewport', url, bbox, targetGsd });
+  return call<ViewportResult>({ type: 'readViewport', url, bbox, targetResolution });
 }
