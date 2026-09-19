@@ -180,7 +180,7 @@ Previously published v0.1.1 sample files use the retired `cogp` / `gsd` metadata
 and must be reconverted before using the current readers. The extension has no
 independent version field; package versions do not identify its wire format.
 
-Readers accept the previous `geo.coarse_to_fine` key for existing files and expose it as `geo.lod`. Writers emit only `geo.lod`. Files containing both keys are rejected to avoid ambiguous level selection. The published `/v1.0.0/` samples still use the previous key.
+Readers require `geo.lod.levels`; the previous `geo.coarse_to_fine` key is not supported. The published `/v1.0.0/` samples still use the previous key and must be regenerated before use with the current readers.
 
 ## License
 

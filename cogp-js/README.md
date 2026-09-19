@@ -61,8 +61,7 @@ pnpm --filter cogp-demo build
 The public entry point exports `CogpReader` and its associated configuration and
 metadata types. Metadata parsing, level-selection helpers, and cache construction
 remain internal. Read levels through `reader.geo.lod.levels`.
-Existing files using `geo.coarse_to_fine` are normalized to this API; metadata
-containing both extension keys is rejected.
+Files must provide `geo.lod.levels`; there is no fallback to `geo.coarse_to_fine`.
 `CogpReader.fromAsyncBuffer(file)` accepts a custom byte source without a URL.
 
 ```ts

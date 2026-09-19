@@ -77,14 +77,6 @@ export function extractGeoMeta(
   const geoJson = kv?.find(entry => entry.key === GEO_METADATA_KEY)?.value;
   if (!geoJson) throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
   const geo = parseGeoMeta(geoJson);
-  // Normalize published files using the previous key into the public lod API.
-  if ('lod' in geo && 'coarse_to_fine' in geo) {
-    throw new Error('geo metadata: both lod and coarse_to_fine are present');
-  }
-  if ('coarse_to_fine' in geo) {
-    geo.lod = geo.coarse_to_fine as CogpMeta;
-    delete geo.coarse_to_fine;
-  }
   if (!geo.lod) throw new Error('missing geo.lod metadata');
   const lod = parseCogpMeta(JSON.stringify(geo.lod), numRowGroups);
   return { ...geo, lod };

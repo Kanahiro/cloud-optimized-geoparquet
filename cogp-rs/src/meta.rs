@@ -17,11 +17,7 @@ pub struct Level {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoMeta {
-    #[serde(
-        default,
-        alias = "coarse_to_fine",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lod: Option<CogpMeta>,
     pub version: String,
     pub primary_column: String,
@@ -93,18 +89,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn legacy_extension_is_read_but_only_lod_is_written() {
+    fn only_lod_supplies_levels() {
         let mut value = json!({
             "version": "1.1.0", "primary_column": "geometry", "columns": {},
             "coarse_to_fine": {"levels": [{"row_group_end": 0, "resolution": 1.0}]}
         });
         let parsed: GeoMeta = serde_json::from_value(value.clone()).unwrap();
-        parsed.lod.as_ref().unwrap().validate(1).unwrap();
-        let output = serde_json::to_value(parsed).unwrap();
-        assert_eq!(output["lod"], value["coarse_to_fine"]);
-        assert!(output.get("coarse_to_fine").is_none());
+        assert!(parsed.lod.is_none());
+        value["lod"] = json!({"levels": []});
+        let parsed: GeoMeta = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.lod.unwrap().validate(1).is_err());
         value["lod"] = value["coarse_to_fine"].clone();
-        assert!(serde_json::from_value::<GeoMeta>(value).is_err());
+        let parsed: GeoMeta = serde_json::from_value(value).unwrap();
+        parsed.lod.unwrap().validate(1).unwrap();
     }
 
     #[test]

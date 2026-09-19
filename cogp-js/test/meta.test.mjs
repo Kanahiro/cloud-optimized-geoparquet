@@ -37,11 +37,13 @@ test('legacy metadata is not interpreted as the extension', () => {
   ], 3), /lod/);
 });
 
-test('previous extension key is normalized without exposing two sources of truth', () => {
-  const geo = { version: '1.1.0', primary_column: 'geom', columns: {}, coarse_to_fine: { levels, future: true } };
-  const doc = extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3);
-  assert.deepEqual(doc.lod, { levels, future: true });
-  assert.equal('coarse_to_fine' in doc, false);
+test('only lod supplies levels, with no legacy-key fallback', () => {
+  const geo = { version: '1.1.0', primary_column: 'geom', columns: {}, coarse_to_fine: { levels } };
+  const extract = () => extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3);
+  assert.throws(extract, /missing geo.lod metadata/);
+  geo.lod = { levels: [] };
+  assert.throws(extract, /levels must be a non-empty array/);
   geo.lod = { levels };
-  assert.throws(() => extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3), /both lod and coarse_to_fine/);
+  geo.coarse_to_fine = { levels: [] };
+  assert.deepEqual(extract().lod.levels, levels);
 });
