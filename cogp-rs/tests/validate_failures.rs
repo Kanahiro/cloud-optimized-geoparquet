@@ -71,7 +71,7 @@ fn standard_geo() -> GeoMeta {
         },
     );
     GeoMeta {
-        coarse_to_fine: None,
+        lod: None,
         version: GEOPARQUET_VERSION.into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -120,7 +120,7 @@ fn write_file(path: &std::path::Path, row_groups: usize, kv: Vec<KeyValue>) {
 fn kv(geo: Option<GeoMeta>, cogp: Option<CogpMeta>) -> Vec<KeyValue> {
     let mut out = Vec::new();
     if let Some(mut g) = geo {
-        g.coarse_to_fine = cogp;
+        g.lod = cogp;
         out.push(KeyValue {
             key: GEO_METADATA_KEY.into(),
             value: Some(serde_json::to_string(&g).unwrap()),

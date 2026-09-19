@@ -8,10 +8,10 @@ const levels = [
   { row_group_end: 2, resolution: 0.01 },
 ];
 test('nested metadata accepts repeated boundaries, CRS resolutions, and unknown fields', () => {
-  const geo = { version: '1.1.0', primary_column: 'geom', columns: { geom: { encoding: 'WKB' } }, coarse_to_fine: { levels, future: true } };
+  const geo = { version: '1.1.0', primary_column: 'geom', columns: { geom: { encoding: 'WKB' } }, lod: { levels, future: true } };
   const doc = extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3);
-  assert.deepEqual(doc.coarse_to_fine.levels, levels);
-  assert.equal(doc.coarse_to_fine.future, true);
+  assert.deepEqual(doc.lod.levels, levels);
+  assert.equal(doc.lod.future, true);
   assert.equal(selectLevelByResolution(levels, 2), 0);
   assert.equal(selectLevelByResolution(levels, 0.1), 1);
   assert.equal(selectLevelByResolution(levels, 0.001), 2);
@@ -34,5 +34,14 @@ test('legacy metadata is not interpreted as the extension', () => {
   assert.throws(() => extractGeoMeta([
     { key: 'geo', value: '{"primary_column":"geom","columns":{}}' },
     { key: 'cogp', value: JSON.stringify({ version: '0.1.1', levels }) },
-  ], 3), /coarse_to_fine/);
+  ], 3), /lod/);
+});
+
+test('previous extension key is normalized without exposing two sources of truth', () => {
+  const geo = { version: '1.1.0', primary_column: 'geom', columns: {}, coarse_to_fine: { levels, future: true } };
+  const doc = extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3);
+  assert.deepEqual(doc.lod, { levels, future: true });
+  assert.equal('coarse_to_fine' in doc, false);
+  geo.lod = { levels };
+  assert.throws(() => extractGeoMeta([{ key: 'geo', value: JSON.stringify(geo) }], 3), /both lod and coarse_to_fine/);
 });

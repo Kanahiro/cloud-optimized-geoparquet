@@ -62,17 +62,17 @@ pub fn run(path: &Path) -> Result<()> {
     };
 
     let num_rgs = metadata.num_row_groups();
-    match &geo.coarse_to_fine {
+    match &geo.lod {
         Some(layout) => {
             if let Err(e) = layout.validate(num_rgs) {
                 errors.push(e.to_string());
             }
             if file_meta.num_rows() == 0 {
-                errors.push("empty files must omit geo.coarse_to_fine".into());
+                errors.push("empty files must omit geo.lod".into());
             }
         }
         None if file_meta.num_rows() == 0 => {}
-        None => errors.push("missing geo.coarse_to_fine metadata".into()),
+        None => errors.push("missing geo.lod metadata".into()),
     }
     let bbox_paths = primary_col
         .covering

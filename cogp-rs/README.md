@@ -131,12 +131,12 @@ The output file:
 - trusts and preserves an existing `covering.bbox`, regardless of column name;
 - if no covering exists, appends one with a collision-free name (`bbox`, `bbox_`, ...);
 - emits one or more row groups per level, written in coarse-to-fine order;
-- writes `geo.coarse_to_fine` metadata listing the `row_group_end` and `resolution` of each level.
+- writes `geo.lod` metadata listing the `row_group_end` and `resolution` of each level.
 
 ## Library use — reading COGP files
 
 The crate also exposes a `Reader` for reading COGP files from Rust. The
-Parquet footer (and the `geo` / `geo.coarse_to_fine` metadata it carries) is parsed
+Parquet footer (and the `geo` / `geo.lod` metadata it carries) is parsed
 **once** at construction; selectors take `&self` and never consume the
 reader, so a single `Reader` can sit in shared server state and fan out
 across requests. Geometries stay in their on-disk WKB form in the
@@ -315,7 +315,7 @@ Checks the layout metadata constraints:
 
 - `geo` metadata and its primary column are present;
 - covering paths, when declared, refer to actual columns (missing statistics produce warnings);
-- `geo.coarse_to_fine` metadata is present with a non-empty `levels` array;
+- `geo.lod` metadata is present with a non-empty `levels` array;
 - `row_group_end` values are non-decreasing and end at `num_row_groups - 1`;
 - `resolution` values are positive, finite, and strictly decreasing.
 

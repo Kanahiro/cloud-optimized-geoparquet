@@ -17,8 +17,12 @@ pub struct Level {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coarse_to_fine: Option<CogpMeta>,
+    #[serde(
+        default,
+        alias = "coarse_to_fine",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lod: Option<CogpMeta>,
     pub version: String,
     pub primary_column: String,
     pub columns: BTreeMap<String, GeoColumn>,
@@ -52,14 +56,8 @@ pub struct BboxCovering {
 impl CogpMeta {
     /// Validate before using a prefix to exclude any row groups.
     pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            num_row_groups > 0,
-            "empty files must omit geo.coarse_to_fine"
-        );
-        anyhow::ensure!(
-            !self.levels.is_empty(),
-            "geo.coarse_to_fine.levels must be non-empty"
-        );
+        anyhow::ensure!(num_row_groups > 0, "empty files must omit geo.lod");
+        anyhow::ensure!(!self.levels.is_empty(), "geo.lod.levels must be non-empty");
         for (i, level) in self.levels.iter().enumerate() {
             anyhow::ensure!(
                 level.row_group_end >= 0 && (level.row_group_end as usize) < num_row_groups,
@@ -93,6 +91,21 @@ impl CogpMeta {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn legacy_extension_is_read_but_only_lod_is_written() {
+        let mut value = json!({
+            "version": "1.1.0", "primary_column": "geometry", "columns": {},
+            "coarse_to_fine": {"levels": [{"row_group_end": 0, "resolution": 1.0}]}
+        });
+        let parsed: GeoMeta = serde_json::from_value(value.clone()).unwrap();
+        parsed.lod.as_ref().unwrap().validate(1).unwrap();
+        let output = serde_json::to_value(parsed).unwrap();
+        assert_eq!(output["lod"], value["coarse_to_fine"]);
+        assert!(output.get("coarse_to_fine").is_none());
+        value["lod"] = value["coarse_to_fine"].clone();
+        assert!(serde_json::from_value::<GeoMeta>(value).is_err());
+    }
 
     #[test]
     fn cogp_meta_roundtrip() {

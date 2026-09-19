@@ -144,7 +144,10 @@ def row_group_bboxes(path: Path) -> dict:
     metadata = pf.metadata.metadata or {}
     if b"geo" not in metadata:
         raise ValueError(f"{path} has no cogp metadata")
-    cogp = json.loads(metadata[b"geo"].decode("utf-8"))["coarse_to_fine"]
+    geo = json.loads(metadata[b"geo"].decode("utf-8"))
+    if "lod" in geo and "coarse_to_fine" in geo:
+        raise ValueError(f"{path} contains both lod and coarse_to_fine")
+    cogp = geo["lod"] if "lod" in geo else geo["coarse_to_fine"]
     return {
         "row_group_bboxes": bboxes,
         "row_group_rows": rows,

@@ -31,7 +31,7 @@ export interface GeoColumn {
 }
 
 export interface GeoMeta {
-  coarse_to_fine?: CogpMeta;
+  lod?: CogpMeta;
   version: string;
   primary_column: string;
   columns: Record<string, GeoColumn>;
@@ -40,7 +40,7 @@ export interface GeoMeta {
 
 export function parseCogpMeta(json: string, numRowGroups: number): CogpMeta {
   const parsed = JSON.parse(json) as CogpMeta;
-  const fail = (detail: string): never => { throw new Error(`geo.coarse_to_fine: ${detail}`); };
+  const fail = (detail: string): never => { throw new Error(`geo.lod: ${detail}`); };
   if (!parsed || !Array.isArray(parsed.levels) || parsed.levels.length === 0) {
     fail('levels must be a non-empty array');
   }
@@ -73,11 +73,19 @@ export function parseGeoMeta(json: string): GeoMeta {
 export function extractGeoMeta(
   kv: ReadonlyArray<{ key: string; value?: string | null }> | null | undefined,
   numRowGroups: number,
-): GeoMeta & { coarse_to_fine: CogpMeta } {
+): GeoMeta & { lod: CogpMeta } {
   const geoJson = kv?.find(entry => entry.key === GEO_METADATA_KEY)?.value;
   if (!geoJson) throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
   const geo = parseGeoMeta(geoJson);
-  if (!geo.coarse_to_fine) throw new Error('missing geo.coarse_to_fine metadata');
-  const coarse_to_fine = parseCogpMeta(JSON.stringify(geo.coarse_to_fine), numRowGroups);
-  return { ...geo, coarse_to_fine };
+  // Normalize published files using the previous key into the public lod API.
+  if ('lod' in geo && 'coarse_to_fine' in geo) {
+    throw new Error('geo metadata: both lod and coarse_to_fine are present');
+  }
+  if ('coarse_to_fine' in geo) {
+    geo.lod = geo.coarse_to_fine as CogpMeta;
+    delete geo.coarse_to_fine;
+  }
+  if (!geo.lod) throw new Error('missing geo.lod metadata');
+  const lod = parseCogpMeta(JSON.stringify(geo.lod), numRowGroups);
+  return { ...geo, lod };
 }

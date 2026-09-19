@@ -114,7 +114,7 @@ fn write_input(path: &std::path::Path) {
         },
     );
     let geo = GeoMeta {
-        coarse_to_fine: None,
+        lod: None,
         version: "1.1.0".into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -374,7 +374,7 @@ fn convert_reuses_existing_bbox_column() {
         },
     );
     let geo = GeoMeta {
-        coarse_to_fine: None,
+        lod: None,
         version: "1.1.0".into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -537,7 +537,8 @@ fn preserves_null_empty_duplicate_rows_and_crs_metadata() {
         serde_json::Value::Null
     );
     assert_eq!(result["columns"]["geometry"]["future"], "preserve");
-    assert!(result["coarse_to_fine"].get("version").is_none());
+    assert!(result["lod"].get("version").is_none());
+    assert!(result.get("coarse_to_fine").is_none());
     let mut actual = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
@@ -604,6 +605,7 @@ fn empty_input_omits_extension() {
             .unwrap(),
     )
     .unwrap();
+    assert!(geo.get("lod").is_none());
     assert!(geo.get("coarse_to_fine").is_none());
 }
 
@@ -614,26 +616,51 @@ fn cli_defaults_write_page_indexes() {
     let output = tmp.path().join("output.parquet");
     write_input(&input);
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
-        .arg("convert").arg(&input).arg(&output).output().unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        .arg("convert")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let reader = Reader::open(&output).unwrap();
     assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
     for group in reader.parquet_metadata().row_groups() {
-        assert!(group.columns().iter().all(|c| c.offset_index_offset().is_some()));
-        assert_eq!(group.columns().iter().filter(|c| {
-            c.column_path().parts().first().map(String::as_str) == Some("bbox")
-                && c.column_index_offset().is_some()
-        }).count(), 4);
+        assert!(group
+            .columns()
+            .iter()
+            .all(|c| c.offset_index_offset().is_some()));
+        assert_eq!(
+            group
+                .columns()
+                .iter()
+                .filter(|c| {
+                    c.column_path().parts().first().map(String::as_str) == Some("bbox")
+                        && c.column_index_offset().is_some()
+                })
+                .count(),
+            4
+        );
     }
 }
 
 #[test]
 fn cli_rejects_retired_options() {
-    for flag in ["--row-group-max-bytes", "--dictionary-page-size-limit", "--input-units",
-                 "--geometry-column", "--sort-key", "--sort-order"] {
+    for flag in [
+        "--row-group-max-bytes",
+        "--dictionary-page-size-limit",
+        "--input-units",
+        "--geometry-column",
+        "--sort-key",
+        "--sort-order",
+    ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
             .args(["convert", "input.parquet", "output.parquet", flag, "1"])
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert!(!result.status.success());
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");

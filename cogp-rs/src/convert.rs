@@ -124,10 +124,7 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64
 
 /// Convert equatorial meter hints to horizontal CRS units; never guess that
 /// every projected CRS uses meters, or that explicit null means CRS84.
-fn auto_resolution_scale(
-    geo: Option<&serde_json::Value>,
-    column: &str,
-) -> Result<f64> {
+fn auto_resolution_scale(geo: Option<&serde_json::Value>, column: &str) -> Result<f64> {
     let Some(mut crs) = geo.and_then(|g| g["columns"][column].get("crs")) else {
         return Ok(1.0 / 111_320.0); // GeoParquet's absent CRS is CRS84.
     };
@@ -146,7 +143,8 @@ fn auto_resolution_scale(
             .map(|f| f * 180.0 / std::f64::consts::PI * 111_320.0),
         _ => None,
     };
-    let factor = factor.filter(|v| v.is_finite() && *v > 0.0)
+    let factor = factor
+        .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| anyhow!("unknown CRS units: provide --resolution in coordinate units"))?;
     Ok(1.0 / factor)
 }
@@ -276,9 +274,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .transpose()
         .context("invalid geo metadata fields")?;
 
-    let geom_col_name = input_geo.as_ref()
+    let geom_col_name = input_geo
+        .as_ref()
         .ok_or_else(|| anyhow!("input requires GeoParquet geo metadata with primary_column"))?
-        .primary_column.clone();
+        .primary_column
+        .clone();
     let geom_col_idx = input_schema
         .index_of(&geom_col_name)
         .with_context(|| format!("geometry column `{geom_col_name}` not found"))?;
@@ -289,6 +289,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         let mut geo = input_geo_json
             .clone()
             .ok_or_else(|| anyhow!("empty input requires geo metadata"))?;
+        geo.as_object_mut().unwrap().remove("lod");
         geo.as_object_mut().unwrap().remove("coarse_to_fine");
         let props = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![KeyValue {
@@ -307,8 +308,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // Explicit resolutions are already in coordinate units. Only auto zoom
     // hints need conversion; unknown CRS units require an explicit resolution.
     if args.resolution.is_empty() {
-        let scale =
-            auto_resolution_scale(input_geo_json.as_ref(), &geom_col_name)?;
+        let scale = auto_resolution_scale(input_geo_json.as_ref(), &geom_col_name)?;
         for value in &mut resolutions {
             *value *= scale;
             anyhow::ensure!(
@@ -353,8 +353,14 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     )?;
 
     let sort_ranks = match &priority_column {
-        Some(col) => compute_sort_ranks(col.as_ref(), args.priority_column_order)
-            .with_context(|| format!("ranking --priority-column column `{:?}`", args.priority_column))?,
+        Some(col) => {
+            compute_sort_ranks(col.as_ref(), args.priority_column_order).with_context(|| {
+                format!(
+                    "ranking --priority-column column `{:?}`",
+                    args.priority_column
+                )
+            })?
+        }
         None => vec![0u64; n_rows],
     };
     drop(priority_column);
@@ -594,7 +600,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             crs: None,
         });
     let mut geo_meta = GeoMeta {
-        coarse_to_fine: None,
+        lod: None,
         version: GEOPARQUET_VERSION.to_string(),
         primary_column: geom_col_name.clone(),
         columns,
@@ -603,12 +609,13 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         levels: levels_meta,
     };
 
-    geo_meta.coarse_to_fine = Some(cogp_meta.clone());
+    geo_meta.lod = Some(cogp_meta.clone());
     let mut output_geo = serde_json::to_value(&geo_meta)?;
     // Retain CRS null (unknown), edge semantics, and other GeoParquet fields.
     if let Some(mut original) = input_geo_json {
         original["primary_column"] = serde_json::json!(geom_col_name);
-        original["coarse_to_fine"] = output_geo["coarse_to_fine"].clone();
+        original.as_object_mut().unwrap().remove("coarse_to_fine");
+        original["lod"] = output_geo["lod"].clone();
         if original["columns"].get(&geom_col_name).is_some() {
             if append_bbox {
                 original["columns"][&geom_col_name]["covering"] =
@@ -1525,16 +1532,26 @@ mod tests {
             #[command(flatten)]
             args: ConvertArgs,
         }
-        let cli = Cli::try_parse_from(["cogp", "input", "output",
-            "--priority-column", "population", "--priority-column-order", "asc"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "cogp",
+            "input",
+            "output",
+            "--priority-column",
+            "population",
+            "--priority-column-order",
+            "asc",
+        ])
+        .unwrap();
         assert_eq!(cli.args.point_thinning_factor, 4);
         assert_eq!(cli.args.line_visibility_factor, 4);
         assert_eq!(cli.args.polygon_visibility_factor, 4);
         assert_eq!(cli.args.page_row_count, 2048);
         assert_eq!(cli.args.priority_column.as_deref(), Some("population"));
-        assert!(matches!(cli.args.priority_column_order, PriorityColumnOrder::Asc));
+        assert!(matches!(
+            cli.args.priority_column_order,
+            PriorityColumnOrder::Asc
+        ));
     }
-
 
     fn bb(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Bbox {
         Bbox {
@@ -1575,10 +1592,7 @@ mod tests {
             ),
         ] {
             let geo = json!({"columns":{"geom":{"crs":{"type":"ProjectedCRS","coordinate_system":{"axis":[{"unit":unit}]}}}}});
-            assert_eq!(
-                auto_resolution_scale(Some(&geo), "geom").unwrap(),
-                expected
-            );
+            assert_eq!(auto_resolution_scale(Some(&geo), "geom").unwrap(), expected);
         }
         let unknown = json!({"columns":{"geom":{"crs":null}}});
         assert!(auto_resolution_scale(Some(&unknown), "geom").is_err());

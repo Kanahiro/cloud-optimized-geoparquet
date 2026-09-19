@@ -88,7 +88,7 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
   return {
     primary_column: reader.primaryGeometryColumn,
     num_row_groups: reader.numRowGroups,
-    levels: reader.geo.coarse_to_fine.levels.map((l, i) => ({
+    levels: reader.geo.lod.levels.map((l, i) => ({
       i,
       resolution: l.resolution,
       row_group_end: l.row_group_end,

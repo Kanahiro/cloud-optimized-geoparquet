@@ -43,7 +43,7 @@ Within each level's newly introduced rows, producers SHOULD spatially cluster fe
 
 ## Metadata
 
-The extension adds an OPTIONAL `coarse_to_fine` object to the GeoParquet file metadata stored under the `geo` key. When present, this object MUST contain the fields below. Its levels apply to the primary geometry column identified by `geo.primary_column`.
+The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet file metadata stored under the `geo` key. When present, this object MUST contain the fields below. Its levels apply to the primary geometry column identified by `geo.primary_column`.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ The extension adds an OPTIONAL `coarse_to_fine` object to the GeoParquet file me
 | `levels[].row_group_end` | integer | **REQUIRED.** Zero-based, inclusive end of the selected row group prefix. |
 | `levels[].resolution` | number | **REQUIRED.** Positive, finite nominal rendering resolution in the primary geometry column's CRS units. |
 
-Example of the `geo.coarse_to_fine` object for the eight-row-group file above:
+Example of the `geo.lod` object for the eight-row-group file above:
 
 ```json
 {
@@ -86,9 +86,9 @@ The target resolution is interpreted in the same CRS units as `resolution`. If t
 
 ### Metadata handling
 
-Readers that do not support this extension can ignore `coarse_to_fine` and read the file as ordinary GeoParquet. Extension-aware readers MUST validate the required fields and boundary constraints before using the levels to exclude row groups. If the metadata is invalid, readers MUST NOT use it for prefix selection and SHOULD report the problem. They MAY fall back to ordinary GeoParquet access.
+Readers that do not support this extension can ignore `lod` and read the file as ordinary GeoParquet. Extension-aware readers MUST validate the required fields and boundary constraints before using the levels to exclude row groups. If the metadata is invalid, readers MUST NOT use it for prefix selection and SHOULD report the problem. They MAY fall back to ordinary GeoParquet access.
 
-Readers MUST ignore unrecognized fields within `coarse_to_fine`. This proposal does not introduce an independent extension version field.
+Readers MUST ignore unrecognized fields within `lod`. This proposal does not introduce an independent extension version field.
 
 ## Reader behavior
 

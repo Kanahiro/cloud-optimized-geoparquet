@@ -1,6 +1,6 @@
 //! Reader for COGP (Cloud Optimized GeoParquet Profile) files.
 //!
-//! The Parquet footer (and the `geo.coarse_to_fine` metadata it carries) is
+//! The Parquet footer (and the `geo.lod` metadata it carries) is
 //! parsed exactly once when the reader is constructed and cached as an
 //! [`ArrowReaderMetadata`]. All later reads — sync or async, local or remote —
 //! reuse that cached metadata via `new_with_metadata`, so the footer is never
@@ -372,13 +372,13 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
     let geo_meta: GeoMeta = serde_json::from_str(geo_str)
         .map_err(|e| anyhow!("`geo` metadata is not valid JSON: {e}"))?;
     let cogp_meta = geo_meta
-        .coarse_to_fine
+        .lod
         .clone()
-        .ok_or_else(|| anyhow!("missing geo.coarse_to_fine metadata"))?;
+        .ok_or_else(|| anyhow!("missing geo.lod metadata"))?;
     cogp_meta.validate(metadata.num_row_groups())?;
     anyhow::ensure!(
         metadata.file_metadata().num_rows() > 0,
-        "empty files must omit geo.coarse_to_fine"
+        "empty files must omit geo.lod"
     );
     Ok((geo_meta, cogp_meta))
 }
@@ -459,7 +459,7 @@ mod tests {
                 },
             );
             let mut geo = GeoMeta {
-                coarse_to_fine: None,
+                lod: None,
                 version: GEOPARQUET_VERSION.into(),
                 primary_column: "geometry".into(),
                 columns: cols,
@@ -474,7 +474,7 @@ mod tests {
                 w.write(&batch).unwrap();
                 w.flush().unwrap();
             }
-            geo.coarse_to_fine = Some(cogp);
+            geo.lod = Some(cogp);
             w.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
@@ -580,7 +580,7 @@ mod tests {
                 },
             );
             let mut geo = GeoMeta {
-                coarse_to_fine: None,
+                lod: None,
                 version: GEOPARQUET_VERSION.into(),
                 primary_column: "geometry".into(),
                 columns,
@@ -588,7 +588,7 @@ mod tests {
             let cogp = CogpMeta {
                 levels: vec![level(0, 1.0)],
             };
-            geo.coarse_to_fine = Some(cogp);
+            geo.lod = Some(cogp);
             writer.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
@@ -692,7 +692,7 @@ mod tests {
             },
         );
         let geo = GeoMeta {
-            coarse_to_fine: None,
+            lod: None,
             version: GEOPARQUET_VERSION.into(),
             primary_column: "geometry".into(),
             columns: cols,
@@ -703,7 +703,7 @@ mod tests {
         }])
         .err()
         .expect("expected reader construction to fail");
-        assert!(format!("{err}").contains("coarse_to_fine"), "{err}");
+        assert!(format!("{err}").contains("lod"), "{err}");
     }
 
     #[test]

@@ -139,7 +139,7 @@ export class CogpReader {
     return new CogpReader(file, metadata);
   }
 
-  readonly geo: GeoMeta & { coarse_to_fine: CogpMeta };
+  readonly geo: GeoMeta & { lod: CogpMeta };
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
@@ -190,8 +190,8 @@ export class CogpReader {
    * coarsest level is returned respectively.
    */
   selectLevel(targetResolution?: number): number {
-    if (targetResolution === undefined) return this.geo.coarse_to_fine.levels.length - 1;
-    return selectLevelByResolution(this.geo.coarse_to_fine.levels, targetResolution);
+    if (targetResolution === undefined) return this.geo.lod.levels.length - 1;
+    return selectLevelByResolution(this.geo.lod.levels, targetResolution);
   }
 
   /**
@@ -205,7 +205,7 @@ export class CogpReader {
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
-    const maxLevel = opts.maxLevel ?? this.geo.coarse_to_fine.levels.length - 1;
+    const maxLevel = opts.maxLevel ?? this.geo.lod.levels.length - 1;
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
@@ -295,10 +295,10 @@ export class CogpReader {
   }
 
   private candidateRowGroups(maxLevel: number, bbox?: Bbox): number[] {
-    if (maxLevel < 0 || maxLevel >= this.geo.coarse_to_fine.levels.length) {
-      throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.geo.coarse_to_fine.levels.length})`);
+    if (maxLevel < 0 || maxLevel >= this.geo.lod.levels.length) {
+      throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.geo.lod.levels.length})`);
     }
-    const end = this.geo.coarse_to_fine.levels[maxLevel]!.row_group_end;
+    const end = this.geo.lod.levels[maxLevel]!.row_group_end;
     const out: number[] = [];
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
