@@ -74,6 +74,77 @@ The implementations remain independently publishable. The repository root owns
 shared dependency locks, CI, releases, and development commands so changes to the
 profile can be tested against both implementations together.
 
+## Writer implementation
+
+[`SPEC.md`](./SPEC.md) defines the format contract. The following describes the
+current [`cogp-rs` writer](./cogp-rs/src/convert.rs): these algorithms, defaults,
+and tuning options are implementation choices, not additional format requirements.
+See the [CLI reference](./cogp-rs/README.md#convert) for conversion options.
+
+### Feature assignment to levels
+
+The writer assigns each input row to one level before spatial sorting. Explicit
+`--resolution` values use the primary geometry CRS units. By default, it derives
+17 resolutions from Web Mercator zooms 0–16 using
+`40,075,016.68557849 / (1024 × 2^zoom)` meters at the equator, then converts those
+hints to CRS units. Geographic coordinates use an approximate 111,320 meters per
+degree; this is an equatorial scale heuristic, without latitude correction.
+Coordinates themselves are not reprojected or quantized.
+
+- **Points / MultiPoints:** choose one remaining feature per bbox-center grid
+  cell, with cell width `4 × resolution` by default. Points already assigned to
+  coarser levels block their cells at the current resolution. Optional
+  `--sort-key` ranks candidates, followed by bbox diagonal and a deterministic
+  row-index hash as tie-breakers.
+- **Lines / polygons:** assign each feature to the first level where its bbox
+  diagonal reaches `2 × resolution` for lines or `4 × resolution` for polygons
+  by default. Non-empty zero-extent geometries are eligible from the coarsest
+  level. Lines and polygons do not compete for grid cells.
+- **Remaining rows:** place all deferred rows, including null/empty geometries,
+  in the finest level. No rows are discarded. Levels introducing no rows are
+  omitted from the emitted metadata.
+
+### Spatial sorting and Row Group construction
+
+Within each level, the writer uses a recursive Sort-Tile-Recursive (STR) packing
+variant. It finds the longer axis of the combined bbox, sorts feature bbox
+centers along that axis, and splits at a multiple of the target Row Group row
+count. Recursion stops when a partition fits in one Row Group. Sort directions
+follow a snake traversal, with alternating starting corners between levels, to
+keep consecutive groups spatially close. Geometry and attribute values are
+preserved while row order changes.
+
+`--row-group-size` defaults to **65,536 rows**. Each level is written in order,
+and the writer flushes at every level boundary, so a Row Group never mixes
+levels. The final group of a level may be smaller. The metadata records the
+actual zero-based index of the last flushed Row Group for each level.
+
+Optional `--row-group-max-bytes` can flush earlier based on the writer's estimate
+of encoded size. This is not a strict bound on final compressed bytes: a single
+large row can exceed it. These earlier flushes can also split the spatial
+partitions planned from the row-count limit.
+
+### Bbox covering, pages, and encoding
+
+Existing `covering.bbox` metadata determines which columns the writer uses;
+it trusts and preserves those paths and values. If covering is absent, it
+computes bboxes from geometry and adds a collision-free column named `bbox`,
+`bbox_`, etc. An existing column merely named `bbox` has no special meaning.
+
+By default, the writer emits column-chunk statistics and disables OffsetIndexes.
+With `--page-row-count`, it additionally applies STR packing to page-sized row
+intervals within each planned Row Group, enables page statistics / ColumnIndexes
+for the covering bbox leaves, and retains OffsetIndexes for all leaves. This
+supports finer spatial pruning within selected Row Groups. Parquet's byte limits
+can create smaller pages, and early Row Group flushes from the optional byte
+limit can shift these planned intervals; indexes describe the actual output.
+
+Compression is **ZSTD level 3**. Dictionary encoding is disabled for the primary
+WKB geometry and covering bbox leaves. Other columns retain the Parquet writer's
+default dictionary behavior; `--dictionary-page-size-limit` can tune dictionary
+size. The published v1.0.0 samples use 65,536-row groups and
+`--page-row-count 2048`, with the other conversion options at their defaults.
+
 ## Development
 
 Install JavaScript dependencies once from the repository root:
