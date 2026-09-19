@@ -143,8 +143,8 @@ bbox-diagonal threshold, so equal factors do not imply equal visual density.
 Each factor remains independently configurable.
 
 The published v1.0.0 samples were generated with 65,536-row groups, 2,048-row
-pages, and point/line/polygon factors **4/2/4**. The line default has since changed
-to 4; the existing sample objects have not been regenerated for this API change.
+pages, and point/line/polygon factors **4/4/4**. Their level metadata is stored
+in `geo.lod.levels`.
 
 ## Development
 
@@ -180,7 +180,7 @@ Previously published v0.1.1 sample files use the retired `cogp` / `gsd` metadata
 and must be reconverted before using the current readers. The extension has no
 independent version field; package versions do not identify its wire format.
 
-Readers require `geo.lod.levels`; the previous `geo.coarse_to_fine` key is not supported. The published `/v1.0.0/` samples still use the previous key and must be regenerated before use with the current readers.
+Readers require `geo.lod.levels`; the previous `geo.coarse_to_fine` key is not supported. The published `/v1.0.0/` samples have been regenerated with `geo.lod`.
 
 ## License
 

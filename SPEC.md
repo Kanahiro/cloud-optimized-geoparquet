@@ -1,6 +1,6 @@
-# [Proposal] Coarse-to-fine layout extension
+# [Proposal] Level of Detail (LoD) extension
 
-This document proposes an optional GeoParquet extension for progressive feature access.
+This document proposes an optional GeoParquet Level of Detail (LoD) extension for progressive feature access.
 
 ## Motivation
 
