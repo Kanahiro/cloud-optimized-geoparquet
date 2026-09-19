@@ -172,6 +172,12 @@ See each implementation's README for its public API and focused workflows.
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
 
+## Presentation
+
+- [2026-09-03 MapLibre Meetup in Hiroshima / What vector tiles don’t solve.](https://docs.google.com/presentation/d/13rUtH5Px_L9jTL6NnWHaAgGC1-F7JRhz6TkJ-foARbg/edit?usp=sharing)
+- [2026-09-02 FOSS4G 2026 Hiroshima / A Proposal for Hierarchically Organized GeoParquet](https://drive.google.com/file/d/1EW6pTnrNkW3LUdzfBP6ArhYeYoPQUafy/view?usp=sharing)
+- [2026-08-24 CNG Japan / Spatial sort for well-packed GeoParquet](https://drive.google.com/file/d/1ZkRvXv9Ryak_jiZZqL-QAxGl--TBw668/view?usp=sharing)
+
 ## License
 
 The contents of [`SPEC.md`](./SPEC.md) are licensed under [Creative Commons
