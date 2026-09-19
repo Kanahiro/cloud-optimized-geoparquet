@@ -24,12 +24,11 @@ pub fn run(path: &Path) -> Result<()> {
                 Some(v) => v,
                 None => continue,
             };
-            match entry.key.as_str() {
-                GEO_METADATA_KEY => match serde_json::from_str::<GeoMeta>(value) {
+            if entry.key == GEO_METADATA_KEY {
+                match serde_json::from_str::<GeoMeta>(value) {
                     Ok(m) => geo_meta = Some(m),
                     Err(e) => errors.push(format!("`geo` metadata is not valid JSON: {e}")),
-                },
-                _ => {}
+                }
             }
         }
     }

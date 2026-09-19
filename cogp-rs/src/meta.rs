@@ -49,6 +49,46 @@ pub struct BboxCovering {
     pub ymax: Vec<String>,
 }
 
+impl CogpMeta {
+    /// Validate before using a prefix to exclude any row groups.
+    pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            num_row_groups > 0,
+            "empty files must omit geo.coarse_to_fine"
+        );
+        anyhow::ensure!(
+            !self.levels.is_empty(),
+            "geo.coarse_to_fine.levels must be non-empty"
+        );
+        for (i, level) in self.levels.iter().enumerate() {
+            anyhow::ensure!(
+                level.row_group_end >= 0 && (level.row_group_end as usize) < num_row_groups,
+                "levels[{i}].row_group_end out of range"
+            );
+            anyhow::ensure!(
+                level.resolution.is_finite() && level.resolution > 0.0,
+                "levels[{i}].resolution must be positive and finite"
+            );
+            if i > 0 {
+                let prev = &self.levels[i - 1];
+                anyhow::ensure!(
+                    level.row_group_end >= prev.row_group_end,
+                    "levels[{i}].row_group_end must be non-decreasing"
+                );
+                anyhow::ensure!(
+                    level.resolution < prev.resolution,
+                    "levels[{i}].resolution must strictly decrease"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.levels.last().unwrap().row_group_end as usize == num_row_groups - 1,
+            "final row_group_end must equal num_row_groups - 1"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,45 +168,5 @@ mod tests {
         assert_eq!(GEOPARQUET_VERSION, "1.1.0");
 
         assert_eq!(GEO_METADATA_KEY, "geo");
-    }
-}
-
-impl CogpMeta {
-    /// Validate before using a prefix to exclude any row groups.
-    pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            num_row_groups > 0,
-            "empty files must omit geo.coarse_to_fine"
-        );
-        anyhow::ensure!(
-            !self.levels.is_empty(),
-            "geo.coarse_to_fine.levels must be non-empty"
-        );
-        for (i, level) in self.levels.iter().enumerate() {
-            anyhow::ensure!(
-                level.row_group_end >= 0 && (level.row_group_end as usize) < num_row_groups,
-                "levels[{i}].row_group_end out of range"
-            );
-            anyhow::ensure!(
-                level.resolution.is_finite() && level.resolution > 0.0,
-                "levels[{i}].resolution must be positive and finite"
-            );
-            if i > 0 {
-                let prev = &self.levels[i - 1];
-                anyhow::ensure!(
-                    level.row_group_end >= prev.row_group_end,
-                    "levels[{i}].row_group_end must be non-decreasing"
-                );
-                anyhow::ensure!(
-                    level.resolution < prev.resolution,
-                    "levels[{i}].resolution must strictly decrease"
-                );
-            }
-        }
-        anyhow::ensure!(
-            self.levels.last().unwrap().row_group_end as usize == num_row_groups - 1,
-            "final row_group_end must equal num_row_groups - 1"
-        );
-        Ok(())
     }
 }
