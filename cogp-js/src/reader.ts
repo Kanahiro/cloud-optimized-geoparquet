@@ -17,7 +17,7 @@ import {
   coalescingAsyncBuffer,
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
-import { selectLevelByGsd } from './level.js';
+import { selectLevelByResolution } from './level.js';
 import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
 import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
 
@@ -145,9 +145,9 @@ export class CogpReader {
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
-  private readonly bboxColIdx: BboxColumnIndexes;
+  private readonly bboxColIdx: BboxColumnIndexes | undefined;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
-  private readonly bboxPaths: BboxCovering;
+  private readonly bboxPaths: BboxCovering | undefined;
   /** Names of WKB-encoded geometry columns we decode lazily after filtering. */
   private readonly geomColumns: readonly string[];
 
@@ -156,7 +156,7 @@ export class CogpReader {
     readonly metadata: FullFileMetadata,
     readonly url: string,
   ) {
-    const doc = extractCogpDocument(metadata.key_value_metadata);
+    const doc = extractCogpDocument(metadata.key_value_metadata, metadata.row_groups.length);
     this.cogp = doc.cogp;
     this.geo = doc.geo;
 
@@ -168,22 +168,10 @@ export class CogpReader {
     }
     this.rowOffsets = offsets;
 
-    // SPEC: COGP mandates a per-feature bbox covering on the primary
-    // geometry column. Surface a clear error rather than silently falling
-    // back to "no spatial filter" when the file is malformed.
-    const primaryCol = this.geo.columns[this.geo.primary_column];
-    const covering = primaryCol?.covering;
-    if (!covering?.bbox) {
-      throw new Error(
-        `not a COGP file: primary geometry column \`${this.geo.primary_column}\` is missing \`covering.bbox\``,
-      );
-    }
-    this.bboxPaths = covering.bbox;
+    const covering = this.geo.columns[this.geo.primary_column]?.covering;
+    this.bboxPaths = covering?.bbox;
     const firstRg = metadata.row_groups[0];
-    if (!firstRg) {
-      throw new Error('cogp file has no row groups');
-    }
-    this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
+    this.bboxColIdx = firstRg && covering ? findBboxColumnIndexes(firstRg, covering.bbox) : undefined;
 
     const geomCols: string[] = [];
     for (const [name, col] of Object.entries(this.geo.columns)) {
@@ -205,14 +193,14 @@ export class CogpReader {
   }
 
   /**
-   * Select a level index per SPEC §7. Pass a target ground-sample distance in
-   * meters; the reader returns the last level whose `gsd >= targetGsd`. If
-   * `targetGsd` is omitted (or coarser than the coarsest level), the finest /
+   * Select a level index per the specification. Pass a target rendering resolution in
+   * primary geometry CRS units; the reader returns the last level whose `resolution >= targetResolution`. If
+   * `targetResolution` is omitted (or coarser than the coarsest level), the finest /
    * coarsest level is returned respectively.
    */
-  selectLevel(targetGsd?: number): number {
-    if (targetGsd === undefined) return this.levels.length - 1;
-    return selectLevelByGsd(this.levels, targetGsd);
+  selectLevel(targetResolution?: number): number {
+    if (targetResolution === undefined) return this.levels.length - 1;
+    return selectLevelByResolution(this.levels, targetResolution);
   }
 
   /**
@@ -237,7 +225,10 @@ export class CogpReader {
     // struct's top-level name in transparently — hyparquet reads the whole
     // struct when you name its root.
     let columns = opts.columns;
-    if (bbox && columns) {
+    if (bbox && !this.bboxPaths && columns && !columns.includes(this.primaryGeometryColumn)) {
+      columns = [...columns, this.primaryGeometryColumn];
+    }
+    if (bbox && columns && this.bboxPaths) {
       const top = this.bboxPaths.xmin[0]!;
       if (!columns.includes(top)) columns = [...columns, top];
     }
@@ -266,12 +257,13 @@ export class CogpReader {
         const v = row[col];
         if (v instanceof Uint8Array) row[col] = decodeWkb(v);
       }
+      if (bbox && !paths && !geometryIntersects(row[this.primaryGeometryColumn], bbox)) return false;
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
     let stopped = false;
-    for await (const batch of this.streamBatches(rgs, columns, bbox)) {
+    for await (const batch of this.streamBatches(rgs, columns, this.bboxPaths ? bbox : undefined)) {
       if (!paths) {
         for (const row of batch) {
           if (acceptRow(row)) {
@@ -307,7 +299,7 @@ export class CogpReader {
   /** Bbox of a single row group as derived from covering column statistics. */
   rowGroupEnvelope(rgIndex: number): Bbox | null {
     const rg = this.metadata.row_groups[rgIndex];
-    if (!rg) return null;
+    if (!rg || !this.bboxColIdx) return null;
     return rowGroupBbox(rg, this.bboxColIdx);
   }
 
@@ -319,7 +311,7 @@ export class CogpReader {
     const out: number[] = [];
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
-      if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
+      if (bbox && this.bboxColIdx && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
       out.push(i);
     }
     return out;
@@ -340,9 +332,9 @@ export class CogpReader {
     // Keep the four spatial predicates together: hyparquet uses this one
     // expression for PageIndex pruning and exact row filtering. PageIndexes
     // are fetched lazily only for bbox reads and only for candidate row groups.
-    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths!, bbox) : undefined;
     const indexWindows: number[][] = [];
-    if (bbox) {
+    if (bbox && this.bboxPaths) {
       for (let i = 0; i < rgIndices.length; i += PAGE_INDEX_WINDOW_MAX_GROUPS) {
         indexWindows.push(rgIndices.slice(i, i + PAGE_INDEX_WINDOW_MAX_GROUPS));
       }
@@ -441,7 +433,7 @@ export class CogpReader {
     return prefetchPageIndexes({
       file: this.file,
       metadata: this.metadata,
-      filter: bboxFilter(this.bboxPaths, bbox),
+      filter: bboxFilter(this.bboxPaths!, bbox),
       rowStart,
       rowEnd,
       columns,
@@ -477,4 +469,23 @@ function readNum(row: Record<string, unknown>, path: readonly string[]): number 
   let cur: unknown = row;
   for (const p of path) cur = (cur as Record<string, unknown>)[p];
   return cur as number;
+}
+
+// Without a covering, decode the primary geometry and evaluate its envelope.
+function geometryIntersects(value: unknown, query: Bbox): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const geometry = value as { coordinates?: unknown; geometries?: unknown[] };
+  if (geometry.geometries) return geometry.geometries.some(g => geometryIntersects(g, query));
+  const envelope = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  const visit = (coords: unknown): void => {
+    if (!Array.isArray(coords)) return;
+    if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+      envelope.minX = Math.min(envelope.minX, coords[0]);
+      envelope.maxX = Math.max(envelope.maxX, coords[0]);
+      envelope.minY = Math.min(envelope.minY, coords[1]);
+      envelope.maxY = Math.max(envelope.maxY, coords[1]);
+    } else coords.forEach(visit);
+  };
+  visit(geometry.coordinates);
+  return bboxesIntersect(envelope, query);
 }

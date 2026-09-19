@@ -208,7 +208,7 @@ async function refreshViewport(): Promise<void> {
     maxY: b.getNorth(),
   };
   try {
-    const { data, status } = await readViewport(ds.url, bbox, metersPerCssPixel());
+    const { data, status } = await readViewport(ds.url, bbox, degreesPerCssPixel());
     if (myToken !== viewportToken || active?.url !== ds.url) return;
     source.setData(data);
     if (status) setStatus(status);
@@ -297,10 +297,10 @@ function renderMetadata(summary: MetadataSummary): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
 }
 
-function metersPerCssPixel(): number {
+function degreesPerCssPixel(): number {
   const sampleWidth = 100;
   const y = map.getContainer().clientHeight / 2;
   const left = map.unproject([0, y]);
   const right = map.unproject([sampleWidth, y]);
-  return left.distanceTo(right) / sampleWidth;
+  return Math.abs(right.lng - left.lng) / sampleWidth;
 }

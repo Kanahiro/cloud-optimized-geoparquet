@@ -1,9 +1,8 @@
-export const COGP_METADATA_KEY = 'cogp';
 export const GEO_METADATA_KEY = 'geo';
 
 export interface Level {
   row_group_end: number;
-  gsd: number;
+  resolution: number;
 }
 
 export interface CogpGenerator {
@@ -12,7 +11,6 @@ export interface CogpGenerator {
 }
 
 export interface CogpMeta {
-  version: string;
   levels: Level[];
   generator?: CogpGenerator;
   [extra: string]: unknown;
@@ -39,26 +37,31 @@ export interface GeoColumn {
 }
 
 export interface GeoMeta {
+  coarse_to_fine?: CogpMeta;
   version: string;
   primary_column: string;
   columns: Record<string, GeoColumn>;
   [extra: string]: unknown;
 }
 
-export function parseCogpMeta(json: string): CogpMeta {
+export function parseCogpMeta(json: string, numRowGroups: number): CogpMeta {
   const parsed = JSON.parse(json) as CogpMeta;
-  if (typeof parsed.version !== 'string') {
-    throw new Error('cogp metadata: missing `version`');
+  const fail = (detail: string): never => { throw new Error(`geo.coarse_to_fine: ${detail}`); };
+  if (!parsed || !Array.isArray(parsed.levels) || parsed.levels.length === 0) {
+    fail('levels must be a non-empty array');
   }
-  if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
-    throw new Error('cogp metadata: `levels` must be a non-empty array');
-  }
-  const major = Number.parseInt(parsed.version.split('.')[0] ?? '', 10);
-  if (major !== 0) {
-    throw new Error(
-      `cogp metadata: unsupported major version \`${parsed.version}\` (this reader implements 0.x)`,
-    );
-  }
+  if (!Number.isSafeInteger(numRowGroups) || numRowGroups <= 0) fail('empty files must omit the extension');
+  parsed.levels.forEach((level, i) => {
+    if (!level || !Number.isSafeInteger(level.row_group_end) || level.row_group_end < 0 || level.row_group_end >= numRowGroups) {
+      fail(`levels[${i}].row_group_end out of range or not an integer`);
+    }
+    if (!Number.isFinite(level.resolution) || level.resolution <= 0) fail(`levels[${i}].resolution must be positive and finite`);
+    if (i > 0) {
+      if (level.row_group_end < parsed.levels[i - 1]!.row_group_end) fail('boundaries must be non-decreasing');
+      if (level.resolution >= parsed.levels[i - 1]!.resolution) fail('resolutions must strictly decrease');
+    }
+  });
+  if (parsed.levels[parsed.levels.length - 1]!.row_group_end !== numRowGroups - 1) fail('final boundary must cover all row groups');
   return parsed;
 }
 
@@ -80,21 +83,11 @@ export interface CogpDocument {
 
 export function extractCogpDocument(
   kv: ReadonlyArray<{ key: string; value?: string | null }> | null | undefined,
+  numRowGroups: number,
 ): CogpDocument {
-  let cogpJson: string | undefined;
-  let geoJson: string | undefined;
-  for (const entry of kv ?? []) {
-    if (entry.key === COGP_METADATA_KEY && typeof entry.value === 'string') {
-      cogpJson = entry.value;
-    } else if (entry.key === GEO_METADATA_KEY && typeof entry.value === 'string') {
-      geoJson = entry.value;
-    }
-  }
-  if (!geoJson) {
-    throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
-  }
-  if (!cogpJson) {
-    throw new Error('not a COGP file: missing `cogp` key/value metadata');
-  }
-  return { cogp: parseCogpMeta(cogpJson), geo: parseGeoMeta(geoJson) };
+  const geoJson = kv?.find(entry => entry.key === GEO_METADATA_KEY)?.value;
+  if (!geoJson) throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
+  const geo = parseGeoMeta(geoJson);
+  if (!geo.coarse_to_fine) throw new Error('missing geo.coarse_to_fine metadata');
+  return { geo, cogp: parseCogpMeta(JSON.stringify(geo.coarse_to_fine), numRowGroups) };
 }

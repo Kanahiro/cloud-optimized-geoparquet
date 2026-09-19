@@ -8,7 +8,7 @@ A COGP file is a valid [GeoParquet 1.1](https://geoparquet.org/) file whose row 
 
 COGP is **feature-level**: it reorders features across row groups; it does not simplify, aggregate, or duplicate them. Each source feature appears in exactly one row group, with its geometry preserved verbatim.
 
-A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `cogp` metadata and read the file as ordinary GeoParquet 1.1.
+A COGP-aware reader can stream just the leading row groups needed for its target rendering resolution and stop. A reader that does not understand the profile can ignore the `geo.coarse_to_fine` metadata and read the file as ordinary GeoParquet 1.1.
 
 ## Design influences
 
@@ -28,7 +28,7 @@ COGP is a small, conservative layout convention that enables this without changi
 
 ## Benefits
 
-- **Faster overview rendering, even for non-COGP-aware software.** Because coarse-detail features are physically placed at the front of the file, any GeoParquet 1.1 reader that streams row groups in order will see a usable overview almost immediately, without needing to understand the `cogp` metadata.
+- **Faster overview rendering, even for non-COGP-aware software.** Because coarse-detail features are physically placed at the front of the file, any GeoParquet 1.1 reader that streams row groups in order will see a usable overview almost immediately, without needing to understand the `geo.coarse_to_fine` metadata.
 - **Efficient AoI-based spatial queries, even for non-COGP-aware software.** The layout preserves GeoParquet 1.1 semantics and row group statistics, so existing engines can still prune by bounding box and answer area-of-interest queries efficiently.
 - **Minimal, resolution-targeted streaming for COGP-aware software.** A COGP-aware reader can consult the level metadata and fetch only the leading row groups required for its target geographic resolution, enabling fast progressive streaming with the smallest possible byte footprint.
 
@@ -48,9 +48,9 @@ https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
 ## Sample data
 
-- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/pois.cogp.parquet) (OpenStreetMap)
-- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/segments.cogp.parquet) (OvertureMaps)
-- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v0.1.1/buildings.cogp.parquet) (OvertureMaps)
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v1.0.0/buildings.cogp.parquet) (OvertureMaps)
 
 ## When COGP works well
 
@@ -95,13 +95,18 @@ See each implementation's README for its public API and focused workflows.
 ## Roadmap
 
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
-- [x] Reader implementation: a client that interprets the `cogp` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [x] Reader implementation: a client that interprets the `geo.coarse_to_fine` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
 
 ## Status and feedback
 
-COGP v0.1.1 is an early draft. Feedback, issues, and discussion are welcome via GitHub Issues.
+COGP v1.0.0 is the current specification. Feedback, issues, and discussion are welcome via GitHub Issues.
+
+COGP v1.0.0 uses `geo.coarse_to_fine` with CRS-unit `resolution`.
+Previously published v0.1.1 sample files use the retired `cogp` / `gsd` metadata
+and must be reconverted before using the current readers. The extension has no
+independent version field; package versions do not identify its wire format.
 
 ## License
 

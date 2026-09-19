@@ -4,7 +4,7 @@ use parquet::file::statistics::Statistics;
 use std::fs::File;
 use std::path::Path;
 
-use crate::meta::{CogpMeta, GeoMeta, COGP_METADATA_KEY, GEO_METADATA_KEY};
+use crate::meta::{GeoMeta, GEO_METADATA_KEY};
 
 pub fn run(path: &Path) -> Result<()> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -17,7 +17,6 @@ pub fn run(path: &Path) -> Result<()> {
     let mut warnings: Vec<String> = Vec::new();
 
     let mut geo_meta: Option<GeoMeta> = None;
-    let mut cogp_meta: Option<CogpMeta> = None;
 
     if let Some(kv) = kv {
         for entry in kv {
@@ -29,10 +28,6 @@ pub fn run(path: &Path) -> Result<()> {
                 GEO_METADATA_KEY => match serde_json::from_str::<GeoMeta>(value) {
                     Ok(m) => geo_meta = Some(m),
                     Err(e) => errors.push(format!("`geo` metadata is not valid JSON: {e}")),
-                },
-                COGP_METADATA_KEY => match serde_json::from_str::<CogpMeta>(value) {
-                    Ok(m) => cogp_meta = Some(m),
-                    Err(e) => errors.push(format!("`cogp` metadata is not valid JSON: {e}")),
                 },
                 _ => {}
             }
@@ -49,99 +44,49 @@ pub fn run(path: &Path) -> Result<()> {
         }
     };
     if !geo.version.starts_with("1.") {
-        warnings.push(format!("GeoParquet version is `{}`; COGP v0.1.1 targets 1.1.x", geo.version));
+        warnings.push(format!(
+            "GeoParquet version is `{}`; this writer targets 1.1.x",
+            geo.version
+        ));
     }
 
     let primary = geo.primary_column.clone();
     let primary_col = match geo.columns.get(&primary) {
         Some(c) => c.clone(),
         None => {
-            errors.push(format!("`geo.columns` is missing primary_column `{primary}`"));
+            errors.push(format!(
+                "`geo.columns` is missing primary_column `{primary}`"
+            ));
             print_report(path, &errors, &warnings);
             bail!("validation failed");
         }
     };
-
-    let covering = match primary_col.covering.as_ref() {
-        Some(c) => c,
-        None => {
-            errors.push(format!("`geo.columns[{primary}].covering` is required by COGP §5.1"));
-            print_report(path, &errors, &warnings);
-            bail!("validation failed");
-        }
-    };
-
-    let bbox_paths = [
-        ("xmin", &covering.bbox.xmin),
-        ("ymin", &covering.bbox.ymin),
-        ("xmax", &covering.bbox.xmax),
-        ("ymax", &covering.bbox.ymax),
-    ];
-
-    // §5.3 cogp metadata
-    let cogp = match cogp_meta {
-        Some(c) => c,
-        None => {
-            errors.push("missing `cogp` key-value metadata".into());
-            print_report(path, &errors, &warnings);
-            bail!("validation failed");
-        }
-    };
-
-    let major: u32 = cogp.version.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    if major != 0 {
-        errors.push(format!("unsupported cogp major version `{}`; this validator implements 0.x", cogp.version));
-    }
-    if cogp.levels.is_empty() {
-        errors.push("`cogp.levels` must be non-empty".into());
-    }
 
     let num_rgs = metadata.num_row_groups();
-    if num_rgs == 0 {
-        errors.push("file has zero row groups".into());
-    }
-
-    let mut prev_rge: Option<i64> = None;
-    let mut prev_gsd: Option<f64> = None;
-    for (i, level) in cogp.levels.iter().enumerate() {
-        if level.row_group_end < 0 || (level.row_group_end as usize) >= num_rgs {
-            errors.push(format!(
-                "levels[{i}].row_group_end={} out of range [0, {})",
-                level.row_group_end, num_rgs
-            ));
-        }
-        if let Some(p) = prev_rge {
-            if level.row_group_end <= p {
-                errors.push(format!(
-                    "levels[{i}].row_group_end={} must be strictly greater than previous ({})",
-                    level.row_group_end, p
-                ));
+    match &geo.coarse_to_fine {
+        Some(layout) => {
+            if let Err(e) = layout.validate(num_rgs) {
+                errors.push(e.to_string());
+            }
+            if file_meta.num_rows() == 0 {
+                errors.push("empty files must omit geo.coarse_to_fine".into());
             }
         }
-        prev_rge = Some(level.row_group_end);
-        // partial_cmp so NaN gsd values also fall into the error branch.
-        if level.gsd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            errors.push(format!("levels[{i}].gsd={} must be positive", level.gsd));
-        }
-        if let Some(p) = prev_gsd {
-            if level.gsd.partial_cmp(&p) != Some(std::cmp::Ordering::Less) {
-                errors.push(format!(
-                    "levels[{i}].gsd={} must be strictly less than previous ({})",
-                    level.gsd, p
-                ));
-            }
-        }
-        prev_gsd = Some(level.gsd);
+        None if file_meta.num_rows() == 0 => {}
+        None => errors.push("missing geo.coarse_to_fine metadata".into()),
     }
-    if let Some(last) = cogp.levels.last() {
-        if num_rgs > 0 && last.row_group_end != (num_rgs as i64) - 1 {
-            errors.push(format!(
-                "final levels[].row_group_end={} must equal num_row_groups-1={}",
-                last.row_group_end,
-                num_rgs - 1
-            ));
-        }
-    }
+    let bbox_paths = primary_col
+        .covering
+        .as_ref()
+        .map(|covering| {
+            vec![
+                ("xmin", &covering.bbox.xmin),
+                ("ymin", &covering.bbox.ymin),
+                ("xmax", &covering.bbox.xmax),
+                ("ymax", &covering.bbox.ymax),
+            ]
+        })
+        .unwrap_or_default();
 
     // §5.1 cont: bbox covering columns must have row group min/max stats.
     // Locate the column indexes for each bbox sub-field.
@@ -163,22 +108,38 @@ pub fn run(path: &Path) -> Result<()> {
                     match col.statistics() {
                         Some(stats) => {
                             let has_min_max = match stats {
-                                Statistics::Boolean(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int32(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int64(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Int96(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Float(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::Double(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::ByteArray(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
-                                Statistics::FixedLenByteArray(s) => s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some(),
+                                Statistics::Boolean(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int32(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int64(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Int96(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Float(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::Double(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::ByteArray(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
+                                Statistics::FixedLenByteArray(s) => {
+                                    s.min_bytes_opt().is_some() && s.max_bytes_opt().is_some()
+                                }
                             };
                             if !has_min_max {
-                                errors.push(format!(
+                                warnings.push(format!(
                                     "row group {rg_i} column `{dotted}` has no min/max stats"
                                 ));
                             }
                         }
-                        None => errors.push(format!(
+                        None => warnings.push(format!(
                             "row group {rg_i} column `{dotted}` has no statistics"
                         )),
                     }
@@ -196,7 +157,10 @@ pub fn run(path: &Path) -> Result<()> {
 
 fn print_report(path: &Path, errors: &[String], warnings: &[String]) {
     if errors.is_empty() {
-        println!("OK: {} conforms to COGP v0.1.1", path.display());
+        println!(
+            "OK: {} has valid coarse-to-fine layout metadata",
+            path.display()
+        );
     } else {
         println!("FAIL: {} ({} error(s))", path.display(), errors.len());
     }

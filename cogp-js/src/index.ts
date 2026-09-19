@@ -9,7 +9,6 @@ export { rangeCachedAsyncBuffer } from './range-cache.js';
 export type { RangeCacheOptions } from './range-cache.js';
 
 export {
-  COGP_METADATA_KEY,
   GEO_METADATA_KEY,
   extractCogpDocument,
   parseCogpMeta,
@@ -26,6 +25,6 @@ export type {
   Level,
 } from './meta.js';
 
-export { selectLevelByGsd } from './level.js';
+export { selectLevelByResolution } from './level.js';
 
 export type { Bbox } from './bbox.js';

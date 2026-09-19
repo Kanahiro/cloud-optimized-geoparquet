@@ -28,6 +28,10 @@ let latestUrl = '';
 async function openDataset(url: string): Promise<OpenResult> {
   latestUrl = url;
   const reader = await CogpReader.open(url);
+  const crs = reader.geo.columns[reader.primaryGeometryColumn]?.crs as { type?: string } | null | undefined;
+  if (crs !== undefined && (!crs || crs.type !== 'GeographicCRS')) {
+    throw new Error('This demo requires longitude/latitude geometry in degrees.');
+  }
   if (latestUrl !== url) throw new Error('Dataset open was superseded');
 
   const dataBbox = computeDataBbox(reader);
@@ -45,14 +49,14 @@ async function openDataset(url: string): Promise<OpenResult> {
 async function readViewport(
   url: string,
   bbox: ViewportBbox,
-  targetGsd: number,
+  targetResolution: number,
 ): Promise<ViewportResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
     return { data: { type: 'FeatureCollection', features: [] }, status: '' };
   }
   const geomColumn = ds.reader.primaryGeometryColumn;
-  const maxLevel = ds.reader.selectLevel(targetGsd);
+  const maxLevel = ds.reader.selectLevel(targetResolution);
   const rows = await ds.reader.readRows({
     bbox,
     maxLevel,
@@ -76,7 +80,7 @@ async function readViewport(
   ds.servedViewports += 1;
   return {
     data: { type: 'FeatureCollection', features },
-    status: `Loaded ${features.length} features at ${formatGsd(targetGsd)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
+    status: `Loaded ${features.length} features at ${formatResolution(targetResolution)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
   };
 }
 
@@ -86,7 +90,7 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
     num_row_groups: reader.numRowGroups,
     levels: reader.levels.map((l, i) => ({
       i,
-      gsd: l.gsd,
+      resolution: l.resolution,
       row_group_end: l.row_group_end,
     })),
     crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
@@ -130,10 +134,8 @@ function coerceForGeoJson(value: unknown): unknown {
   return value;
 }
 
-function formatGsd(gsdMeters: number): string {
-  if (gsdMeters >= 1000) return `${(gsdMeters / 1000).toFixed(1)} km`;
-  if (gsdMeters >= 1) return `${gsdMeters.toFixed(1)} m`;
-  return `${(gsdMeters * 100).toFixed(1)} cm`;
+function formatResolution(resolution: number): string {
+  return `${resolution.toPrecision(3)}°`;
 }
 
 self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
@@ -143,7 +145,7 @@ self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
     if (payload.type === 'open') {
       result = await openDataset(payload.url);
     } else {
-      result = await readViewport(payload.url, payload.bbox, payload.targetGsd);
+      result = await readViewport(payload.url, payload.bbox, payload.targetResolution);
     }
     const response: WorkerResponse = { id, ok: true, result };
     self.postMessage(response);

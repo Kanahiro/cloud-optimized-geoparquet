@@ -3,7 +3,7 @@
 TypeScript reader for the [Cloud Optimized GeoParquet Profile
 (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
 metadata and fetches only the Parquet ranges needed for a requested geographic
-area and ground sample distance. Bbox reads use covering-column statistics to
+area and rendering resolution in primary geometry CRS units. Bbox reads use covering-column statistics to
 prune row groups, then lazily fetch Parquet PageIndexes to prune pages inside
 the surviving groups. Files without PageIndexes fall back safely to Row Group
 reads. An exact per-feature bbox filter is applied to every surviving row.
@@ -59,4 +59,11 @@ pnpm --filter cogp-demo build
 ```
 
 The public entry point exports `CogpReader`, metadata parsing helpers,
-`selectLevelByGsd`, and their associated TypeScript types.
+`selectLevelByResolution`, and their associated TypeScript types.
+
+Readers validate all level boundaries against the footer before selecting a prefix.
+Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be
+regenerated with the current converter. Bbox covering and PageIndexes are optional.
+Without covering, bbox queries decode primary WKB and filter its envelope.
+The demo expects longitude/latitude coordinates and passes degrees per pixel.
+Display prefixes are partial selections, not complete analytical query results.

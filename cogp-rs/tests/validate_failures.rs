@@ -10,8 +10,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::meta::{
-    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, COGP_METADATA_KEY, COGP_VERSION,
-    GEOPARQUET_VERSION, GEO_METADATA_KEY,
+    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, GEOPARQUET_VERSION,
+    GEO_METADATA_KEY,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
@@ -71,6 +71,7 @@ fn standard_geo() -> GeoMeta {
         },
     );
     GeoMeta {
+        coarse_to_fine: None,
         version: GEOPARQUET_VERSION.into(),
         primary_column: "geometry".into(),
         columns: cols,
@@ -118,18 +119,14 @@ fn write_file(path: &std::path::Path, row_groups: usize, kv: Vec<KeyValue>) {
 
 fn kv(geo: Option<GeoMeta>, cogp: Option<CogpMeta>) -> Vec<KeyValue> {
     let mut out = Vec::new();
-    if let Some(g) = geo {
+    if let Some(mut g) = geo {
+        g.coarse_to_fine = cogp;
         out.push(KeyValue {
             key: GEO_METADATA_KEY.into(),
             value: Some(serde_json::to_string(&g).unwrap()),
         });
     }
-    if let Some(c) = cogp {
-        out.push(KeyValue {
-            key: COGP_METADATA_KEY.into(),
-            value: Some(serde_json::to_string(&c).unwrap()),
-        });
-    }
+
     out
 }
 
@@ -149,10 +146,15 @@ fn validate_happy_path_accepts_well_formed_file() {
     let tmp = TempDir::new("happy");
     let p = tmp.path().join("ok.parquet");
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 1000.0 },
-            Level { row_group_end: 2, gsd: 100.0 },
+            Level {
+                row_group_end: 0,
+                resolution: 1000.0,
+            },
+            Level {
+                row_group_end: 2,
+                resolution: 100.0,
+            },
         ],
     };
     write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
@@ -164,8 +166,10 @@ fn validate_rejects_missing_geo() {
     let tmp = TempDir::new("missing-geo");
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: 1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            resolution: 1.0,
+        }],
     };
     write_file(&p, 1, kv(None, Some(cogp)));
     assert_validate_fails(&p, "geo");
@@ -180,19 +184,24 @@ fn validate_rejects_missing_cogp() {
 }
 
 #[test]
-fn validate_rejects_non_decreasing_gsd() {
-    let tmp = TempDir::new("flat-gsd");
+fn validate_rejects_non_decreasing_resolution() {
+    let tmp = TempDir::new("flat-resolution");
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 100.0 },
+            Level {
+                row_group_end: 0,
+                resolution: 100.0,
+            },
             // equal to previous → must be strictly less
-            Level { row_group_end: 1, gsd: 100.0 },
+            Level {
+                row_group_end: 1,
+                resolution: 100.0,
+            },
         ],
     };
     write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
-    assert_validate_fails(&p, "gsd");
+    assert_validate_fails(&p, "resolution");
 }
 
 #[test]
@@ -200,10 +209,15 @@ fn validate_rejects_non_increasing_row_group_end() {
     let tmp = TempDir::new("flat-rge");
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 1, gsd: 100.0 },
-            Level { row_group_end: 1, gsd: 10.0 }, // not strictly greater
+            Level {
+                row_group_end: 1,
+                resolution: 100.0,
+            },
+            Level {
+                row_group_end: 0,
+                resolution: 10.0,
+            }, // decreasing
         ],
     };
     write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
@@ -216,10 +230,15 @@ fn validate_rejects_final_row_group_end_mismatch() {
     let p = tmp.path().join("bad.parquet");
     // File has 3 row groups, but levels stop at index 1 → 2 ≠ 3-1.
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
         levels: vec![
-            Level { row_group_end: 0, gsd: 100.0 },
-            Level { row_group_end: 1, gsd: 10.0 },
+            Level {
+                row_group_end: 0,
+                resolution: 100.0,
+            },
+            Level {
+                row_group_end: 1,
+                resolution: 10.0,
+            },
         ],
     };
     write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
@@ -227,12 +246,14 @@ fn validate_rejects_final_row_group_end_mismatch() {
 }
 
 #[test]
-fn validate_rejects_negative_gsd() {
-    let tmp = TempDir::new("neg-gsd");
+fn validate_rejects_negative_resolution() {
+    let tmp = TempDir::new("neg-resolution");
     let p = tmp.path().join("bad.parquet");
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: -1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            resolution: -1.0,
+        }],
     };
     write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "positive");
@@ -253,8 +274,10 @@ fn validate_rejects_missing_covering_column_in_schema() {
         },
     });
     let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
-        levels: vec![Level { row_group_end: 0, gsd: 1.0 }],
+        levels: vec![Level {
+            row_group_end: 0,
+            resolution: 1.0,
+        }],
     };
     write_file(&p, 1, kv(Some(geo), Some(cogp)));
     assert_validate_fails(&p, "covering");
@@ -264,10 +287,76 @@ fn validate_rejects_missing_covering_column_in_schema() {
 fn validate_rejects_empty_levels() {
     let tmp = TempDir::new("empty-levels");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta {
-        version: COGP_VERSION.into(),
-        levels: vec![],
-    };
+    let cogp = CogpMeta { levels: vec![] };
     write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
     assert_validate_fails(&p, "non-empty");
+}
+
+#[test]
+fn repeated_boundaries_and_optional_covering_are_valid() {
+    let tmp = TempDir::new("repeated-boundaries");
+    let path = tmp.path().join("valid.parquet");
+    let mut geo = standard_geo();
+    geo.columns.get_mut("geometry").unwrap().covering = None;
+    let layout = CogpMeta {
+        levels: vec![
+            Level {
+                row_group_end: 0,
+                resolution: 1.0,
+            },
+            Level {
+                row_group_end: 0,
+                resolution: 0.1,
+            },
+            Level {
+                row_group_end: 1,
+                resolution: 0.01,
+            },
+        ],
+    };
+    write_file(&path, 2, kv(Some(geo), Some(layout)));
+    cogp::validate::run(&path).unwrap();
+    let reader = cogp::reader::Reader::open(&path).unwrap();
+    assert_eq!(reader.row_groups_in_level(1).unwrap(), 1..1);
+    assert_eq!(
+        reader.row_groups_intersecting_bbox([0.0, 0.0, 1.0, 1.0]),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn reader_rejects_invalid_prefix_before_selection() {
+    let tmp = TempDir::new("invalid-prefix");
+    let path = tmp.path().join("bad.parquet");
+    for levels in [
+        vec![Level {
+            row_group_end: 0,
+            resolution: 1.0,
+        }],
+        vec![Level {
+            row_group_end: 2,
+            resolution: 1.0,
+        }],
+        vec![Level {
+            row_group_end: 1,
+            resolution: -1.0,
+        }],
+        vec![
+            Level {
+                row_group_end: 1,
+                resolution: 1.0,
+            },
+            Level {
+                row_group_end: 1,
+                resolution: 2.0,
+            },
+        ],
+    ] {
+        write_file(
+            &path,
+            2,
+            kv(Some(standard_geo()), Some(CogpMeta { levels })),
+        );
+        assert!(cogp::reader::Reader::open(&path).is_err());
+    }
 }
