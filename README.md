@@ -167,19 +167,10 @@ See each implementation's README for its public API and focused workflows.
 
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
 - [x] Reader implementation: a client that interprets the `geo.lod` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [ ] Propose the level-of-detail layout as a GeoParquet extension.
+- [ ] Add geometry overviews for scale-dependent rendering while preserving the lossless primary geometry.
 
 A proof-of-concept exploring this layout exists at [Kanahiro/yosegi](https://github.com/Kanahiro/yosegi).
-
-## Status and feedback
-
-COGP v1.0.0 is the current specification. Feedback, issues, and discussion are welcome via GitHub Issues.
-
-COGP v1.0.0 uses `geo.lod` with CRS-unit `resolution`.
-Previously published v0.1.1 sample files use the retired `cogp` / `gsd` metadata
-and must be reconverted before using the current readers. The extension has no
-independent version field; package versions do not identify its wire format.
-
-Readers require `geo.lod.levels`; the previous `geo.coarse_to_fine` key is not supported. The published `/v1.0.0/` samples have been regenerated with `geo.lod`.
 
 ## License
 
