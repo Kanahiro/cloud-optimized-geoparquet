@@ -129,9 +129,8 @@ computes bboxes from geometry and adds a collision-free column named `bbox`,
 The writer always spatially packs page-sized intervals within each Row Group,
 with `--page-row-count` defaulting to **2,048 rows**. It writes column-chunk
 statistics, page statistics / ColumnIndexes for covering bbox leaves, and
-OffsetIndexes for all leaves. Parquet byte limits may produce smaller pages;
-indexes describe the actual output. Readers without Page Index support can
-still read complete column chunks.
+OffsetIndexes for all leaves. Readers without Page Index support can still read
+complete column chunks.
 
 Compression is **ZSTD level 3**. Dictionary encoding is disabled for the primary
 WKB geometry and covering bbox leaves. Other columns retain the Parquet writer's
