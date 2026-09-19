@@ -18,7 +18,7 @@ import {
   type RangeCoalescingOptions,
 } from './coalescing-buffer.js';
 import { selectLevelByResolution } from './level.js';
-import { type BboxCovering, type CogpMeta, extractCogpDocument, type GeoMeta } from './meta.js';
+import { type BboxCovering, type CogpMeta, extractGeoMeta, type GeoMeta } from './meta.js';
 import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
@@ -107,7 +107,7 @@ export interface ReadOptions {
    * WKB geometry columns contribute; other heavy columns (long strings,
    * etc.) are not measured.
    */
-  maxRowWkbBytes?: number;
+  maxGeometryBytes?: number;
 }
 
 export class CogpReader {
@@ -123,7 +123,7 @@ export class CogpReader {
     const file = opts.rangeCache === false
       ? coalesced
       : rangeCachedAsyncBuffer(coalesced, opts.rangeCache);
-    return CogpReader.fromAsyncBuffer(file, url);
+    return CogpReader.fromAsyncBuffer(file);
   }
 
   /**
@@ -134,14 +134,12 @@ export class CogpReader {
    */
   static async fromAsyncBuffer(
     file: { byteLength: number; slice: (start: number, end?: number) => unknown },
-    url: string,
   ): Promise<CogpReader> {
     const metadata = (await parquetMetadataAsync(file as never)) as unknown as FullFileMetadata;
-    return new CogpReader(file, metadata, url);
+    return new CogpReader(file, metadata);
   }
 
-  readonly cogp: CogpMeta;
-  readonly geo: GeoMeta;
+  readonly geo: GeoMeta & { coarse_to_fine: CogpMeta };
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
@@ -153,12 +151,9 @@ export class CogpReader {
 
   private constructor(
     private readonly file: unknown,
-    readonly metadata: FullFileMetadata,
-    readonly url: string,
+    private readonly metadata: FullFileMetadata,
   ) {
-    const doc = extractCogpDocument(metadata.key_value_metadata, metadata.row_groups.length);
-    this.cogp = doc.cogp;
-    this.geo = doc.geo;
+    this.geo = extractGeoMeta(metadata.key_value_metadata, metadata.row_groups.length);
 
     const offsets: number[] = [];
     let acc = 0;
@@ -180,10 +175,6 @@ export class CogpReader {
     this.geomColumns = geomCols;
   }
 
-  get levels() {
-    return this.cogp.levels;
-  }
-
   get numRowGroups(): number {
     return this.metadata.row_groups.length;
   }
@@ -199,8 +190,8 @@ export class CogpReader {
    * coarsest level is returned respectively.
    */
   selectLevel(targetResolution?: number): number {
-    if (targetResolution === undefined) return this.levels.length - 1;
-    return selectLevelByResolution(this.levels, targetResolution);
+    if (targetResolution === undefined) return this.geo.coarse_to_fine.levels.length - 1;
+    return selectLevelByResolution(this.geo.coarse_to_fine.levels, targetResolution);
   }
 
   /**
@@ -214,11 +205,11 @@ export class CogpReader {
    * row's per-feature bbox column.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
-    const maxLevel = opts.maxLevel ?? this.levels.length - 1;
+    const maxLevel = opts.maxLevel ?? this.geo.coarse_to_fine.levels.length - 1;
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
-    const maxRowWkbBytes = opts.maxRowWkbBytes;
+    const maxGeometryBytes = opts.maxGeometryBytes;
     let wkbBytes = 0;
     // When filtering by bbox we need the per-row bbox struct on hand. If the
     // caller provided a custom column selection that excludes it, splice the
@@ -244,13 +235,13 @@ export class CogpReader {
     // downstream renderer).
     //
     const acceptRow = (row: Record<string, unknown>): boolean => {
-      if (maxRowWkbBytes !== undefined) {
+      if (maxGeometryBytes !== undefined) {
         let rowWkbBytes = 0;
         for (const col of geomCols) {
           const v = row[col];
           if (v instanceof Uint8Array) rowWkbBytes += v.byteLength;
         }
-        if (wkbBytes + rowWkbBytes > maxRowWkbBytes) return true;
+        if (wkbBytes + rowWkbBytes > maxGeometryBytes) return true;
         wkbBytes += rowWkbBytes;
       }
       for (const col of geomCols) {
@@ -304,10 +295,10 @@ export class CogpReader {
   }
 
   private candidateRowGroups(maxLevel: number, bbox?: Bbox): number[] {
-    if (maxLevel < 0 || maxLevel >= this.levels.length) {
-      throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
+    if (maxLevel < 0 || maxLevel >= this.geo.coarse_to_fine.levels.length) {
+      throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.geo.coarse_to_fine.levels.length})`);
     }
-    const end = this.levels[maxLevel]!.row_group_end;
+    const end = this.geo.coarse_to_fine.levels[maxLevel]!.row_group_end;
     const out: number[] = [];
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;

@@ -58,8 +58,25 @@ Build the browser demo with:
 pnpm --filter cogp-demo build
 ```
 
-The public entry point exports `CogpReader`, metadata parsing helpers,
-`selectLevelByResolution`, and their associated TypeScript types.
+The public entry point exports `CogpReader` and its associated configuration and
+metadata types. Metadata parsing, level-selection helpers, and cache construction
+remain internal. Read levels through `reader.geo.coarse_to_fine.levels`.
+`CogpReader.fromAsyncBuffer(file)` accepts a custom byte source without a URL.
+
+```ts
+const reader = await CogpReader.open(url);
+const rows = await reader.readRows({
+  maxLevel: reader.selectLevel(targetResolution), // primary geometry CRS units
+  bbox: [xmin, ymin, xmax, ymax],
+  columns: [reader.primaryGeometryColumn],
+  maxRows: 10_000,
+  maxGeometryBytes: 8 * 1024 * 1024,
+});
+```
+
+`maxGeometryBytes` limits cumulative raw WKB bytes across returned geometry
+columns, not bytes per row or HTTP transfer size. A row exceeding the remaining
+budget stops the read before decoding that row. Both output caps are optional.
 
 Readers validate all level boundaries against the footer before selecting a prefix.
 Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be

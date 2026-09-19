@@ -12,7 +12,7 @@ use arrow::array::{
     ArrayRef, BinaryArray, Float64Array, Int32Array, RecordBatch, StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use cogp::convert::{ConvertArgs, InputUnits, SortKeyOrder};
+use cogp::convert::{ConvertArgs, PriorityColumnOrder};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
 use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
@@ -139,17 +139,13 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
-        page_row_count: Some(2),
-        dictionary_page_size_limit: None,
-        row_group_max_bytes: None,
-        input_units: InputUnits::Degrees,
-        geometry_column: None,
+        page_row_count: 2,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
         line_visibility_factor: 2,
         polygon_visibility_factor: 4,
-        sort_key: None,
-        sort_order: SortKeyOrder::Desc,
+        priority_column: None,
+        priority_column_order: PriorityColumnOrder::Desc,
     }
 }
 
@@ -292,21 +288,8 @@ fn convert_rejects_zero_thinning_factor() {
     assert!(format!("{err}").contains("point-thinning-factor"));
 }
 
-#[test]
-fn convert_rejects_zero_dictionary_page_size_limit() {
-    let tmp = TempDir::new("zerodictionarypage");
-    let input = tmp.path().join("input.parquet");
-    let output = tmp.path().join("out.parquet");
-    write_input(&input);
-    let mut args = convert_args(&input, &output);
-    args.dictionary_page_size_limit = Some(0);
-    let err = cogp::convert::run(args).unwrap_err();
-    assert!(format!("{err}").contains("dictionary-page-size-limit"));
-}
-
 /// Convert reuses an existing GeoParquet 1.1 `covering.bbox` column instead
-/// of recomputing per-feature bboxes from WKB. The reuse path also drops
-/// the original column from the output.
+/// of recomputing per-feature bboxes from WKB, preserving the original column.
 #[test]
 fn convert_reuses_existing_bbox_column() {
     let tmp = TempDir::new("reuse-bbox");
@@ -531,7 +514,6 @@ fn preserves_null_empty_duplicate_rows_and_crs_metadata() {
     writer.close().unwrap();
     let mut args = convert_args(&input, &output);
     args.resolution = vec![1.0, 0.1];
-    args.input_units = InputUnits::Auto;
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
@@ -623,4 +605,37 @@ fn empty_input_omits_extension() {
     )
     .unwrap();
     assert!(geo.get("coarse_to_fine").is_none());
+}
+
+#[test]
+fn cli_defaults_write_page_indexes() {
+    let tmp = TempDir::new("cli-default-pages");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    write_input(&input);
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
+        .arg("convert").arg(&input).arg(&output).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
+    for group in reader.parquet_metadata().row_groups() {
+        assert!(group.columns().iter().all(|c| c.offset_index_offset().is_some()));
+        assert_eq!(group.columns().iter().filter(|c| {
+            c.column_path().parts().first().map(String::as_str) == Some("bbox")
+                && c.column_index_offset().is_some()
+        }).count(), 4);
+    }
+}
+
+#[test]
+fn cli_rejects_retired_options() {
+    for flag in ["--row-group-max-bytes", "--dictionary-page-size-limit", "--input-units",
+                 "--geometry-column", "--sort-key", "--sort-order"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_cogp"))
+            .args(["convert", "input.parquet", "output.parquet", flag, "1"])
+            .output().unwrap();
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");
+    }
 }

@@ -94,10 +94,10 @@ Coordinates themselves are not reprojected or quantized.
 - **Points / MultiPoints:** choose one remaining feature per bbox-center grid
   cell, with cell width `4 × resolution` by default. Points already assigned to
   coarser levels block their cells at the current resolution. Optional
-  `--sort-key` ranks candidates, followed by bbox diagonal and a deterministic
+  `--priority-column` ranks candidates, followed by bbox diagonal and a deterministic
   row-index hash as tie-breakers.
 - **Lines / polygons:** assign each feature to the first level where its bbox
-  diagonal reaches `2 × resolution` for lines or `4 × resolution` for polygons
+  diagonal reaches `4 × resolution` for both lines and polygons
   by default. Non-empty zero-extent geometries are eligible from the coarsest
   level. Lines and polygons do not compete for grid cells.
 - **Remaining rows:** place all deferred rows, including null/empty geometries,
@@ -119,11 +119,6 @@ and the writer flushes at every level boundary, so a Row Group never mixes
 levels. The final group of a level may be smaller. The metadata records the
 actual zero-based index of the last flushed Row Group for each level.
 
-Optional `--row-group-max-bytes` can flush earlier based on the writer's estimate
-of encoded size. This is not a strict bound on final compressed bytes: a single
-large row can exceed it. These earlier flushes can also split the spatial
-partitions planned from the row-count limit.
-
 ### Bbox covering, pages, and encoding
 
 Existing `covering.bbox` metadata determines which columns the writer uses;
@@ -131,19 +126,25 @@ it trusts and preserves those paths and values. If covering is absent, it
 computes bboxes from geometry and adds a collision-free column named `bbox`,
 `bbox_`, etc. An existing column merely named `bbox` has no special meaning.
 
-By default, the writer emits column-chunk statistics and disables OffsetIndexes.
-With `--page-row-count`, it additionally applies STR packing to page-sized row
-intervals within each planned Row Group, enables page statistics / ColumnIndexes
-for the covering bbox leaves, and retains OffsetIndexes for all leaves. This
-supports finer spatial pruning within selected Row Groups. Parquet's byte limits
-can create smaller pages, and early Row Group flushes from the optional byte
-limit can shift these planned intervals; indexes describe the actual output.
+The writer always spatially packs page-sized intervals within each Row Group,
+with `--page-row-count` defaulting to **2,048 rows**. It writes column-chunk
+statistics, page statistics / ColumnIndexes for covering bbox leaves, and
+OffsetIndexes for all leaves. Parquet byte limits may produce smaller pages;
+indexes describe the actual output. Readers without Page Index support can
+still read complete column chunks.
 
 Compression is **ZSTD level 3**. Dictionary encoding is disabled for the primary
 WKB geometry and covering bbox leaves. Other columns retain the Parquet writer's
-default dictionary behavior; `--dictionary-page-size-limit` can tune dictionary
-size. The published v1.0.0 samples use 65,536-row groups and
-`--page-row-count 2048`, with the other conversion options at their defaults.
+default dictionary behavior.
+
+All three visibility factors default to **4**, expressing a common four-resolution-
+unit scale. Points use that scale as grid width; lines and polygons use it as a
+bbox-diagonal threshold, so equal factors do not imply equal visual density.
+Each factor remains independently configurable.
+
+The published v1.0.0 samples were generated with 65,536-row groups, 2,048-row
+pages, and point/line/polygon factors **4/2/4**. The line default has since changed
+to 4; the existing sample objects have not been regenerated for this API change.
 
 ## Development
 

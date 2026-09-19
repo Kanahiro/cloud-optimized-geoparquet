@@ -5,14 +5,8 @@ export interface Level {
   resolution: number;
 }
 
-export interface CogpGenerator {
-  name: string;
-  version: string;
-}
-
 export interface CogpMeta {
   levels: Level[];
-  generator?: CogpGenerator;
   [extra: string]: unknown;
 }
 
@@ -76,18 +70,14 @@ export function parseGeoMeta(json: string): GeoMeta {
   return parsed;
 }
 
-export interface CogpDocument {
-  cogp: CogpMeta;
-  geo: GeoMeta;
-}
-
-export function extractCogpDocument(
+export function extractGeoMeta(
   kv: ReadonlyArray<{ key: string; value?: string | null }> | null | undefined,
   numRowGroups: number,
-): CogpDocument {
+): GeoMeta & { coarse_to_fine: CogpMeta } {
   const geoJson = kv?.find(entry => entry.key === GEO_METADATA_KEY)?.value;
   if (!geoJson) throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
   const geo = parseGeoMeta(geoJson);
   if (!geo.coarse_to_fine) throw new Error('missing geo.coarse_to_fine metadata');
-  return { geo, cogp: parseCogpMeta(JSON.stringify(geo.coarse_to_fine), numRowGroups) };
+  const coarse_to_fine = parseCogpMeta(JSON.stringify(geo.coarse_to_fine), numRowGroups);
+  return { ...geo, coarse_to_fine };
 }

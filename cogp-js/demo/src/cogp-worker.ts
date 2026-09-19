@@ -12,7 +12,7 @@ import type {
 } from './cogp-types';
 
 const VIEWPORT_MAX_ROWS = 50_000;
-const VIEWPORT_MAX_ROW_WKB_BYTES = 20_000_000;
+const VIEWPORT_MAX_GEOMETRY_BYTES = 20_000_000;
 
 interface ActiveDataset {
   url: string;
@@ -61,7 +61,7 @@ async function readViewport(
     bbox,
     maxLevel,
     maxRows: VIEWPORT_MAX_ROWS,
-    maxRowWkbBytes: VIEWPORT_MAX_ROW_WKB_BYTES,
+    maxGeometryBytes: VIEWPORT_MAX_GEOMETRY_BYTES,
   });
 
   const features: Feature[] = [];
@@ -88,7 +88,7 @@ function metadataSummary(reader: CogpReader): MetadataSummary {
   return {
     primary_column: reader.primaryGeometryColumn,
     num_row_groups: reader.numRowGroups,
-    levels: reader.levels.map((l, i) => ({
+    levels: reader.geo.coarse_to_fine.levels.map((l, i) => ({
       i,
       resolution: l.resolution,
       row_group_end: l.row_group_end,

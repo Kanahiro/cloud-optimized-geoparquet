@@ -56,27 +56,10 @@ pub struct ConvertArgs {
     /// Maximum Parquet row group size in rows.
     #[arg(long, default_value_t = 65_536)]
     pub row_group_size: usize,
-    /// Maximum top-level rows per Parquet data page. When set, the converter
-    /// writes PageIndexes for the bbox leaves and spatially packs each page
-    /// within its row group. Omit it to retain the legacy row-group-only layout.
-    #[arg(long)]
-    pub page_row_count: Option<usize>,
-    /// Best-effort maximum dictionary page size in bytes for dictionary-encoded
-    /// columns. Smaller values bound the compulsory dictionary read for sparse
-    /// PageIndex queries; low-cardinality dictionaries naturally remain smaller.
-    /// Omit this option to retain Parquet's 1 MiB default.
-    #[arg(long)]
-    pub dictionary_page_size_limit: Option<usize>,
-    /// Maximum estimated encoded Parquet row group size in bytes
-    #[arg(long)]
-    pub row_group_max_bytes: Option<usize>,
-    /// Coordinate-unit override for auto-derived zoom hints. By default use
-    /// PROJJSON horizontal units; unknown units require an explicit resolution.
-    #[arg(long, default_value = "auto")]
-    pub input_units: InputUnits,
-    /// Override auto-detected primary geometry column
-    #[arg(long)]
-    pub geometry_column: Option<String>,
+    /// Maximum top-level rows per data page. Page indexes and spatial page
+    /// packing are always enabled; smaller pages permit finer spatial pruning.
+    #[arg(long, default_value_t = 2048)]
+    pub page_row_count: usize,
     /// **Web Mercator only.** Base resolution per tile side (units) used to
     /// derive level visibility thresholds and the point-thinning grid when
     /// auto-deriving resolutions from
@@ -97,21 +80,13 @@ pub struct ConvertArgs {
     /// thinning grid (one winner per resolution-sized cell).
     #[arg(long, default_value_t = 4)]
     pub point_thinning_factor: u32,
-    /// Line visibility threshold multiplier applied to `prec` when deciding
-    /// the coarsest level at which a LineString first becomes independently
-    /// meaningful. A line is eligible from level `i` once its bbox diagonal
-    /// reaches `factor · prec[i]`. Lines are 1D so a diagonal equal to `prec`
-    /// is only a hairline; the default of `2` defers such short lines to a
-    /// finer level. Set to `1` for the least restrictive supported threshold.
-    #[arg(long, default_value_t = 2)]
+    /// Minimum line bbox diagonal in resolution units. The default uses the
+    /// same four-unit visibility scale as points and polygons; this is a
+    /// rendering heuristic, not a guarantee of equal perceived size.
+    #[arg(long, default_value_t = 4)]
     pub line_visibility_factor: u32,
-    /// Polygon visibility threshold multiplier applied to `prec` when deciding
-    /// the coarsest level at which a Polygon first becomes independently
-    /// meaningful. A polygon is eligible from level `i` once its bbox diagonal
-    /// reaches `factor · prec[i]`. Default of `4` defers polygons whose
-    /// diagonal is under ~4 grid cells to a finer level, so coarse levels aren't
-    /// crowded by tiny polygons. Set to `1` for the least restrictive supported
-    /// threshold.
+    /// Minimum polygon bbox diagonal in resolution units. Larger factors defer
+    /// smaller polygons to finer levels without changing their geometries.
     #[arg(long, default_value_t = 4)]
     pub polygon_visibility_factor: u32,
     /// Attribute column deciding which feature wins when several contend for the
@@ -124,33 +99,20 @@ pub struct ConvertArgs {
     /// column must be rank-able: numeric, boolean, or string. Rows whose value
     /// is null always lose the tie.
     #[arg(long)]
-    pub sort_key: Option<String>,
-    /// Direction for --sort-key: `desc` (default) keeps the feature with the
-    /// largest value, `asc` keeps the smallest. Ignored when --sort-key is unset.
+    pub priority_column: Option<String>,
+    /// Direction for --priority-column: `desc` (default) keeps the feature with the
+    /// largest value, `asc` keeps the smallest. Ignored when --priority-column is unset.
     #[arg(long, default_value = "desc")]
-    pub sort_order: SortKeyOrder,
+    pub priority_column_order: PriorityColumnOrder,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub enum SortKeyOrder {
-    /// Largest --sort-key value wins the cell.
+pub enum PriorityColumnOrder {
+    /// Largest --priority-column value wins the cell.
     Desc,
-    /// Smallest --sort-key value wins the cell.
+    /// Smallest --priority-column value wins the cell.
     Asc,
 }
-
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub enum InputUnits {
-    /// Detect horizontal coordinate units from the GeoParquet CRS.
-    Auto,
-    Degrees,
-    Meters,
-}
-
-/// Upper bound on slice size between byte-limit checks. A fixed cap alone
-/// can't enforce `max_bytes` when per-row payload is large — see the probe
-/// logic in `write_batch_with_row_group_limits`.
-const ROW_GROUP_BYTE_CHECK_MAX_ROWS: usize = 1024;
 
 fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
     let count = writer.flushed_row_groups().len();
@@ -160,61 +122,12 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64
     Ok((count as i64) - 1)
 }
 
-fn write_batch_with_row_group_limits<W: Write + Send>(
-    writer: &mut ArrowWriter<W>,
-    batch: &RecordBatch,
-    max_rows: usize,
-    max_bytes: Option<usize>,
-) -> Result<()> {
-    let Some(max_bytes) = max_bytes else {
-        writer.write(batch)?;
-        return Ok(());
-    };
-
-    let mut offset = 0;
-    while offset < batch.num_rows() {
-        let buffered_rows = writer.in_progress_rows();
-        let buffered_bytes = writer.in_progress_size();
-        let rows_until_row_limit = max_rows.saturating_sub(buffered_rows).max(1);
-
-        // Predict how many more rows fit in the remaining byte budget by
-        // extrapolating buffered bytes/row. Without a sample (fresh row group)
-        // probe a single row first, so a dataset where one row already exceeds
-        // `max_bytes` (e.g. dense MultiPolygons) cannot inflate the row group
-        // by ~1024× before the next size check.
-        let rows_until_byte_limit = if buffered_rows == 0 || buffered_bytes >= max_bytes {
-            1
-        } else {
-            let bytes_per_row = buffered_bytes.div_ceil(buffered_rows).max(1);
-            ((max_bytes - buffered_bytes) / bytes_per_row).max(1)
-        };
-
-        let rows = (batch.num_rows() - offset)
-            .min(rows_until_row_limit)
-            .min(rows_until_byte_limit)
-            .min(ROW_GROUP_BYTE_CHECK_MAX_ROWS);
-        writer.write(&batch.slice(offset, rows))?;
-        offset += rows;
-
-        if writer.in_progress_rows() > 0 && writer.in_progress_size() >= max_bytes {
-            writer.flush()?;
-        }
-    }
-    Ok(())
-}
-
 /// Convert equatorial meter hints to horizontal CRS units; never guess that
 /// every projected CRS uses meters, or that explicit null means CRS84.
 fn auto_resolution_scale(
     geo: Option<&serde_json::Value>,
     column: &str,
-    units: InputUnits,
 ) -> Result<f64> {
-    match units {
-        InputUnits::Degrees => return Ok(1.0 / 111_320.0),
-        InputUnits::Meters => return Ok(1.0),
-        InputUnits::Auto => {}
-    }
     let Some(mut crs) = geo.and_then(|g| g["columns"][column].get("crs")) else {
         return Ok(1.0 / 111_320.0); // GeoParquet's absent CRS is CRS84.
     };
@@ -234,7 +147,7 @@ fn auto_resolution_scale(
         _ => None,
     };
     let factor = factor.filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| anyhow!("unknown CRS units: provide --resolution in coordinate units or --input-units for auto zoom hints"))?;
+        .ok_or_else(|| anyhow!("unknown CRS units: provide --resolution in coordinate units"))?;
     Ok(1.0 / factor)
 }
 
@@ -332,11 +245,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
     }
-    if args.page_row_count == Some(0) {
+    if args.page_row_count == 0 {
         bail!("--page-row-count must be >= 1");
-    }
-    if args.dictionary_page_size_limit == Some(0) {
-        bail!("--dictionary-page-size-limit must be >= 1");
     }
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
@@ -366,15 +276,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .transpose()
         .context("invalid geo metadata fields")?;
 
-    let geom_col_name = if let Some(c) = &args.geometry_column {
-        c.clone()
-    } else if let Some(g) = &input_geo {
-        g.primary_column.clone()
-    } else {
-        guess_geometry_column(&input_schema).ok_or_else(|| {
-            anyhow!("could not auto-detect geometry column; pass --geometry-column")
-        })?
-    };
+    let geom_col_name = input_geo.as_ref()
+        .ok_or_else(|| anyhow!("input requires GeoParquet geo metadata with primary_column"))?
+        .primary_column.clone();
     let geom_col_idx = input_schema
         .index_of(&geom_col_name)
         .with_context(|| format!("geometry column `{geom_col_name}` not found"))?;
@@ -404,7 +308,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // hints need conversion; unknown CRS units require an explicit resolution.
     if args.resolution.is_empty() {
         let scale =
-            auto_resolution_scale(input_geo_json.as_ref(), &geom_col_name, args.input_units)?;
+            auto_resolution_scale(input_geo_json.as_ref(), &geom_col_name)?;
         for value in &mut resolutions {
             *value *= scale;
             anyhow::ensure!(
@@ -416,11 +320,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     eprintln!("      features: {n_rows}");
 
-    let sort_key_idx = match &args.sort_key {
+    let priority_column_idx = match &args.priority_column {
         Some(name) => Some(
             input_schema
                 .index_of(name)
-                .with_context(|| format!("--sort-key column `{name}` not found"))?,
+                .with_context(|| format!("--priority-column column `{name}` not found"))?,
         ),
         None => None,
     };
@@ -433,33 +337,33 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         ),
         None => eprintln!("[2/4] Scanning geometry (computing per-feature bbox from WKB)"),
     }
-    // Pass 1: stream only the geometry (+ covering bbox / sort-key) columns.
+    // Pass 1: stream only the geometry (+ covering bbox / priority-column) columns.
     // Everything retained per row is O(1)-sized (bbox, kind, rank), so memory
     // stays bounded by the row count, not by the file's attribute payload.
     let ScanResult {
         bboxes,
         kinds,
-        sort_key,
+        priority_column,
     } = scan_input(
         &args.input,
         &arrow_meta,
         geom_col_idx,
         covering.as_ref(),
-        sort_key_idx,
+        priority_column_idx,
     )?;
 
-    let sort_ranks = match &sort_key {
-        Some(col) => compute_sort_ranks(col.as_ref(), args.sort_order)
-            .with_context(|| format!("ranking --sort-key column `{:?}`", args.sort_key))?,
+    let sort_ranks = match &priority_column {
+        Some(col) => compute_sort_ranks(col.as_ref(), args.priority_column_order)
+            .with_context(|| format!("ranking --priority-column column `{:?}`", args.priority_column))?,
         None => vec![0u64; n_rows],
     };
-    drop(sort_key);
-    if let Some(col) = &args.sort_key {
+    drop(priority_column);
+    if let Some(col) = &args.priority_column {
         eprintln!(
             "      tie-break sort key: {col} ({})",
-            match args.sort_order {
-                SortKeyOrder::Desc => "desc, largest wins",
-                SortKeyOrder::Asc => "asc, smallest wins",
+            match args.priority_column_order {
+                PriorityColumnOrder::Desc => "desc, largest wins",
+                PriorityColumnOrder::Asc => "asc, smallest wins",
             }
         );
     }
@@ -504,15 +408,13 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
         str_pack(rows, &bboxes, args.row_group_size, level_idx);
-        if let Some(page_row_count) = args.page_row_count {
-            str_pack_pages(
-                rows,
-                &bboxes,
-                args.row_group_size,
-                page_row_count,
-                level_idx,
-            );
-        }
+        str_pack_pages(
+            rows,
+            &bboxes,
+            args.row_group_size,
+            args.page_row_count,
+            level_idx,
+        );
     }
 
     eprintln!("[4/4] Writing COGP file: {}", args.output.display());
@@ -558,9 +460,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false);
-    if let Some(dictionary_page_size_limit) = args.dictionary_page_size_limit {
-        props_builder = props_builder.set_dictionary_page_size_limit(dictionary_page_size_limit);
-    }
     for parts in [
         &output_covering.bbox.xmin,
         &output_covering.bbox.ymin,
@@ -569,21 +468,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     ] {
         let path = ColumnPath::from(parts.clone());
         props_builder = props_builder.set_column_dictionary_enabled(path.clone(), false);
-        if args.page_row_count.is_some() {
-            props_builder =
-                props_builder.set_column_statistics_enabled(path, EnabledStatistics::Page);
-        }
+        props_builder = props_builder.set_column_statistics_enabled(path, EnabledStatistics::Page);
     }
-    if let Some(page_row_count) = args.page_row_count {
-        // Matching the write batch to the row limit lets the writer honor the
-        // boundary closely even for narrow columns. Offset indexes remain on
-        // for every leaf so a bbox PageIndex selection maps to projected data.
-        props_builder = props_builder
-            .set_data_page_row_count_limit(page_row_count)
-            .set_write_batch_size(page_row_count);
-    } else {
-        props_builder = props_builder.set_offset_index_disabled(true);
-    }
+    // Keep bbox page statistics and offsets for all projected columns.
+    props_builder = props_builder
+        .set_data_page_row_count_limit(args.page_row_count)
+        .set_write_batch_size(args.page_row_count);
     let props = props_builder.build();
     let out_file = File::create(&args.output)
         .with_context(|| format!("creating {}", args.output.display()))?;
@@ -644,7 +534,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     let mut last_level: Option<usize> = None;
     let mut levels_meta: Vec<Level> = Vec::with_capacity(resolutions.len());
-    let row_group_max_bytes = args.row_group_max_bytes;
     while let Ok((level_i, batch)) = rx.recv() {
         if let Some(prev) = last_level {
             if prev != level_i {
@@ -655,12 +544,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 });
             }
         }
-        write_batch_with_row_group_limits(
-            &mut writer,
-            &batch,
-            args.row_group_size,
-            row_group_max_bytes,
-        )?;
+        writer.write(&batch)?;
         last_level = Some(level_i);
     }
     if let Some(prev) = last_level {
@@ -924,13 +808,13 @@ impl<'a> CoverCols<'a> {
 struct ScanResult {
     bboxes: Vec<Bbox>,
     kinds: Vec<GeomKind>,
-    /// The fully materialized `--sort-key` column, when one was requested —
+    /// The fully materialized `--priority-column` column, when one was requested —
     /// the only column the convert still holds in memory in its entirety.
-    sort_key: Option<ArrayRef>,
+    priority_column: Option<ArrayRef>,
 }
 
 /// Pass 1: stream the file reading only the geometry column (plus, when
-/// present, the covering bbox column and the `--sort-key` column) and reduce
+/// present, the covering bbox column and the `--priority-column` column) and reduce
 /// each row to its bbox + geometry kind. Batches are dropped as soon as they
 /// are consumed, so peak memory is one batch plus the per-row outputs.
 fn scan_input(
@@ -938,13 +822,13 @@ fn scan_input(
     meta: &ArrowReaderMetadata,
     geom_col_idx: usize,
     covering: Option<&CoveringPlan>,
-    sort_key_idx: Option<usize>,
+    priority_column_idx: Option<usize>,
 ) -> Result<ScanResult> {
     let mut roots: Vec<usize> = vec![geom_col_idx];
     if let Some(p) = covering {
         roots.extend_from_slice(&p.roots);
     }
-    if let Some(i) = sort_key_idx {
+    if let Some(i) = priority_column_idx {
         roots.push(i);
     }
     roots.sort_unstable();
@@ -970,7 +854,7 @@ fn scan_input(
     let n_rows = meta.metadata().file_metadata().num_rows() as usize;
     let mut bboxes: Vec<Bbox> = Vec::with_capacity(n_rows);
     let mut kinds: Vec<GeomKind> = Vec::with_capacity(n_rows);
-    let mut sort_key_parts: Vec<ArrayRef> = Vec::new();
+    let mut priority_column_parts: Vec<ArrayRef> = Vec::new();
     let mut row_base = 0usize;
     for batch in reader {
         let batch = batch?;
@@ -987,19 +871,19 @@ fn scan_input(
             bboxes.push(bb);
             kinds.push(k);
         }
-        if let Some(i) = sort_key_idx {
-            sort_key_parts.push(batch.column(proj_idx(i)).clone());
+        if let Some(i) = priority_column_idx {
+            priority_column_parts.push(batch.column(proj_idx(i)).clone());
         }
         row_base += batch.num_rows();
     }
-    let sort_key = match sort_key_idx {
-        Some(_) => Some(concat_sort_key(&sort_key_parts)?),
+    let priority_column = match priority_column_idx {
+        Some(_) => Some(concat_priority_column(&priority_column_parts)?),
         None => None,
     };
     Ok(ScanResult {
         bboxes,
         kinds,
-        sort_key,
+        priority_column,
     })
 }
 
@@ -1040,14 +924,14 @@ fn scan_wkb_rows<O: OffsetSizeTrait>(
         .collect()
 }
 
-/// Concatenate the per-batch sort-key arrays into one column for `rank`.
+/// Concatenate the per-batch priority-column arrays into one column for `rank`.
 /// A variable-width column whose accumulated bytes would overflow i32 offsets
 /// (arrow panics past ~2 GiB) is upcast to its Large counterpart first; the
 /// 1 GiB threshold leaves headroom and keeps small columns on the i32 path.
-fn concat_sort_key(parts: &[ArrayRef]) -> Result<ArrayRef> {
+fn concat_priority_column(parts: &[ArrayRef]) -> Result<ArrayRef> {
     const PROMOTE_THRESHOLD: usize = 1 << 30;
     match parts {
-        [] => bail!("internal: sort-key scan produced no batches"),
+        [] => bail!("internal: priority-column scan produced no batches"),
         [only] => return Ok(only.clone()),
         _ => {}
     }
@@ -1089,23 +973,6 @@ fn var_width_total(arr: &dyn Array) -> usize {
         _ => None,
     }
     .unwrap_or(0)
-}
-
-fn guess_geometry_column(schema: &Schema) -> Option<String> {
-    for f in schema.fields() {
-        let n = f.name();
-        if matches!(f.data_type(), DataType::Binary | DataType::LargeBinary)
-            && (n == "geometry" || n == "geom" || n == "wkb")
-        {
-            return Some(n.clone());
-        }
-    }
-    for f in schema.fields() {
-        if matches!(f.data_type(), DataType::Binary | DataType::LargeBinary) {
-            return Some(f.name().clone());
-        }
-    }
-    None
 }
 
 /// Per-row byte contribution to variable-width output arrays; used to split a
@@ -1267,15 +1134,15 @@ struct VisibilityFactors {
     polygon: u32,
 }
 
-/// Per-row tie-break ranks derived from the `--sort-key` attribute column: a
+/// Per-row tie-break ranks derived from the `--priority-column` attribute column: a
 /// larger rank means higher priority within a point-thinning cell (see `priority`).
 /// Equal column values share a rank, so ties still fall through to the hashed
 /// row index; null values rank below every non-null and so always lose.
-fn compute_sort_ranks(col: &dyn Array, order: SortKeyOrder) -> Result<Vec<u64>> {
+fn compute_sort_ranks(col: &dyn Array, order: PriorityColumnOrder) -> Result<Vec<u64>> {
     // nulls_first keeps nulls at the lowest rank in both directions; `descending`
     // only flips which end of the value range earns the highest (winning) rank.
     let opts = SortOptions {
-        descending: matches!(order, SortKeyOrder::Asc),
+        descending: matches!(order, PriorityColumnOrder::Asc),
         nulls_first: true,
     };
     let ranks = rank(col, Some(opts))?;
@@ -1465,7 +1332,7 @@ fn assign_levels(
     Ok(out)
 }
 
-/// Point-cell winner priority. The optional `--sort-key` rank leads, bbox
+/// Point-cell winner priority. The optional `--priority-column` rank leads, bbox
 /// diagonal breaks ties for an extended MultiPoint, and a hashed row index gives
 /// a deterministic final order. Ordinary Point bboxes have zero size.
 fn priority(b: &Bbox, sort_rank: u64, row: u32) -> (u64, u64, u64) {
@@ -1650,6 +1517,25 @@ fn str_pack_rec(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cli_visibility_defaults_and_priority_options() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ConvertArgs,
+        }
+        let cli = Cli::try_parse_from(["cogp", "input", "output",
+            "--priority-column", "population", "--priority-column-order", "asc"]).unwrap();
+        assert_eq!(cli.args.point_thinning_factor, 4);
+        assert_eq!(cli.args.line_visibility_factor, 4);
+        assert_eq!(cli.args.polygon_visibility_factor, 4);
+        assert_eq!(cli.args.page_row_count, 2048);
+        assert_eq!(cli.args.priority_column.as_deref(), Some("population"));
+        assert!(matches!(cli.args.priority_column_order, PriorityColumnOrder::Asc));
+    }
+
+
     fn bb(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Bbox {
         Bbox {
             xmin,
@@ -1677,7 +1563,7 @@ mod tests {
     fn auto_hints_respect_crs_units_and_unknown_crs() {
         use serde_json::json;
         assert_eq!(
-            auto_resolution_scale(None, "geom", InputUnits::Auto).unwrap(),
+            auto_resolution_scale(None, "geom").unwrap(),
             1.0 / 111_320.0
         );
         for (unit, expected) in [
@@ -1690,12 +1576,12 @@ mod tests {
         ] {
             let geo = json!({"columns":{"geom":{"crs":{"type":"ProjectedCRS","coordinate_system":{"axis":[{"unit":unit}]}}}}});
             assert_eq!(
-                auto_resolution_scale(Some(&geo), "geom", InputUnits::Auto).unwrap(),
+                auto_resolution_scale(Some(&geo), "geom").unwrap(),
                 expected
             );
         }
         let unknown = json!({"columns":{"geom":{"crs":null}}});
-        assert!(auto_resolution_scale(Some(&unknown), "geom", InputUnits::Auto).is_err());
+        assert!(auto_resolution_scale(Some(&unknown), "geom").is_err());
     }
 
     #[test]
@@ -1793,11 +1679,11 @@ mod tests {
         let col = Int32Array::from(vec![Some(10), None, Some(30), Some(20)]);
 
         // desc → largest value gets the highest rank, null the lowest.
-        let desc = compute_sort_ranks(&col, SortKeyOrder::Desc).unwrap();
+        let desc = compute_sort_ranks(&col, PriorityColumnOrder::Desc).unwrap();
         assert!(desc[2] > desc[3] && desc[3] > desc[0] && desc[0] > desc[1]);
 
         // asc → smallest value gets the highest rank, null still lowest.
-        let asc = compute_sort_ranks(&col, SortKeyOrder::Asc).unwrap();
+        let asc = compute_sort_ranks(&col, PriorityColumnOrder::Asc).unwrap();
         assert!(asc[0] > asc[3] && asc[3] > asc[2] && asc[2] > asc[1]);
     }
 
@@ -1929,22 +1815,6 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let writer = ArrowWriter::try_new(buf, schema, None).unwrap();
         assert!(flushed_row_group_end(&writer).is_err());
-    }
-
-    #[test]
-    fn guess_geometry_column_prefers_named() {
-        use arrow::datatypes::Field;
-        let s = Schema::new(vec![
-            Field::new("attr", DataType::Binary, false),
-            Field::new("geometry", DataType::Binary, false),
-        ]);
-        assert_eq!(guess_geometry_column(&s).as_deref(), Some("geometry"));
-
-        let s = Schema::new(vec![Field::new("blob", DataType::LargeBinary, false)]);
-        assert_eq!(guess_geometry_column(&s).as_deref(), Some("blob"));
-
-        let s = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
-        assert_eq!(guess_geometry_column(&s), None);
     }
 
     #[test]

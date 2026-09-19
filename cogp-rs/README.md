@@ -54,7 +54,7 @@ cogp convert input.parquet output.cogp.parquet \
 
 # Point dataset already in a projected CRS; thin points more aggressively.
 cogp convert points.parquet points.cogp.parquet \
-    --input-units meters --point-thinning-factor 8
+    --point-thinning-factor 8
 ```
 
 Level selection (mutually exclusive). These only choose the per-level Resolutions
@@ -79,26 +79,19 @@ readable by any renderer regardless of which path you pick.
 Other options:
 
 - `--row-group-size` (default `65536`) — max Parquet row group size in rows.
-- `--page-row-count` — enables PageIndex layout with at most this many
-  top-level rows per data page. The converter spatially packs page intervals
-  within each row group and writes Page-level statistics for the four `bbox`
-  leaves. If omitted, the legacy row-group-only layout is retained.
-  Row group boundaries always align with level boundaries.
-- `--dictionary-page-size-limit` — best-effort byte limit for dictionary pages.
-  Smaller limits bound the compulsory dictionary read when a sparse PageIndex
-  query projects a high-cardinality column. Low-cardinality dictionaries remain
-  smaller than the limit naturally. If omitted, Parquet's 1 MiB default is used.
-- `--row-group-max-bytes` — max estimated encoded Parquet row group size in
-  bytes. This must be a numeric byte count, without suffixes. It is enforced
-  using the Parquet writer's in-progress encoded-size estimate, checked at batch
-  granularity, so an individual row group can exceed the target slightly.
-- `--input-units` (default `auto`) — `auto` reads the GeoParquet `crs`
-  horizontal CRS units in PROJJSON for auto-derived resolutions. An absent CRS
-  means CRS84; null or unrecognized units require explicit `--resolution` or
-  `--input-units`. Explicit resolutions always use coordinate units.
-  **For datasets spanning high latitudes or the antimeridian, reproject to a
-  meter-based CRS before running `convert`.** The degree→meter conversion is
-  rendering-grade, not geodesic.
+- `--page-row-count` (default `2048`) — maximum top-level rows per data page.
+  Page Indexes and spatial page packing are always enabled. Row Groups never
+  mix levels; the bbox leaves get ColumnIndexes and every leaf gets an OffsetIndex.
+
+The primary geometry column comes from `geo.primary_column`. Auto-derived
+resolutions use its CRS horizontal units; absent CRS means CRS84. Null or
+unrecognized units require explicit `--resolution` values in coordinate units.
+No coordinate reprojection is performed.
+
+All visibility factors default to **4**, a common four-resolution-unit scale.
+This is a rendering heuristic: a point grid width and a geometry bbox diagonal
+are different measures, so the same factor does not guarantee equal visual density.
+
 - `--point-thinning-factor` (default `4`) — point-like features (WKB
   `Point` / `MultiPoint`) thin on a grid this many times coarser per axis
   than the level Resolution, yielding approximately `factor²` fewer points than a
@@ -106,7 +99,7 @@ Other options:
   applies only to points: lines and
   polygons are assigned as soon as they meet their visibility threshold,
   because a bbox center cannot represent an extended geometry's footprint.
-- `--line-visibility-factor` (default `2`) — coarsest level at which a
+- `--line-visibility-factor` (default `4`) — coarsest level at which a
   LineString is considered independently meaningful: its bbox diagonal must
   reach `factor · Resolution` of that level. Lines are 1D so a diagonal equal to
   one Resolution is only a hairline. This is a hard cutoff: a line shorter than the
@@ -120,7 +113,7 @@ Other options:
   that level and deferred to a finer one. The default keeps coarse levels from
   being crowded by tiny polygons. Set to `1` for the least restrictive supported
   threshold.
-- `--sort-key` — attribute column that decides which feature wins when several
+- `--priority-column` — attribute column that decides which feature wins when several
   points contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is
   kept (e.g. keep the higher-population city). Bbox size
@@ -128,11 +121,9 @@ Other options:
   row-index hash. It does not affect line or polygon level assignment. The column
   must be rank-able (numeric, boolean, or string); rows whose value is null always
   lose the tie.
-- `--sort-order` (default `desc`) — direction for `--sort-key`: `desc` keeps
-  the largest value, `asc` keeps the smallest. Ignored when `--sort-key` is
+- `--priority-column-order` (default `desc`) — direction for `--priority-column`: `desc` keeps
+  the largest value, `asc` keeps the smallest. Ignored when `--priority-column` is
   unset.
-- `--geometry-column` — override the auto-detected primary geometry column.
-  Input must be a WKB `Binary`/`LargeBinary` Arrow column.
 
 The output file:
 
