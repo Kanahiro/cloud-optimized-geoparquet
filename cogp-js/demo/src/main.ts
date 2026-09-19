@@ -4,7 +4,6 @@ import type { FeatureCollection } from 'geojson';
 import {
   openDataset as openCogpDataset,
   readViewport,
-  type MetadataSummary,
 } from './dataset-service';
 
 const COGP_SOURCE_ID = 'cogp';
@@ -233,7 +232,6 @@ function setStatus(msg: string): void {
 interface ActiveDataset {
   url: string;
   dataBbox: LngLatBoundsLike | null;
-  summary: MetadataSummary;
 }
 
 let active: ActiveDataset | null = null;
@@ -267,20 +265,19 @@ async function loadDataset(url: string): Promise<void> {
   setStatus(`Opening ${url} …`);
   latestUrl = url;
   try {
-    const { summary, dataBbox } = await openCogpDataset(url);
+    const { geo, numRowGroups, dataBbox } = await openCogpDataset(url);
     if (latestUrl !== url) return;
     active = {
       url,
       dataBbox,
-      summary,
     };
-    renderMetadata(summary);
+    metaEl.textContent = JSON.stringify(geo, null, 2);
     if (dataBbox) {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     installCogpSource();
     setStatus(
-      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels.`,
+      `Opened. ${numRowGroups} row groups across ${geo.lod.levels.length} levels.`,
     );
   } catch (err) {
     if (latestUrl !== url) return;
@@ -291,10 +288,6 @@ async function loadDataset(url: string): Promise<void> {
   } finally {
     if (latestUrl === url) loadBtn.disabled = false;
   }
-}
-
-function renderMetadata(summary: MetadataSummary): void {
-  metaEl.textContent = JSON.stringify(summary, null, 2);
 }
 
 function degreesPerCssPixel(): number {

@@ -1,18 +1,9 @@
+import type { CogpReader } from 'cogp';
 import type { FeatureCollection } from 'geojson';
 
-export interface MetadataSummary {
-  primary_column: string;
-  num_row_groups: number;
-  levels: Array<{
-    i: number;
-    resolution: number;
-    row_group_end: number;
-  }>;
-  crs: unknown;
-}
-
 export interface OpenResult {
-  summary: MetadataSummary;
+  geo: CogpReader['geo'];
+  numRowGroups: number;
   dataBbox: [[number, number], [number, number]] | null;
 }
 

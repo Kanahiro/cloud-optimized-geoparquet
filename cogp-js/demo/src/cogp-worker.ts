@@ -3,7 +3,6 @@ import { CogpReader } from 'cogp';
 import type { Feature, Geometry } from 'geojson';
 
 import type {
-  MetadataSummary,
   OpenResult,
   ViewportBbox,
   ViewportResult,
@@ -43,7 +42,7 @@ async function openDataset(url: string): Promise<OpenResult> {
     servedViewports: 0,
   };
 
-  return { summary: metadataSummary(reader), dataBbox };
+  return { geo: reader.geo, numRowGroups: reader.numRowGroups, dataBbox };
 }
 
 async function readViewport(
@@ -81,19 +80,6 @@ async function readViewport(
   return {
     data: { type: 'FeatureCollection', features },
     status: `Loaded ${features.length} features at ${formatResolution(targetResolution)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
-  };
-}
-
-function metadataSummary(reader: CogpReader): MetadataSummary {
-  return {
-    primary_column: reader.primaryGeometryColumn,
-    num_row_groups: reader.numRowGroups,
-    levels: reader.geo.lod.levels.map((l, i) => ({
-      i,
-      resolution: l.resolution,
-      row_group_end: l.row_group_end,
-    })),
-    crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
   };
 }
 
