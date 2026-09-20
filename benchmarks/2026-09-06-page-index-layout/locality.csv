@@ -1,5 +1,0 @@
-packing,resolution_m,workload,candidate_rows,selected_rows,exact_rows,amplification,selected_runs,query_kb,rtt25_ms
-RowGroup only,10,10 m,31997.9,3990.4,7.4,541.1,11.1,2297.6,246.6
-Nested Page STR,10,10 m,31997.9,2905.4,7.4,394.0,10.0,2422.0,247.3
-RowGroup only,100,100 m,5187.3,2503.9,88.5,28.3,7.1,577.3,120.5
-Nested Page STR,100,100 m,5187.3,2265.4,88.5,25.6,7.0,656.1,124.3

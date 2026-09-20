@@ -1,3 +1,0 @@
-file,file_size_bytes,num_rows,num_row_groups,footer_size
-pois-full-rg16384-p512.parquet,2973120338,30052264,1843,15737096
-pois.page-index.cogp.parquet,3315504823,30052264,3012,25694806
