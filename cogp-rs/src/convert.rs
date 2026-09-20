@@ -327,6 +327,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         geo.as_object_mut().unwrap().remove("lod");
         geo.as_object_mut().unwrap().remove("coarse_to_fine");
         let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
             .set_key_value_metadata(Some(vec![KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo)?),
@@ -567,17 +568,26 @@ pub fn run(args: ConvertArgs) -> Result<()> {
 
     // ZSTD 9 reduced representative Range payloads without the decode cost
     // observed with Brotli 6. Keep this workload-specific choice internal.
-    // Disable dictionary encoding for the geometry column (WKB is high-cardinality, dict
-    // is pure overhead) and for the bbox struct's float fields (each value is unique).
+    // Selective page reads should not require a column-chunk-wide dictionary.
+    // Keep dictionaries disabled for every leaf, including nested attributes.
+    // Physical-type transforms can worsen ZSTD compression on arbitrary attributes.
+    // Use PLAIN by default and specialize only the generated overview integers.
     let mut props_builder = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_encoding(Encoding::PLAIN)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(9)?))
         .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_column_dictionary_enabled(ColumnPath::from(geom_col_name.as_str()), false)
         .set_column_statistics_enabled(
             ColumnPath::from(geom_col_name.as_str()),
             EnabledStatistics::None,
         );
+    let bbox_paths = [
+        &output_covering.bbox.xmin,
+        &output_covering.bbox.ymin,
+        &output_covering.bbox.xmax,
+        &output_covering.bbox.ymax,
+    ];
     // Overview coordinates and topology offsets are locally correlated integer
     // sequences. Delta encoding preserves the simple logical schema while
     // avoiding a dictionary that grows with every distinct coordinate.
@@ -591,9 +601,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 "element".to_string(),
                 axis.to_string(),
             ]);
-            props_builder = props_builder
-                .set_column_dictionary_enabled(path.clone(), false)
-                .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+            props_builder = props_builder.set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
         }
         for child in ["part_ends", "polygon_ends"] {
             let path = ColumnPath::from(vec![
@@ -603,19 +611,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 "list".to_string(),
                 "element".to_string(),
             ]);
-            props_builder = props_builder
-                .set_column_dictionary_enabled(path.clone(), false)
-                .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+            props_builder = props_builder.set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
         }
     }
-    for parts in [
-        &output_covering.bbox.xmin,
-        &output_covering.bbox.ymin,
-        &output_covering.bbox.xmax,
-        &output_covering.bbox.ymax,
-    ] {
+    for parts in bbox_paths {
         let path = ColumnPath::from(parts.clone());
-        props_builder = props_builder.set_column_dictionary_enabled(path.clone(), false);
         props_builder = props_builder.set_column_statistics_enabled(path, EnabledStatistics::Page);
     }
     // Keep bbox page statistics and offsets for all projected columns.

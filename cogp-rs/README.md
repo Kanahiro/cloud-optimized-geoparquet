@@ -97,6 +97,14 @@ Other options:
   Page Indexes and spatial page packing are always enabled. Row Groups never
   mix levels; the bbox leaves get ColumnIndexes and every leaf gets an OffsetIndex.
 
+The writer always disables dictionary encoding for all columns, including nested
+attributes, so selective reads do not need column-chunk-wide dictionaries. ZSTD
+compression and the delta encoding of overview coordinates/topology remain enabled.
+All attribute leaves, including nested attributes, use `PLAIN` encoding followed
+by ZSTD compression. Physical-type-specific transforms can worsen the final
+compressed size, so only generated overview coordinates/topology use explicit
+delta encoding. Logical types and attribute values are preserved.
+
 The primary geometry column comes from `geo.primary_column`. Auto-derived
 resolutions use its CRS horizontal units; absent CRS means CRS84. Null or
 unrecognized units require explicit `--resolution` values in coordinate units.

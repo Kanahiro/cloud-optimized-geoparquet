@@ -8,7 +8,6 @@ import {
 import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import type {
-  FeatureProperties,
   OpenResult,
   TileResult,
   ViewportBbox,
@@ -78,7 +77,7 @@ async function readTile(
   const usesOverviews = ds.reader.geo.lod.overviews !== undefined;
   const readOptions: ReadOptions = {
     bbox: tileBounds(z, x, y),
-    columns: [geomColumn],
+    columns: [geomColumn, ...ds.propertyColumns],
     includeRowIndex: true,
     maxLevel,
     signal,
@@ -105,6 +104,8 @@ async function readTile(
       ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null, rowIndex as number)
       : encodePrimaryFeature(row[geomColumn], z, x, y, rowIndex as number);
     if (!feature) continue;
+    // Attribute lifetime follows MapLibre's tile cache; clicks need no I/O.
+    feature.properties = Object.fromEntries(ds.propertyColumns.map(name => [name, row[name]]));
     // Reuse the rows array so a dense tile does not need a second 10k-entry
     // container solely for its already-encoded protobuf feature messages.
     rows[featureCount++] = feature as unknown as Record<string, unknown>;
@@ -120,16 +121,6 @@ async function readTile(
     encodeMs,
     maxLevel,
   };
-}
-
-async function readProperties(
-  url: string,
-  rowIndex: number,
-  signal: AbortSignal,
-): Promise<FeatureProperties> {
-  const ds = active;
-  if (!ds || ds.url !== url) throw new Error('Dataset is no longer active');
-  return ds.reader.readRow(rowIndex, { columns: ds.propertyColumns, signal });
 }
 
 function propertyColumnNames(reader: CogpReader): string[] {
@@ -211,10 +202,6 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       );
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response, { transfer: [result.data] });
-    } else {
-      const result = await readProperties(payload.url, payload.rowIndex, controller.signal);
-      const response: WorkerResponse = { id, ok: true, result };
-      self.postMessage(response);
     }
   } catch (err) {
     const response: WorkerResponse = { id, ok: false, error: (err as Error).message };

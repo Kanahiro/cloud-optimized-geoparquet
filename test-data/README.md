@@ -28,3 +28,12 @@ Regenerate all fixtures with:
 ```sh
 COGP_TEST_FIXTURE_DIR="$PWD/test-data" cargo test -p cogp --test end_to_end
 ```
+
+`attribute-encodings.parquet` covers dictionary-free `PLAIN` attribute encoding
+with ZSTD compression, including nested nullable values, integer extremes, floats,
+strings, and binary. Rust verifies all original values after conversion; JS
+checks decoding of the same fixture. Regenerate it with:
+
+```sh
+COGP_TEST_FIXTURE_DIR="$PWD/test-data" cargo test -p cogp --test end_to_end attribute_encodings_preserve_values_and_nested_paths
+```

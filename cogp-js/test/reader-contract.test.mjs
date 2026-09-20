@@ -107,3 +107,38 @@ test('base layout preserves null primary geometries in unfiltered reads', async 
   assert.equal(rows[2].id, 2);
   assert.equal(rows[2].geometry, null);
 });
+
+test('explicit undefined attribute values are distinct from unread row slots', async () => {
+  const { reader } = await openFixture('base-no-covering');
+  // Hyparquet can emit undefined for empty nested attributes. A hole instead
+  // means the requested row was never delivered by the decoder.
+  reader.readColumnValues = async () => new Map([['overviews', [undefined, 'value', null]]]);
+  assert.deepEqual(await reader.readRow(0, { columns: ['overviews'] }), { overviews: undefined });
+  assert.deepEqual(await reader.readRows({ columns: ['overviews'] }), [
+    { overviews: undefined }, { overviews: 'value' }, { overviews: null },
+  ]);
+  reader.readColumnValues = async () => new Map([['overviews', new Array(3)]]);
+  await assert.rejects(reader.readRow(0, { columns: ['overviews'] }), /missing row/);
+  await assert.rejects(reader.readRows({ columns: ['overviews'] }), /missing row/);
+});
+
+test('plain attribute encoding preserves scalars, binary and nested values', async () => {
+  const { reader } = await openFixture('attribute-encodings');
+  const columns = ['id', 'name', 'long', 'float', 'flag', 'binary', 'fixed', 'nested', 'values'];
+  const rows = await reader.readRows({ columns });
+  assert.equal(rows.length, 40);
+  assert.equal(new Set(rows.map(row => row.id)).size, 40);
+  for (const row of rows) {
+    const id = row.id, nullable = id % 3 === 0;
+    assert.equal(row.name, `feature-${id}`);
+    assert.equal(row.long, id % 3 === 0 ? -(1n << 63n) : id % 3 === 1 ? (1n << 63n) - 1n : null);
+    assert.equal(row.float, nullable ? null : id * 0.5);
+    assert.equal(row.flag, nullable ? null : id % 2 === 0);
+    assert.deepEqual(row.binary, nullable ? null : Uint8Array.of(0, id, 255));
+    assert.deepEqual(row.fixed, new Uint8Array(16).fill(id));
+    assert.deepEqual(row.nested, { score: nullable ? null : id * 0.25, label: nullable ? null : `名前-${id}` });
+    assert.deepEqual(row.values ?? null, nullable ? null : [id + 0.5, null, -0]);
+  }
+  const first = await reader.readRow(0, { columns });
+  assert.deepEqual(first, rows[0]);
+});

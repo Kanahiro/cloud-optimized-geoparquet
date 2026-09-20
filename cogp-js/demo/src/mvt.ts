@@ -1,5 +1,7 @@
 import type { QuantizedOverviewGeometry } from 'cogp';
 
+import { formatPropertyValue } from './properties.js';
+
 import { MVT_LAYER_NAME } from './cogp-types.js';
 import {
   clipLineString,
@@ -21,11 +23,12 @@ const MVT_CLIP_BBOX: ClipBbox = [
 const MAX_MERCATOR_LATITUDE = 85.0511287798066;
 const textEncoder = new TextEncoder();
 
-/** Geometry plus its stable source-row identity. */
+/** Geometry, stable source-row identity, and optional popup attributes. */
 export interface EncodedMvtFeature {
   id: number;
   type: 1 | 2 | 3;
   geometry: Uint8Array;
+  properties?: Record<string, unknown>;
 }
 
 /**
@@ -129,7 +132,26 @@ export function encodeMvtTile(features: readonly EncodedMvtFeature[]): ArrayBuff
   const layer = new ByteWriter();
   layer.writeVarintField(15, 2);
   layer.writeStringField(1, MVT_LAYER_NAME);
-  for (const feature of features) layer.writeBytesField(2, encodeFeature(feature));
+  const keys = new Map<string, number>();
+  const values = new Map<string, number>();
+  for (const feature of features) {
+    const tags = new ByteWriter();
+    for (const [key, value] of Object.entries(feature.properties ?? {})) {
+      const text = formatPropertyValue(value);
+      if (!keys.has(key)) keys.set(key, keys.size);
+      if (!values.has(text)) values.set(text, values.size);
+      tags.writeVarint(keys.get(key)!);
+      tags.writeVarint(values.get(text)!);
+    }
+    layer.writeBytesField(2, encodeFeature(feature, tags.finish()));
+  }
+  for (const key of keys.keys()) layer.writeStringField(3, key);
+  // Popup display strings are deduplicated across features within a tile.
+  for (const text of values.keys()) {
+    const value = new ByteWriter();
+    value.writeStringField(1, text);
+    layer.writeBytesField(4, value.finish());
+  }
   layer.writeVarintField(5, MVT_EXTENT);
 
   const tile = new ByteWriter(layer.length + 16);
@@ -287,9 +309,10 @@ function projectOverviewY(
   return projection.y(overview.offset[1] + overview.scale[1] * Number(overview.y[index]));
 }
 
-function encodeFeature(value: EncodedMvtFeature): Uint8Array {
+function encodeFeature(value: EncodedMvtFeature, tags: Uint8Array): Uint8Array {
   const feature = new ByteWriter(value.geometry.byteLength + 32);
   feature.writeVarintField(1, value.id);
+  if (tags.byteLength) feature.writeBytesField(2, tags);
   feature.writeVarintField(3, value.type);
   feature.writeBytesField(4, value.geometry);
   return feature.finish();

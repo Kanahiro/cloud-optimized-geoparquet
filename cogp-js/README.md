@@ -43,5 +43,9 @@ pnpm --filter cogp-demo dev
 ```
 
 The demo targets geographic longitude/latitude data, maps its screen resolution
-to degrees, renders MVT tiles, and fetches clicked feature properties lazily.
+to degrees, renders MVT tiles with popup attributes, and displays clicked feature properties
+without additional requests. Attribute reads share the tile bbox/Page Index
+pruning and byte-range cache. Prefetching attributes can increase initial tile
+transfer compared with geometry-only rendering; files without page indexes may
+require full column chunks. Popup values are stored as display strings in MVT.
 The metadata panel displays the file's GeoParquet metadata directly.

@@ -1,12 +1,11 @@
 import type {
-  FeatureProperties,
   OpenResult,
   TileResult,
   WorkerEnvelope,
   WorkerResponse,
 } from './cogp-types';
 
-export type { FeatureProperties, OpenResult, TileResult } from './cogp-types';
+export type { OpenResult, TileResult } from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 
@@ -65,12 +64,4 @@ export function readTile(
   signal?: AbortSignal,
 ): Promise<TileResult> {
   return call<TileResult>({ type: 'readTile', url, z, x, y }, signal);
-}
-
-export function readProperties(
-  url: string,
-  rowIndex: number,
-  signal?: AbortSignal,
-): Promise<FeatureProperties> {
-  return call<FeatureProperties>({ type: 'readProperties', url, rowIndex }, signal);
 }

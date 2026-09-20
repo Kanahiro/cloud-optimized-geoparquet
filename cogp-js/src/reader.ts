@@ -267,9 +267,9 @@ export class CogpReader {
     );
     const row: Record<string, unknown> = {};
     for (const column of columns) {
-      const value = values.get(column)?.[0];
-      if (value === undefined) throw new Error(`column \`${column}\` is missing row ${rowIndex}`);
-      row[column] = value;
+      const columnValues = values.get(column);
+      if (!columnValues || !(0 in columnValues)) throw new Error(`column \`${column}\` is missing row ${rowIndex}`);
+      row[column] = columnValues[0];
     }
     throwIfAborted(opts.signal);
     return row;
@@ -468,7 +468,7 @@ export class CogpReader {
         const row: Record<string, unknown> = {};
         for (const column of objectColumns ?? []) {
           const values = columnValues.get(column);
-          if (!values || values[localRow] === undefined) {
+          if (!values || !(localRow in values)) {
             throw new Error(`column \`${column}\` is missing row ${rowStart + localRow}`);
           }
           row[column] = values[localRow];
@@ -504,8 +504,11 @@ export class CogpReader {
       columns,
       compressors: this.compressors,
       rowFormat: 'object',
+      // Only annotated strings are text; unannotated binary attributes stay bytes.
+      utf8: false,
       filter,
       usePageIndex: filter !== undefined,
+      useOffsetIndex: true,
       onChunk: ((chunk: ColumnChunk) => {
         let target = values.get(chunk.columnName);
         if (!target) {
@@ -586,6 +589,7 @@ export class CogpReader {
       rowFormat: 'object',
       filter,
       usePageIndex: filter !== undefined,
+      useOffsetIndex: true,
       onPage: onPage as never,
     });
 

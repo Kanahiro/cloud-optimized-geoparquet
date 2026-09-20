@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createRequire } from 'node:module';
+
+// Decode with the same dependencies used by the demo renderer.
+const rendererRequire = createRequire(import.meta.resolve('maplibre-gl'));
+const { VectorTile } = rendererRequire('@mapbox/vector-tile');
+const Pbf = rendererRequire('pbf');
 
 import { clipLineString, clipPolygonRing, pointInBbox } from '../dist/clip-test/clip.js';
 import {
@@ -68,7 +74,7 @@ test('drops point-family coordinates outside the buffered tile', () => {
   assert.equal(encodePrimaryFeature({ type: 'Point', coordinates: [120, 45] }, 10, 512, 512), null);
 });
 
-test('encodes a source-row reference instead of eager properties', () => {
+test('preserves the source-row identity when no properties are supplied', () => {
   const feature = encodePrimaryFeature(
     { type: 'Point', coordinates: [0, 0] },
     0,
@@ -94,4 +100,28 @@ test('primary lines and polygons render when the file has no overviews', () => {
     assert.ok(feature.geometry.length > 0);
     assert.equal(feature.type, geometry.type.includes('Line') ? 2 : 3);
   }
+});
+
+
+test('popup attributes survive MVT decoding with existing display formatting', () => {
+  const feature = encodePrimaryFeature({ type: 'Point', coordinates: [0, 0] }, 0, 0, 0, 42);
+  feature.properties = {
+    name: '東京都', count: 12, enabled: true, missing: null,
+    large: 9007199254740993n, date: new Date('2026-01-01T00:00:00Z'),
+    nested: new Map([['items', [1, 2n]]]), binary: new Uint8Array([1, 2]),
+    html: '<script>alert(1)</script>',
+  };
+  const tile = new VectorTile(new Pbf(new Uint8Array(encodeMvtTile([feature, { ...feature, id: 43 }]))));
+  const layer = tile.layers.cogp;
+  assert.equal(layer.length, 2);
+  assert.equal(layer.feature(0).id, 42);
+  assert.deepEqual(layer.feature(0).properties, {
+    name: '東京都', count: '12', enabled: 'true', missing: '',
+    large: '9007199254740993', date: '2026-01-01T00:00:00.000Z',
+    nested: '{"items":[1,"2"]}', binary: '<bytes:2>', html: '<script>alert(1)</script>',
+  });
+  assert.deepEqual(layer.feature(1).properties, layer.feature(0).properties);
+  assert.deepEqual(layer.feature(0).loadGeometry(), layer.feature(1).loadGeometry());
+  assert.equal(layer._keys.length, Object.keys(feature.properties).length);
+  assert.equal(layer._values.length, Object.keys(feature.properties).length);
 });

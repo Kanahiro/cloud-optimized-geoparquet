@@ -21,9 +21,9 @@ const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 /**
  * Cache successful byte ranges for the lifetime of one AsyncBuffer.
  *
- * Entries are containment-aware: a cached range can satisfy any smaller
- * slice inside it. Promise values are inserted immediately so duplicate
- * in-flight reads share the same request. Settled entries follow LRU order;
+ * Disjoint entries cover both completed and in-flight reads. A slice combines
+ * their overlapping portions and fetches only gaps. Promise values are inserted
+ * immediately so concurrent reads share already requested bytes. Settled entries follow LRU order;
  * in-flight entries may temporarily exceed the budget but are never evicted.
  */
 export function rangeCachedAsyncBuffer(
@@ -56,16 +56,6 @@ export function rangeCachedAsyncBuffer(
       remove(entry);
       if (cachedBytes <= maxBytes) return;
     }
-  };
-
-  const findContainer = (start: number, end: number): CacheEntry | undefined => {
-    let best: CacheEntry | undefined;
-    for (const entry of entries.values()) {
-      if (entry.start > start || end > entry.end) continue;
-      if (!best || entry.bytes < best.bytes) best = entry;
-    }
-    if (best) touch(best);
-    return best;
   };
 
   const fetchWithoutCaching = (
@@ -114,6 +104,40 @@ export function rangeCachedAsyncBuffer(
     });
   };
 
+  const fetchGap = (start: number, end: number, signal: AbortSignal): Promise<ArrayBuffer> => {
+    const bytes = end - start;
+    if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end, signal);
+
+    let fetched: Promise<ArrayBuffer>;
+    const controller = new AbortController();
+    try {
+      fetched = Promise.resolve(source.slice(start, end, controller.signal));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    let entry!: CacheEntry;
+    const promise = fetched.then(buffer => {
+      if (buffer.byteLength < bytes) {
+        throw new Error(
+          `source returned ${buffer.byteLength} bytes for [${start}, ${end}), expected ${bytes}`,
+        );
+      }
+      entry.settled = true;
+      evict();
+      return buffer.byteLength === bytes ? buffer : buffer.slice(0, bytes);
+    }).catch(error => {
+      remove(entry);
+      throw error;
+    });
+    entry = { start, end, bytes, settled: false, consumers: 0, controller, promise };
+    entries.add(entry);
+    cachedBytes += bytes;
+    evict();
+
+    return subscribe(entry, start, end, signal);
+  };
+
   return {
     byteLength: source.byteLength,
     slice(start: number, end = source.byteLength, signal?: AbortSignal): Promise<ArrayBuffer> {
@@ -128,52 +152,41 @@ export function rangeCachedAsyncBuffer(
       if (signal?.aborted) return Promise.reject(abortReason(signal));
       if (start === end) return Promise.resolve(new ArrayBuffer(0));
 
-      const container = findContainer(start, end);
-      if (container) return subscribe(container, start, end, signal);
+      // Snapshot before fetching: inserting gaps can evict settled entries, but
+      // this request must still reuse all bytes that were present at its start.
+      const overlaps = [...entries]
+        .filter(entry => entry.start < end && start < entry.end)
+        .sort((a, b) => a.start - b.start);
+      for (const entry of overlaps) touch(entry);
 
-      const bytes = end - start;
-      if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end, signal);
-
-      let fetched: Promise<ArrayBuffer>;
       const controller = new AbortController();
-      try {
-        fetched = Promise.resolve(source.slice(start, end, controller.signal));
-      } catch (error) {
-        return Promise.reject(error);
+      const onAbort = (): void => controller.abort(signal?.reason);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      const parts: Promise<ArrayBuffer>[] = [];
+      let cursor = start;
+      for (const entry of overlaps) {
+        if (cursor < entry.start) parts.push(fetchGap(cursor, entry.start, controller.signal));
+        const partEnd = Math.min(end, entry.end);
+        parts.push(subscribe(entry, Math.max(cursor, entry.start), partEnd, controller.signal));
+        cursor = partEnd;
       }
+      if (cursor < end) parts.push(fetchGap(cursor, end, controller.signal));
 
-      let entry!: CacheEntry;
-      const promise = fetched.then(buffer => {
-        if (buffer.byteLength < bytes) {
-          throw new Error(
-            `source returned ${buffer.byteLength} bytes for [${start}, ${end}), expected ${bytes}`,
-          );
+      return Promise.all(parts).then(buffers => {
+        // subscribe copies cached bytes; callers never receive mutable cache storage.
+        if (buffers.length === 1) return buffers[0]!;
+        const result = new Uint8Array(end - start);
+        let offset = 0;
+        for (const buffer of buffers) {
+          result.set(new Uint8Array(buffer), offset);
+          offset += buffer.byteLength;
         }
-        entry.settled = true;
-        // A newly completed superset makes older contained entries redundant.
-        for (const other of entries.values()) {
-          if (
-            other !== entry &&
-            other.settled &&
-            start <= other.start &&
-            other.end <= end
-          ) {
-            remove(other);
-          }
-        }
-        evict();
-        return buffer.byteLength === bytes ? buffer : buffer.slice(0, bytes);
-      }).catch(error => {
-        remove(entry);
-        throw error;
+        return result.buffer;
+      }).finally(() => {
+        signal?.removeEventListener('abort', onAbort);
+        // On failure, release other pending gaps without cancelling their peers.
+        controller.abort();
       });
-      entry = { start, end, bytes, settled: false, consumers: 0, controller, promise };
-      entries.add(entry);
-      cachedBytes += bytes;
-      evict();
-
-      // Never expose the cached ArrayBuffer itself to mutable callers.
-      return subscribe(entry, start, end, signal);
     },
   };
 }

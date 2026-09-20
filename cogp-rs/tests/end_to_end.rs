@@ -192,6 +192,14 @@ fn convert_reader_validate_pipeline() {
     // Page layout writes offset indexes for every projected leaf, while only
     // the four bbox leaves need Page-level min/max column indexes.
     for row_group in reader.parquet_metadata().row_groups() {
+        // All physical leaves, including attributes and nested overviews, must
+        // remain readable without fetching a column-chunk-wide dictionary.
+        for column in row_group.columns() {
+            assert!(column.dictionary_page_offset().is_none());
+            assert!(!column
+                .encodings()
+                .contains(&parquet::basic::Encoding::RLE_DICTIONARY));
+        }
         assert!(row_group
             .columns()
             .iter()
@@ -981,5 +989,178 @@ fn base_layout_preserves_unrelated_overviews_attribute_and_optional_statistics()
         if let Some(directory) = std::env::var_os("COGP_TEST_FIXTURE_DIR") {
             std::fs::copy(output, PathBuf::from(directory).join(name)).unwrap();
         }
+    }
+}
+
+#[test]
+fn attribute_encodings_preserve_values_and_nested_paths() {
+    use arrow::array::{BooleanArray, FixedSizeBinaryArray, Float32Array, Int64Array};
+    use arrow::datatypes::Float64Type;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Encoding;
+
+    let tmp = TempDir::new("attribute-encodings");
+    let seed = tmp.path().join("seed.parquet");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    write_input(&seed);
+    let seed_reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&seed).unwrap()).unwrap();
+    let kv = seed_reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned();
+    let seed_batch = seed_reader.build().unwrap().next().unwrap().unwrap();
+    let n = seed_batch.num_rows();
+    let mut fields = seed_batch.schema().fields().to_vec();
+    let mut columns = seed_batch.columns().to_vec();
+    let nested_fields = Fields::from(vec![
+        Field::new("score", DataType::Float64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    let nested = StructArray::new(
+        nested_fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(
+                (0..n)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            None
+                        } else {
+                            Some(i as f64 * 0.25)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            None
+                        } else {
+                            Some(format!("名前-{i}"))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+        None,
+    );
+    let list = ListArray::from_iter_primitive::<Float64Type, _, _>((0..n).map(|i| {
+        if i % 3 == 0 {
+            None
+        } else {
+            Some(vec![Some(i as f64 + 0.5), None, Some(-0.0)])
+        }
+    }));
+    let extra: Vec<(&str, ArrayRef)> = vec![
+        (
+            "long",
+            Arc::new(Int64Array::from(
+                (0..n)
+                    .map(|i| match i % 3 {
+                        0 => Some(i64::MIN),
+                        1 => Some(i64::MAX),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "float",
+            Arc::new(Float32Array::from(
+                (0..n)
+                    .map(|i| {
+                        if i % 3 == 0 {
+                            None
+                        } else {
+                            Some(i as f32 * 0.5)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "flag",
+            Arc::new(BooleanArray::from(
+                (0..n)
+                    .map(|i| if i % 3 == 0 { None } else { Some(i % 2 == 0) })
+                    .collect::<Vec<_>>(),
+            )),
+        ),
+        (
+            "binary",
+            Arc::new(BinaryArray::from_iter((0..n).map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(vec![0, i as u8, 255])
+                }
+            }))),
+        ),
+        (
+            "fixed",
+            Arc::new(FixedSizeBinaryArray::try_from_iter((0..n).map(|i| [i as u8; 16])).unwrap()),
+        ),
+        ("nested", Arc::new(nested)),
+        ("values", Arc::new(list)),
+    ];
+    for (name, array) in extra {
+        fields.push(Arc::new(Field::new(name, array.data_type().clone(), true)));
+        columns.push(array);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let original = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_key_value_metadata(kv)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&input).unwrap(), schema, Some(props)).unwrap();
+    writer.write(&original).unwrap();
+    writer.close().unwrap();
+    cogp::convert::run(convert_args(&input, &output)).unwrap();
+    cogp::validate::run(&output).unwrap();
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
+    for group in reader.metadata().row_groups() {
+        for column in group.columns() {
+            assert!(column.dictionary_page_offset().is_none());
+            let root = &column.column_path().parts()[0];
+            if root == "overviews" {
+                continue;
+            }
+            let expected = Encoding::PLAIN;
+            assert!(
+                column.encodings().contains(&expected),
+                "{}: {:?}",
+                column.column_path(),
+                column.encodings()
+            );
+        }
+    }
+    let mut count = 0;
+    for batch in reader.build().unwrap() {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row) as usize;
+            for col in 0..original.num_columns() {
+                assert_eq!(
+                    batch.column(col).slice(row, 1).to_data(),
+                    original.column(col).slice(id, 1).to_data()
+                );
+            }
+            count += 1;
+        }
+    }
+    assert_eq!(count, n);
+    if let Some(directory) = std::env::var_os("COGP_TEST_FIXTURE_DIR") {
+        let directory = PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::copy(output, directory.join("attribute-encodings.parquet")).unwrap();
     }
 }
