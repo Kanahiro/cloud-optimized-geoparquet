@@ -1,0 +1,40 @@
+{
+  "release": "2.0.0",
+  "publication_status": "not uploaded; temporary upload credential requires explicit approval",
+  "total_rows": 119852975,
+  "total_bytes": 18819012781,
+  "datasets": [
+    {
+      "dataset": "admin",
+      "rows": 125130,
+      "bytes": 254131825,
+      "sha256": "208645760145e984618c4bd648726c2031f50ab535b37c2bfa38a072111b3f28",
+      "source_sha256": "0c8c669f062abe0c9a76f2cc237e0eb13d2b6215a3adf1f4e49e8b61bd5a9b90",
+      "url": "https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet"
+    },
+    {
+      "dataset": "pois",
+      "rows": 30052264,
+      "bytes": 2178564084,
+      "sha256": "81a1c2f2c25e05e554892ae551610d179c05926e4e8860df98ab659fdae42378",
+      "source_sha256": "a18aaf3b3993de444a5b577d70bb49874560773cd4e538b514afb94312ddfc21",
+      "url": "https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet"
+    },
+    {
+      "dataset": "segments",
+      "rows": 16266029,
+      "bytes": 4321039766,
+      "sha256": "57f203a7ddd636ec299beb87d82ed2679b1ee4c6958ba521c03a22c4335bf4c6",
+      "source_sha256": "be0d6572ac5f6e812246282343d3b8256eee0f66e54234abdca2709e9d2c2dbd",
+      "url": "https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet"
+    },
+    {
+      "dataset": "buildings",
+      "rows": 73409552,
+      "bytes": 12065277106,
+      "sha256": "8e9dd38453b8a1d5435000bd7730bb22a4720a70fdb9e2d2286fa4d52a40a9c0",
+      "source_sha256": "bdd0b81b1559bac0d9f143da55b19330dc3b4f2fc53f2b3a9b3a493bf3da65fd",
+      "url": "https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet"
+    }
+  ]
+}

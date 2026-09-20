@@ -1,0 +1,25 @@
+{
+  "dataset": "segments",
+  "results": [
+    {
+      "maxLevel": 0,
+      "rows": 10,
+      "geometryTypes": [
+        "LineString"
+      ],
+      "bytes": 2525,
+      "requests": 6,
+      "milliseconds": 18.290334
+    },
+    {
+      "maxLevel": 16,
+      "rows": 10,
+      "geometryTypes": [
+        "LineString"
+      ],
+      "bytes": 27305579,
+      "requests": 42,
+      "milliseconds": 2267.030791
+    }
+  ]
+}

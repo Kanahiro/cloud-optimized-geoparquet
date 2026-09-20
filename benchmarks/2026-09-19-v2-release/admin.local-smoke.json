@@ -1,0 +1,25 @@
+{
+  "dataset": "admin",
+  "results": [
+    {
+      "maxLevel": 0,
+      "rows": 10,
+      "geometryTypes": [
+        "MultiPolygon"
+      ],
+      "bytes": 677,
+      "requests": 6,
+      "milliseconds": 11.180750000000003
+    },
+    {
+      "maxLevel": 15,
+      "rows": 10,
+      "geometryTypes": [
+        "MultiPolygon"
+      ],
+      "bytes": 19180645,
+      "requests": 78,
+      "milliseconds": 2487.8547500000004
+    }
+  ]
+}

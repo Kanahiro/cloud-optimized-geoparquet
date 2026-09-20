@@ -1,0 +1,91 @@
+{
+  "dataset": "buildings",
+  "source": "/tmp/cogp-v1-release/ready/buildings.cogp.parquet",
+  "output": "/tmp/cogp-v2-release/output/buildings.cogp.parquet",
+  "command": [
+    "/tmp/cogp-v2-release/cogp",
+    "convert",
+    "/tmp/cogp-v1-release/ready/buildings.cogp.parquet",
+    "/tmp/cogp-v2-release/output/buildings.cogp.parquet"
+  ],
+  "seconds": 2780.2156291007996,
+  "bytes": 12065277106,
+  "release": "2.0.0",
+  "url": "https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet",
+  "rows": 73409552,
+  "row_groups": 1128,
+  "levels": [
+    {
+      "lod": "l0",
+      "resolution": 0.005493138935334262,
+      "row_group_end": 0
+    },
+    {
+      "lod": "l1",
+      "resolution": 0.002746569467667131,
+      "row_group_end": 1
+    },
+    {
+      "lod": "l2",
+      "resolution": 0.0013732847338335655,
+      "row_group_end": 2
+    },
+    {
+      "lod": "l3",
+      "resolution": 0.0006866423669167828,
+      "row_group_end": 3
+    },
+    {
+      "lod": "l4",
+      "resolution": 0.0003433211834583914,
+      "row_group_end": 6
+    },
+    {
+      "lod": "l5",
+      "resolution": 0.0001716605917291957,
+      "row_group_end": 24
+    },
+    {
+      "lod": "l6",
+      "resolution": 8.583029586459785e-05,
+      "row_group_end": 102
+    },
+    {
+      "lod": "l7",
+      "resolution": 4.291514793229892e-05,
+      "row_group_end": 539
+    },
+    {
+      "lod": "l8",
+      "resolution": 2.145757396614946e-05,
+      "row_group_end": 1027
+    },
+    {
+      "lod": "l9",
+      "resolution": 1.072878698307473e-05,
+      "row_group_end": 1120
+    },
+    {
+      "lod": "l10",
+      "resolution": 5.364393491537365e-06,
+      "row_group_end": 1127
+    }
+  ],
+  "overview_lods": [
+    "l0",
+    "l1",
+    "l10",
+    "l2",
+    "l3",
+    "l4",
+    "l5",
+    "l6",
+    "l7",
+    "l8",
+    "l9"
+  ],
+  "source_bytes": 8398691474,
+  "source_sha256": "bdd0b81b1559bac0d9f143da55b19330dc3b4f2fc53f2b3a9b3a493bf3da65fd",
+  "sha256": "8e9dd38453b8a1d5435000bd7730bb22a4720a70fdb9e2d2286fa4d52a40a9c0",
+  "validation": "all-row SHA-256 multiset match of every original column; schema, counts, covering, CRS and layout passed"
+}

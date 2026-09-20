@@ -1,0 +1,68 @@
+{
+  "release": "2.0.0",
+  "branch": "codex/quantized-overviews",
+  "branch_parent": "a40f176d73eb187824333126530ee9f65c4abeac",
+  "upstream_parent": "3541e4f9bcd4fe623d0fb16b4b7ac462ca2937b0",
+  "conversion_binary_sha256": "e2c53a01ab350227983cde72d11266ce958b53ba4845b4bb4360859182a01b48",
+  "writer_source_sha256": "a06a4304426b1b5a31e49b9b24d4722d6d0324d21d71ca41b900049c1560c28c",
+  "spec_sha256": "7df90888b129aa04e68ffdbf8dd7015fc9a600bd6ffd0d824974f278696ec103",
+  "parameters": {
+    "row_group_size": 65536,
+    "page_row_count": 2048,
+    "point_thinning_factor": 4,
+    "line_visibility_factor": 4,
+    "polygon_visibility_factor": 4,
+    "simplification_tolerance_factor": 1,
+    "webmerc_minzoom": 0,
+    "webmerc_maxzoom": 16,
+    "compression": "ZSTD 9",
+    "rayon_threads": 4
+  },
+  "browser_validation": {
+    "dataset": "admin",
+    "rendered_tiles": 4,
+    "source_features": 471,
+    "pbf_bytes_displayed": "10.3 KiB",
+    "max_level": 1,
+    "metadata_panel": "geo.lod shown with CRS-unit resolutions",
+    "lazy_properties": {
+      "N03_001": "北海道",
+      "N03_004": "旭川市",
+      "N03_007": "01204"
+    }
+  },
+  "merge_commit": "c187fb8",
+  "null_geometry_fix_commit": "b633385",
+  "tests": {
+    "rust_passed": 90,
+    "js_and_demo_passed": 53,
+    "clippy": "passed with warnings denied",
+    "demo_production_build": "passed"
+  },
+  "browser_poi_validation": {
+    "rendered_tiles": 3,
+    "source_features": 24291,
+    "pbf_bytes_displayed": "331.7 KiB",
+    "max_level": 0,
+    "visual": "nonempty worldwide point rendering"
+  },
+  "browser_segments_validation": {
+    "rendered_tiles": 4,
+    "source_features": 722,
+    "pbf_bytes_displayed": "13.0 KiB",
+    "max_level": 2,
+    "visual": "nonempty line rendering over Japan"
+  },
+  "browser_buildings_validation": {
+    "zoom": 15,
+    "center": [
+      139.76,
+      35.68
+    ],
+    "rendered_tiles_cumulative": 24,
+    "source_features_cumulative": 25217,
+    "pbf_bytes_displayed_cumulative": "620.4 KiB",
+    "max_level": 8,
+    "visual": "nonempty building polygons aligned around Tokyo Station"
+  }
+}

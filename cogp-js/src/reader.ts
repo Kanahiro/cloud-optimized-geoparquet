@@ -777,8 +777,7 @@ function asNumberArray(input: unknown): NumberArray {
 }
 
 // Walk a path-in-schema like `['bbox','xmin']` against a hyparquet row object.
-// The struct is mandated by COGP and read unconditionally when filtering, so
-// every segment is guaranteed to resolve to a number.
+// Null geometry may have a null bbox; NaN keeps it out of bbox matches.
 function readNum(row: Record<string, unknown>, path: readonly string[]): number {
   let cur: unknown = row;
   for (const p of path) {
