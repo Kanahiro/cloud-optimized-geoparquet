@@ -1,18 +1,8 @@
 export const MVT_LAYER_NAME = 'cogp';
 
-export interface MetadataSummary {
-  primary_column: string;
-  num_row_groups: number;
-  levels: Array<{
-    i: number;
-    resolution: number;
-    row_group_end: number;
-  }>;
-  crs: unknown;
-}
-
 export interface OpenResult {
-  summary: MetadataSummary;
+  geo: import('cogp').CogpReader['geo'];
+  numRowGroups: number;
   dataBbox: [[number, number], [number, number]] | null;
 }
 

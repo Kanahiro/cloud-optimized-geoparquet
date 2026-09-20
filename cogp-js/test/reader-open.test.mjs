@@ -35,3 +35,8 @@ test('open disables the browser cache for HEAD and range requests', async () => 
   assert.equal(headers.get('X-Test'), 'preserved');
   assert.equal(headers.get('Range'), 'bytes=0-7');
 });
+
+test('package exposes the reader and stable row identity as runtime APIs', async () => {
+  const api = await import('../dist/index.js');
+  assert.deepEqual(Object.keys(api), ['COGP_ROW_INDEX', 'CogpReader']);
+});

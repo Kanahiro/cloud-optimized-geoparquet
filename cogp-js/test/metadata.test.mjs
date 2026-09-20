@@ -2,11 +2,11 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractCogpDocument, parseCogpMeta, selectLevelByResolution } from '../dist/index.js';
+import { extractGeoMeta, parseCogpMeta } from '../dist/meta.js';
+import { selectLevelByResolution } from '../dist/level.js';
 
 function document(overrides = {}) {
   return JSON.stringify({
-    version: '0.2.0',
     levels: [
       { row_group_end: 0, resolution: 1000, lod: 'l0' },
       { row_group_end: 2, resolution: 100, lod: 'l1' },
@@ -51,7 +51,6 @@ test('selects the level and required LoD for a target resolution', () => {
 
 test('Point-family metadata omits overviews and level LoDs', () => {
   const cogp = JSON.stringify({
-    version: '0.2.0',
     levels: [{ row_group_end: 0, resolution: 1000 }],
   });
   const geo = JSON.stringify({
@@ -59,26 +58,23 @@ test('Point-family metadata omits overviews and level LoDs', () => {
     primary_column: 'geometry',
     columns: { geometry: { encoding: 'WKB', geometry_types: ['Point', 'MultiPoint'] } },
   });
-  const parsed = extractCogpDocument([
-    { key: 'cogp', value: cogp },
-    { key: 'geo', value: geo },
-  ]);
-  assert.equal(parsed.cogp.overviews, undefined);
-  assert.equal(parsed.cogp.levels[0].lod, undefined);
+  const parsed = extractGeoMeta([
+    { key: 'geo', value: JSON.stringify({...JSON.parse(geo), lod: JSON.parse(cogp)}) },
+  ], 1);
+  assert.equal(parsed.lod.overviews, undefined);
+  assert.equal(parsed.lod.levels[0].lod, undefined);
 
   const strayLod = JSON.parse(cogp);
   strayLod.levels[0].lod = 'l0';
   assert.throws(() => parseCogpMeta(JSON.stringify(strayLod)), /requires overviews/);
 
-  assert.throws(() => extractCogpDocument([
-    { key: 'cogp', value: document() },
-    { key: 'geo', value: geo },
-  ]), /must not declare overviews/);
+  assert.throws(() => extractGeoMeta([
+    { key: 'geo', value: JSON.stringify({...JSON.parse(geo), lod: JSON.parse(document())}) },
+  ], 3), /must not declare overviews/);
 });
 
 test('Line and Polygon metadata may omit overviews and level LoDs', () => {
   const cogp = JSON.stringify({
-    version: '0.2.0',
     levels: [{ row_group_end: 0, resolution: 1000 }],
   });
   for (const geometryType of ['LineString', 'Polygon']) {
@@ -87,18 +83,17 @@ test('Line and Polygon metadata may omit overviews and level LoDs', () => {
       primary_column: 'geometry',
       columns: { geometry: { encoding: 'WKB', geometry_types: [geometryType] } },
     });
-    const parsed = extractCogpDocument([
-      { key: 'cogp', value: cogp },
-      { key: 'geo', value: geo },
-    ]);
-    assert.equal(parsed.cogp.overviews, undefined);
-    assert.equal(parsed.cogp.levels[0].lod, undefined);
+    const parsed = extractGeoMeta([
+        { key: 'geo', value: JSON.stringify({...JSON.parse(geo), lod: JSON.parse(cogp)}) },
+    ], 1);
+    assert.equal(parsed.lod.overviews, undefined);
+    assert.equal(parsed.lod.levels[0].lod, undefined);
   }
 });
 
-const specExample = JSON.parse(readFileSync(new URL('../../cogp-rs/tests/fixtures/metadata-0.2.json', import.meta.url), 'utf8'));
+const specExample = JSON.parse(readFileSync(new URL('../../cogp-rs/tests/fixtures/metadata-overviews.json', import.meta.url), 'utf8'));
 
-test('0.2 selects a new LoD on the same prefix and shares LoDs across prefixes', () => {
+test('rendering extension selects a new LoD on the same prefix and shares LoDs across prefixes', () => {
   const metadata = parseCogpMeta(JSON.stringify(specExample));
   const selected = [1000, 500, 250, 100].map(resolution => {
     const level = metadata.levels[selectLevelByResolution(metadata.levels, resolution)];
@@ -107,13 +102,8 @@ test('0.2 selects a new LoD on the same prefix and shares LoDs across prefixes',
   assert.deepEqual(selected, [[0, 'l0'], [0, 'l1'], [3, 'l1'], [3, 'l2']]);
 });
 
-test('accepts supported patch versions and rejects unknown or malformed drafts', () => {
-  for (const version of ['0.2.0', '0.2.9']) {
-    assert.equal(parseCogpMeta(document({ version })).version, version);
-  }
-  for (const version of ['0.1.0', '0.3.0', '1.0.0', 'garbage', '0.2', '0.2.01', '0.2.0-extra']) {
-    assert.throws(() => parseCogpMeta(document({ version })), /unsupported version/);
-  }
+test('layout has no independent version and ignores unrelated fields', () => {
+  assert.equal(parseCogpMeta(document({ future: true })).future, true);
 });
 
 test('rejects decreasing boundaries, orphan LoDs, and reserved LoD names', () => {

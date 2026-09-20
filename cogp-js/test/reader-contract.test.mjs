@@ -86,3 +86,16 @@ test('readRow projects one source row without requiring geometry', async () => {
   await assert.rejects(() => reader.readRow(-1), /rowIndex/);
   await assert.rejects(() => reader.readRow(2), /rowIndex/);
 });
+
+test('base layout uses separate bbox roots without requiring statistics', async () => {
+  const { reader } = await openFixture('base-covering');
+  assert.equal(reader.rowGroupEnvelope(0), null);
+  const rows = await reader.readRows({ columns: ['id', 'overviews'], bbox: [-1, -1, 1, 1] });
+  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }]);
+});
+
+test('base layout without covering conservatively retains candidates', async () => {
+  const { reader } = await openFixture('base-no-covering');
+  const rows = await reader.readRows({ columns: ['id', 'overviews'], bbox: [-1, -1, 1, 1] });
+  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }, { id: 1, overviews: 'attribute' }]);
+});

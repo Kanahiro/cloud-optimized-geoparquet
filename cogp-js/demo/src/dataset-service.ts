@@ -6,7 +6,7 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-export type { FeatureProperties, MetadataSummary, OpenResult, TileResult } from './cogp-types';
+export type { FeatureProperties, OpenResult, TileResult } from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 

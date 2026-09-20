@@ -91,9 +91,6 @@ pub fn bbox_from_wkb(bytes: &[u8]) -> Result<(Bbox, GeomKind)> {
     let mut bbox = Bbox::empty();
     let mut kind = GeomKind::Point;
     read_geom(&mut cur, &mut bbox, &mut kind)?;
-    if bbox.is_empty() {
-        bail!("empty geometry");
-    }
     Ok((bbox, kind))
 }
 
@@ -402,10 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_polygon_errors() {
+    fn empty_polygon_has_empty_bbox() {
         // Polygon with zero rings has no points, so the bbox stays empty.
         let bytes = Wkb::new(3).u32(0).done();
-        assert!(bbox_from_wkb(&bytes).is_err());
+        assert!(bbox_from_wkb(&bytes).unwrap().0.is_empty());
     }
 
     #[test]

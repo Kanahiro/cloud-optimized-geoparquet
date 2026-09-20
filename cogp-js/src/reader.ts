@@ -20,7 +20,7 @@ import { selectLevelByResolution } from './level.js';
 import {
   type BboxCovering,
   type CogpMeta,
-  extractCogpDocument,
+  extractGeoMeta,
   type GeoMeta,
   type LodMetadata,
 } from './meta.js';
@@ -131,10 +131,10 @@ export class CogpReader {
     const metadata = (await parquetMetadataAsync(bindAbortSignal(cached, opts.signal) as never, {
       initialFetchSize: 8,
     })) as unknown as FullFileMetadata;
-    const doc = extractCogpDocument(metadata.key_value_metadata);
-    const protectedRanges = doc.cogp.overviews === undefined
+    const geo = extractGeoMeta(metadata.key_value_metadata, metadata.row_groups.length);
+    const protectedRanges = geo.lod.overviews === undefined
       ? []
-      : wkbColumnRanges(metadata, doc.geo);
+      : wkbColumnRanges(metadata, geo);
     const file = opts.rangeCoalescing === false
       ? cached
       : coalescingAsyncBuffer(cached, { protectedRanges });
@@ -158,15 +158,14 @@ export class CogpReader {
     return new CogpReader(file, metadata, url, opts.compressors);
   }
 
-  readonly cogp: CogpMeta;
-  readonly geo: GeoMeta;
+  readonly geo: GeoMeta & { lod: CogpMeta };
   /** Row group → flat row index of its first row. */
   private readonly rowOffsets: number[];
   private readonly rowCount: number;
   /** Column indexes (within a row group's columns list) of covering bbox sub-columns. */
-  private readonly bboxColIdx: BboxColumnIndexes;
+  private readonly bboxColIdx: BboxColumnIndexes | undefined;
   /** Path-in-schema of the covering bbox struct, e.g. `['bbox','xmin']`. */
-  private readonly bboxPaths: BboxCovering;
+  private readonly bboxPaths: BboxCovering | undefined;
   /** WKB columns excluded from overview-backed browser projections. */
   private readonly geomColumns: readonly string[];
   /** Whether rendering uses the overview column instead of primary WKB. */
@@ -182,19 +181,15 @@ export class CogpReader {
     readonly url: string,
     compressors?: Compressors,
   ) {
-    const doc = extractCogpDocument(metadata.key_value_metadata);
-    this.cogp = doc.cogp;
-    this.geo = doc.geo;
+    const geo = extractGeoMeta(metadata.key_value_metadata, metadata.row_groups.length);
+    this.geo = geo;
     this.compressors = { ...defaultCompressors, ...compressors };
-    this.usesOverviews = this.cogp.overviews !== undefined;
+    this.usesOverviews = this.geo.lod.overviews !== undefined;
     const hasOverviewsColumn = rootColumnNames(metadata.schema).includes('overviews');
     if (this.usesOverviews && !hasOverviewsColumn) {
       throw new Error('cogp file is missing declared `overviews` column');
     }
-    if (!this.usesOverviews && hasOverviewsColumn) {
-      throw new Error('cogp file contains an `overviews` column without overviews metadata');
-    }
-    const finalBoundary = this.cogp.levels[this.cogp.levels.length - 1]!.row_group_end;
+    const finalBoundary = this.geo.lod.levels[this.geo.lod.levels.length - 1]!.row_group_end;
     if (finalBoundary !== metadata.row_groups.length - 1) {
       throw new Error(
         `cogp final row_group_end ${finalBoundary} does not cover ${metadata.row_groups.length} row groups`,
@@ -215,17 +210,9 @@ export class CogpReader {
     // back to "no spatial filter" when the file is malformed.
     const primaryCol = this.geo.columns[this.geo.primary_column];
     const covering = primaryCol?.covering;
-    if (!covering?.bbox) {
-      throw new Error(
-        `not a COGP file: primary geometry column \`${this.geo.primary_column}\` is missing \`covering.bbox\``,
-      );
-    }
-    this.bboxPaths = covering.bbox;
+    this.bboxPaths = covering?.bbox;
     const firstRg = metadata.row_groups[0];
-    if (!firstRg) {
-      throw new Error('cogp file has no row groups');
-    }
-    this.bboxColIdx = findBboxColumnIndexes(firstRg, covering.bbox);
+    this.bboxColIdx = firstRg && covering?.bbox ? findBboxColumnIndexes(firstRg, covering.bbox) : undefined;
 
     const geomCols: string[] = [];
     for (const [name, col] of Object.entries(this.geo.columns)) {
@@ -235,7 +222,7 @@ export class CogpReader {
   }
 
   get levels() {
-    return this.cogp.levels;
+    return this.geo.lod.levels;
   }
 
   get numRowGroups(): number {
@@ -251,8 +238,8 @@ export class CogpReader {
   }
 
   /**
-   * Select a level index per SPEC §7. Pass a target ground-sample distance in
-   * meters; the reader returns the last level whose `resolution >= targetResolution`. If
+   * Select a level index using a target rendering resolution in
+   * primary geometry CRS units; the reader returns the last level whose `resolution >= targetResolution`. If
    * `targetResolution` is omitted (or coarser than the coarsest level), the finest /
    * coarsest level is returned respectively.
    */
@@ -305,7 +292,7 @@ export class CogpReader {
     if (!level) throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
     const lod = level.lod;
     const lodMetadata = this.usesOverviews
-      ? this.cogp.overviews!.lods[lod!]!
+      ? this.geo.lod.overviews!.lods[lod!]!
       : undefined;
     const projectedMetadata = this.usesOverviews
       ? this.projectedMetadata(lod!)
@@ -323,15 +310,17 @@ export class CogpReader {
       || (this.usesOverviews && opts.columns.includes('overviews'));
     let columns = requested.filter(
       (column) => (!this.usesOverviews || !this.geomColumns.includes(column))
-        && column !== 'overviews',
+        && (!this.usesOverviews || column !== 'overviews'),
     );
     if (wantsGeometry && this.usesOverviews) columns.push('overviews');
-    let injectedBboxColumn: string | undefined;
-    if (bbox && columns) {
-      const top = this.bboxPaths.xmin[0]!;
-      if (!columns.includes(top)) {
-        columns = [...columns, top];
-        injectedBboxColumn = top;
+    const injectedBboxColumns: string[] = [];
+    if (bbox && this.bboxPaths) {
+      for (const path of Object.values(this.bboxPaths)) {
+        const top = path[0]!;
+        if (!columns.includes(top)) {
+          columns.push(top);
+          injectedBboxColumns.push(top);
+        }
       }
     }
     const out: Record<string, unknown>[] = [];
@@ -347,7 +336,7 @@ export class CogpReader {
           : decodeQuantizedOverview(overview);
         delete row['overviews'];
       }
-      if (injectedBboxColumn) delete row[injectedBboxColumn];
+      for (const column of injectedBboxColumns) delete row[column];
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
@@ -400,7 +389,7 @@ export class CogpReader {
   /** Bbox of a single row group as derived from covering column statistics. */
   rowGroupEnvelope(rgIndex: number): Bbox | null {
     const rg = this.metadata.row_groups[rgIndex];
-    if (!rg) return null;
+    if (!rg || !this.bboxColIdx) return null;
     return rowGroupBbox(rg, this.bboxColIdx);
   }
 
@@ -412,7 +401,7 @@ export class CogpReader {
     const out: number[] = [];
     for (let i = 0; i <= end; i++) {
       const rg = this.metadata.row_groups[i]!;
-      if (bbox && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
+      if (bbox && this.bboxColIdx && !rowGroupIntersects(rg, this.bboxColIdx, bbox)) continue;
       out.push(i);
     }
     return out;
@@ -436,7 +425,7 @@ export class CogpReader {
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
-    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths, bbox) : undefined;
     const file = bindAbortSignal(this.file as AsyncBufferLike, signal);
     for (const run of this.coalescedRuns(rgIndices)) {
       throwIfAborted(signal);
@@ -576,17 +565,17 @@ export class CogpReader {
         assign(partEnds, chunk, asNumberArray);
       } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'polygon_ends') {
         assign(polygonEnds, chunk, asNumberArray);
-      } else if (samePath(path, this.bboxPaths.xmin)) {
+      } else if (this.bboxPaths && samePath(path, this.bboxPaths.xmin)) {
         assign(minXs, chunk, Number);
-      } else if (samePath(path, this.bboxPaths.ymin)) {
+      } else if (this.bboxPaths && samePath(path, this.bboxPaths.ymin)) {
         assign(minYs, chunk, Number);
-      } else if (samePath(path, this.bboxPaths.xmax)) {
+      } else if (this.bboxPaths && samePath(path, this.bboxPaths.xmax)) {
         assign(maxXs, chunk, Number);
-      } else if (samePath(path, this.bboxPaths.ymax)) {
+      } else if (this.bboxPaths && samePath(path, this.bboxPaths.ymax)) {
         assign(maxYs, chunk, Number);
       }
     };
-    const filter = bbox ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths, bbox) : undefined;
     await parquetRead({
       file: file as never,
       metadata: metadata as never,
@@ -603,7 +592,7 @@ export class CogpReader {
     const rowIndexes: number[] = [];
     const values: QuantizedOverviewGeometry[] = [];
     for (let row = 0; row < rowCount; row++) {
-      if (bbox) {
+      if (bbox && this.bboxPaths) {
         const values = [minXs[row], minYs[row], maxXs[row], maxYs[row]];
         if (values.some((value) => value === undefined)) continue;
         if (!bboxesIntersect(
@@ -690,10 +679,10 @@ function bboxFilter(paths: BboxCovering, bbox: Bbox): ParquetQueryFilter {
 function selectedRowIndexes(
   columns: Map<string, unknown[]>,
   rowCount: number,
-  paths: BboxCovering,
+  paths: BboxCovering | undefined,
   bbox?: Bbox,
 ): number[] {
-  if (!bbox) return Array.from({ length: rowCount }, (_, row) => row);
+  if (!bbox || !paths) return Array.from({ length: rowCount }, (_, row) => row);
   const selected: number[] = [];
   for (let row = 0; row < rowCount; row++) {
     const minX = readColumnNum(columns, row, paths.xmin);

@@ -1,82 +1,47 @@
-# cogp-js
+# COGP JavaScript reader
 
-TypeScript reader for the [Cloud Optimized GeoParquet Profile
-(COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
-metadata for draft 0.2 (including patch versions) and fetches only the Parquet ranges needed for a requested geographic
-area and ground resolution. Bbox reads use covering-column statistics to prune
-row groups and, when present, PageIndex metadata to prune pages inside surviving
-row groups. They then apply an exact per-feature bbox filter to the surviving
-rows; files without page indexes fall back safely to row-group pruning.
-When a file declares `overviews`, rendering geometry is decoded from its
-selected integer XY child and the browser projection excludes WKB. Spatial
-filtering always uses primary geometry bboxes, so changing LoD
-on the same prefix does not change the selected feature IDs. Consecutive
-levels may share a row-group boundary, and several levels may reference one
-LoD. A zoom that changes LoD fetches its columns for existing rows as needed;
-unchanged byte ranges can be reused from cache. Unknown drafts are rejected.
-Files without overviews use hyparquet's primary-WKB decoding. Point files must
-use this path; Line and Polygon files may use it.
-
-Remote reads bypass the browser HTTP cache and use a per-reader, in-memory
-range cache instead. The cache shares duplicate in-flight reads, retains up to
-64 MiB with LRU eviction, and is discarded with the `CogpReader`. Concurrent
-nearby ranges are also coalesced, reducing request count while bounding extra
-transfer with a single, internal 32 KiB cumulative overfetch budget. Every WKB
-column chunk in an overview-backed file is installed as a hard range barrier:
-selected overview requests cannot read it directly or absorb it as coalescing
-overfetch. Point files leave primary WKB readable. Coalescing can be disabled,
-and the range-cache capacity can be tuned when opening:
+Release 2.0.0 reads `geo.lod` and the optional [quantized rendering extension](../OVERVIEWS.md).
+Legacy `cogp` and `coarse_to_fine` metadata are not used. Rendering resolutions
+are in the primary geometry CRS units, including degrees for geographic data.
 
 ```ts
-await CogpReader.open(url, {
-  rangeCache: { maxBytes: 128 * 1024 * 1024 },
+import { CogpReader, COGP_ROW_INDEX } from 'cogp';
+
+const reader = await CogpReader.open(url);
+const level = reader.selectLevel(0.01); // degrees for CRS84
+const rows = await reader.readRows({
+  maxLevel: level,
+  bbox: [139, 35, 140, 36],
+  columns: ['geometry'],
+  includeRowIndex: true,
 });
-await CogpReader.open(url, { rangeCoalescing: false });
-await CogpReader.open(url, { rangeCache: false });
+console.log(reader.geo); // includes lod.levels and optional rendering metadata
+const properties = await reader.readRow(rows[0][COGP_ROW_INDEX], { columns: ['id'] });
 ```
 
-Applications may replace individual Parquet codecs without forking the
-reader. The demo uses this hook to initialize a WebAssembly Zstd decoder once
-inside its worker:
+`readRows` selects primary covering bboxes within a cumulative row-group prefix.
+When overviews are declared, the requested geometry is decoded from the selected
+LoD; primary WKB is excluded from rendering reads. Missing declared overview
+values are errors. Without overviews, the reader uses the primary geometry.
+Missing bbox statistics retain candidate groups; missing covering disables bbox
+pruning. Coarse reads are partial feature selections, not complete analytical results.
 
-```ts
-const zstd = await Zstd.load();
-const reader = await CogpReader.open(url, {
-  compressors: { ZSTD: (input) => zstd.decompress(input) },
-});
-```
-
-Both opening and row reads accept an `AbortSignal`. Cancellation propagates
-through coalesced reads and the shared range cache to the underlying HTTP
-request; aborting one consumer does not cancel a range still used by another:
-
-```ts
-const controller = new AbortController();
-const rows = reader.readRows({ bbox, signal: controller.signal });
-controller.abort();
-await rows; // rejects with AbortError
-```
-
-Page pruning trades additional, small range requests for lower transferred
-bytes. Range coalescing uses a fixed policy so applications do not need to
-tune transport details for each dataset.
+`overviewDecoder` can consume `QuantizedOverviewGeometry` directly. The default
+produces GeoJSON. `maxRows` caps rows after filtering; `signal` cancels requests.
+`includeRowIndex` attaches a non-enumerable source-row identity for lazy property
+reads. `fromAsyncBuffer` supports custom transports. HTTP requests use no-store,
+with bounded in-memory caching and coalescing that avoids primary WKB ranges.
 
 ## Development
 
-Run commands from the repository root so the shared lockfile is used:
-
 ```sh
-pnpm install --frozen-lockfile
-pnpm --filter cogp typecheck
 pnpm --filter cogp build
-```
-
-Build the browser demo with:
-
-```sh
+pnpm --filter cogp test
 pnpm --filter cogp-demo build
+pnpm --filter cogp-demo test
+pnpm --filter cogp-demo dev
 ```
 
-The public entry point exports `CogpReader`, overview decoding and metadata
-helpers, `selectLevelByResolution`, and their associated TypeScript types.
-`selectLevelByGsd` remains as a deprecated compatibility alias.
+The demo targets geographic longitude/latitude data, maps its screen resolution
+to degrees, renders MVT tiles, and fetches clicked feature properties lazily.
+The metadata panel displays the file's GeoParquet metadata directly.

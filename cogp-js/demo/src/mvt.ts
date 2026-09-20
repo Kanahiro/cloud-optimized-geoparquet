@@ -50,8 +50,8 @@ export function createOverviewMvtEncoder(
     : null;
 }
 
-/** Files without overviews retain this primary-WKB fallback for point geometry. */
-export function encodePointFeature(
+/** Encode primary geometry decoded by the reader when no overviews are declared. */
+export function encodePrimaryFeature(
   geometry: unknown,
   z: number,
   x: number,
@@ -60,7 +60,7 @@ export function encodePointFeature(
 ): EncodedMvtFeature | null {
   const value = geometry as {
     type?: string;
-    coordinates?: readonly number[] | readonly (readonly number[])[];
+    coordinates?: unknown;
   } | null;
   if (!value) return null;
   const projection = new TileProjection(z, x, y);
@@ -95,7 +95,32 @@ export function encodePointFeature(
       cursorY = py;
     }
   } else {
-    return null;
+    const type = ({ LineString: 2, Polygon: 3, MultiLineString: 5, MultiPolygon: 6 } as const)[value.type as 'LineString'];
+    if (!type) return null;
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const partEnds: number[] = [];
+    const polygonEnds: number[] = [];
+    const part = (coordinates: readonly (readonly number[])[]) => {
+      for (const coordinate of coordinates) {
+        if (!validCoordinate(coordinate)) throw new Error('invalid primary coordinate');
+        xs.push(coordinate[0]!); ys.push(coordinate[1]!);
+      }
+      partEnds.push(xs.length);
+    };
+    if (value.type === 'LineString') {
+      part(value.coordinates as number[][]);
+      partEnds.length = 0;
+    } else if (value.type === 'MultiPolygon') {
+      for (const polygon of value.coordinates as number[][][][]) {
+        for (const ring of polygon) part(ring);
+        polygonEnds.push(partEnds.length);
+      }
+    } else {
+      for (const lineOrRing of value.coordinates as number[][][]) part(lineOrRing);
+    }
+    return encodeOverviewFeature({ type, x: xs, y: ys, partEnds, polygonEnds,
+      scale: [1, 1], offset: [0, 0] }, projection, id);
   }
   return { id, type: 1, geometry: commands.finish() };
 }

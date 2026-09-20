@@ -1,4 +1,3 @@
-export const COGP_METADATA_KEY = 'cogp';
 export const GEO_METADATA_KEY = 'geo';
 
 export interface Level {
@@ -17,16 +16,9 @@ export interface OverviewsMetadata {
   lods: Record<string, LodMetadata>;
 }
 
-export interface CogpGenerator {
-  name: string;
-  version: string;
-}
-
 export interface CogpMeta {
-  version: string;
   levels: Level[];
   overviews?: OverviewsMetadata;
-  generator?: CogpGenerator;
   [extra: string]: unknown;
 }
 
@@ -51,42 +43,37 @@ export interface GeoColumn {
 }
 
 export interface GeoMeta {
+  lod?: CogpMeta;
   version: string;
   primary_column: string;
   columns: Record<string, GeoColumn>;
   [extra: string]: unknown;
 }
 
-export function parseCogpMeta(json: string): CogpMeta {
+export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
   const parsed = JSON.parse(json) as CogpMeta;
-  if (!parsed || typeof parsed !== 'object') throw new Error('cogp metadata must be an object');
-  if (typeof parsed.version !== 'string') {
-    throw new Error('cogp metadata: missing `version`');
-  }
-  if (!/^0\.2\.(0|[1-9][0-9]*)$/.test(parsed.version)) {
-    throw new Error(`cogp metadata: unsupported version \`${parsed.version}\`; supported draft is 0.2`);
-  }
+  if (!parsed || typeof parsed !== 'object') throw new Error('geo.lod must be an object');
   if (!Array.isArray(parsed.levels) || parsed.levels.length === 0) {
-    throw new Error('cogp metadata: `levels` must be a non-empty array');
+    throw new Error('geo.lod: levels must be a non-empty array');
   }
   if (parsed.overviews !== undefined) {
     if (parsed.overviews?.encoding !== 'quantized_xy_v1') {
-      throw new Error('cogp metadata: unsupported `overviews.encoding`');
+      throw new Error('geo.lod: unsupported `overviews.encoding`');
     }
     if (!parsed.overviews.lods || typeof parsed.overviews.lods !== 'object') {
-      throw new Error('cogp metadata: missing `overviews.lods`');
+      throw new Error('geo.lod: missing `overviews.lods`');
     }
     const lodEntries = Object.entries(parsed.overviews.lods);
     if (lodEntries.length === 0) {
-      throw new Error('cogp metadata: `overviews.lods` must be non-empty');
+      throw new Error('geo.lod: `overviews.lods` must be non-empty');
     }
     for (const [lod, metadata] of lodEntries) {
-      if (!lod || lod === 'geometry_type') throw new Error('cogp metadata: invalid overview LoD name');
+      if (!lod || lod === 'geometry_type') throw new Error('geo.lod: invalid overview LoD name');
       if (!validPair(metadata?.scale, true)) {
-        throw new Error(`cogp metadata: overviews.lods.${lod}.scale must contain two positive numbers`);
+        throw new Error(`geo.lod: overviews.lods.${lod}.scale must contain two positive numbers`);
       }
       if (!validPair(metadata?.offset, false)) {
-        throw new Error(`cogp metadata: overviews.lods.${lod}.offset must contain two finite numbers`);
+        throw new Error(`geo.lod: overviews.lods.${lod}.offset must contain two finite numbers`);
       }
     }
   }
@@ -94,33 +81,37 @@ export function parseCogpMeta(json: string): CogpMeta {
   let previousRowGroupEnd = -1;
   let previousResolution = Number.POSITIVE_INFINITY;
   for (const [index, level] of parsed.levels.entries()) {
+    if (!level || typeof level !== 'object') throw new Error(`geo.lod: levels[${index}] must be an object`);
     if (parsed.overviews !== undefined
       && (typeof level.lod !== 'string' || !Object.prototype.hasOwnProperty.call(parsed.overviews.lods, level.lod))) {
-      throw new Error(`cogp metadata: levels[${index}].lod does not name an overview LoD`);
+      throw new Error(`geo.lod: levels[${index}].lod does not name an overview LoD`);
     }
     if (parsed.overviews === undefined && level.lod !== undefined) {
-      throw new Error(`cogp metadata: levels[${index}].lod requires overviews`);
+      throw new Error(`geo.lod: levels[${index}].lod requires overviews`);
     }
     if (!Number.isSafeInteger(level.row_group_end) || level.row_group_end < 0
       || level.row_group_end < previousRowGroupEnd) {
-      throw new Error(`cogp metadata: levels[${index}].row_group_end must be non-decreasing`);
+      throw new Error(`geo.lod: levels[${index}].row_group_end must be non-decreasing`);
     }
     if (level.lod !== undefined) {
       referenced.add(level.lod);
     }
     if (!(Number.isFinite(level.resolution) && level.resolution > 0)) {
-      throw new Error(`cogp metadata: levels[${index}].resolution must be positive`);
+      throw new Error(`geo.lod: levels[${index}].resolution must be positive`);
     }
     if (level.resolution >= previousResolution) {
-      throw new Error(`cogp metadata: levels[${index}].resolution must strictly decrease`);
+      throw new Error(`geo.lod: levels[${index}].resolution must strictly decrease`);
     }
     previousRowGroupEnd = level.row_group_end;
     previousResolution = level.resolution;
   }
   if (parsed.overviews) {
     for (const lod of Object.keys(parsed.overviews.lods)) {
-      if (!referenced.has(lod)) throw new Error(`cogp metadata: overview LoD \`${lod}\` is not referenced by a level`);
+      if (!referenced.has(lod)) throw new Error(`geo.lod: overview LoD \`${lod}\` is not referenced by a level`);
     }
+  }
+  if (numRowGroups !== undefined && (!Number.isSafeInteger(numRowGroups) || numRowGroups <= 0 || previousRowGroupEnd !== numRowGroups - 1)) {
+    throw new Error('geo.lod: final boundary must cover all row groups; empty files must omit the extension');
   }
   return parsed;
 }
@@ -160,40 +151,18 @@ export function geometryFamily(geometryTypes: readonly string[]): GeometryFamily
   return first && geometryTypes.every(type => family(type) === first) ? first : undefined;
 }
 
-export interface CogpDocument {
-  cogp: CogpMeta;
-  geo: GeoMeta;
-}
-
-export function extractCogpDocument(
+export function extractGeoMeta(
   kv: ReadonlyArray<{ key: string; value?: string | null }> | null | undefined,
-): CogpDocument {
-  let cogpJson: string | undefined;
-  let geoJson: string | undefined;
-  for (const entry of kv ?? []) {
-    if (entry.key === COGP_METADATA_KEY && typeof entry.value === 'string') {
-      cogpJson = entry.value;
-    } else if (entry.key === GEO_METADATA_KEY && typeof entry.value === 'string') {
-      geoJson = entry.value;
-    }
-  }
-  if (!geoJson) {
-    throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
-  }
-  if (!cogpJson) {
-    throw new Error('not a COGP file: missing `cogp` key/value metadata');
-  }
-  const cogp = parseCogpMeta(cogpJson);
+  numRowGroups: number,
+): GeoMeta & { lod: CogpMeta } {
+  const geoJson = kv?.find(entry => entry.key === GEO_METADATA_KEY)?.value;
+  if (!geoJson) throw new Error('not a GeoParquet file: missing `geo` key/value metadata');
   const geo = parseGeoMeta(geoJson);
-  const primary = geo.columns[geo.primary_column];
-  const family = geometryFamily(primary?.geometry_types ?? []);
-  if (!family) {
-    throw new Error('geo metadata: primary geometry must declare one supported family');
+  if (!geo.lod) throw new Error('missing geo.lod metadata');
+  const lod = parseCogpMeta(JSON.stringify(geo.lod), numRowGroups);
+  const family = geometryFamily(geo.columns[geo.primary_column]?.geometry_types ?? []);
+  if (lod.overviews && family !== 'line' && family !== 'polygon') {
+    throw new Error('overviews require a Line or Polygon family; points must not declare overviews');
   }
-  if (family === 'point') {
-    if (cogp.overviews !== undefined || cogp.levels.some(level => level.lod !== undefined)) {
-      throw new Error('cogp metadata: Point-family files must not declare overviews or level lods');
-    }
-  }
-  return { cogp, geo };
+  return { ...geo, lod };
 }

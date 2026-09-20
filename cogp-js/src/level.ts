@@ -1,11 +1,11 @@
 import type { Level } from './meta.js';
 
-// SPEC §7: pick the last level whose resolution >= target resolution.
+// LoD selection: pick the last level whose resolution >= target resolution.
 // If no level satisfies that (target is coarser than the coarsest available),
 // fall back to the first (coarsest) level.
 export function selectLevelByResolution(levels: readonly Level[], targetResolution: number): number {
   if (levels.length === 0) {
-    throw new Error('cogp metadata has no levels');
+    throw new Error('geo.lod has no levels');
   }
   let chosen = -1;
   for (let i = 0; i < levels.length; i++) {
@@ -14,6 +14,3 @@ export function selectLevelByResolution(levels: readonly Level[], targetResoluti
   }
   return chosen === -1 ? 0 : chosen;
 }
-
-/** @deprecated Use selectLevelByResolution. */
-export const selectLevelByGsd = selectLevelByResolution;

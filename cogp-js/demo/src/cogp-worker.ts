@@ -8,7 +8,6 @@ import {
 import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import type {
-  MetadataSummary,
   FeatureProperties,
   OpenResult,
   TileResult,
@@ -20,13 +19,13 @@ import {
   createOverviewMvtEncoder,
   type EncodedMvtFeature,
   encodeMvtTile,
-  encodePointFeature,
+  encodePrimaryFeature,
   MVT_BUFFER,
   MVT_EXTENT,
 } from './mvt';
 
 const VECTOR_TILE_SIZE = 512;
-const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
+
 
 interface ActiveDataset {
   url: string;
@@ -59,7 +58,7 @@ async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult
     propertyColumns: propertyColumnNames(reader),
   };
 
-  return { summary: metadataSummary(reader), dataBbox };
+  return { geo: reader.geo, numRowGroups: reader.numRowGroups, dataBbox };
 }
 
 async function readTile(
@@ -76,7 +75,7 @@ async function readTile(
   const targetResolution = tileResolution(z, y);
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetResolution);
-  const usesOverviews = ds.reader.cogp.overviews !== undefined;
+  const usesOverviews = ds.reader.geo.lod.overviews !== undefined;
   const readOptions: ReadOptions = {
     bbox: tileBounds(z, x, y),
     columns: [geomColumn],
@@ -104,7 +103,7 @@ async function readTile(
     if (!Number.isSafeInteger(rowIndex)) throw new Error('COGP row is missing its source index');
     const feature = usesOverviews
       ? overviewEncoder(row[geomColumn] as QuantizedOverviewGeometry | null, rowIndex as number)
-      : encodePointFeature(row[geomColumn], z, x, y, rowIndex as number);
+      : encodePrimaryFeature(row[geomColumn], z, x, y, rowIndex as number);
     if (!feature) continue;
     // Reuse the rows array so a dense tile does not need a second 10k-entry
     // container solely for its already-encoded protobuf feature messages.
@@ -165,23 +164,8 @@ function tileYToLatitude(y: number, tiles: number): number {
 function tileResolution(z: number, y: number): number {
   const tiles = 2 ** z;
   const latitude = tileYToLatitude(y + 0.5, tiles);
-  return (
-    (EARTH_CIRCUMFERENCE_METERS * Math.cos((latitude * Math.PI) / 180)) /
-    (VECTOR_TILE_SIZE * tiles)
-  );
-}
-
-function metadataSummary(reader: CogpReader): MetadataSummary {
-  return {
-    primary_column: reader.primaryGeometryColumn,
-    num_row_groups: reader.numRowGroups,
-    levels: reader.levels.map((l, i) => ({
-      i,
-      resolution: l.resolution,
-      row_group_end: l.row_group_end,
-    })),
-    crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs ?? null,
-  };
+  // Both metadata and targets use geographic CRS units (degrees).
+  return (360 * Math.cos((latitude * Math.PI) / 180)) / (VECTOR_TILE_SIZE * tiles);
 }
 
 function computeDataBbox(reader: CogpReader): [[number, number], [number, number]] | null {

@@ -10,8 +10,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::meta::{
-    geometry_family, CogpMeta, GeoMeta, GeometryFamily, COGP_METADATA_KEY, COGP_VERSION,
-    GEO_METADATA_KEY, OVERVIEWS_COLUMN,
+    geometry_family, CogpMeta, GeoMeta, GeometryFamily, GEO_METADATA_KEY, OVERVIEWS_COLUMN,
 };
 
 pub fn run(path: &Path) -> Result<()> {
@@ -25,7 +24,6 @@ pub fn run(path: &Path) -> Result<()> {
     let mut warnings: Vec<String> = Vec::new();
 
     let mut geo_meta: Option<GeoMeta> = None;
-    let mut cogp_meta: Option<CogpMeta> = None;
 
     if let Some(kv) = kv {
         for entry in kv {
@@ -33,21 +31,16 @@ pub fn run(path: &Path) -> Result<()> {
                 Some(v) => v,
                 None => continue,
             };
-            match entry.key.as_str() {
-                GEO_METADATA_KEY => match serde_json::from_str::<GeoMeta>(value) {
+            if entry.key == GEO_METADATA_KEY {
+                match serde_json::from_str::<GeoMeta>(value) {
                     Ok(m) => geo_meta = Some(m),
                     Err(e) => errors.push(format!("`geo` metadata is not valid JSON: {e}")),
-                },
-                COGP_METADATA_KEY => match serde_json::from_str::<CogpMeta>(value) {
-                    Ok(m) => cogp_meta = Some(m),
-                    Err(e) => errors.push(format!("`cogp` metadata is not valid JSON: {e}")),
-                },
-                _ => {}
+                }
             }
         }
     }
 
-    // §5.1 GeoParquet compatibility
+    // GeoParquet metadata
     let geo = match geo_meta {
         Some(g) => g,
         None => {
@@ -58,7 +51,7 @@ pub fn run(path: &Path) -> Result<()> {
     };
     if !geo.version.starts_with("1.") {
         warnings.push(format!(
-            "GeoParquet version is `{}`; COGP {COGP_VERSION} targets 1.1.x",
+            "GeoParquet version is `{}`; this writer targets 1.1.x",
             geo.version
         ));
     }
@@ -74,102 +67,49 @@ pub fn run(path: &Path) -> Result<()> {
             bail!("validation failed");
         }
     };
-    let geometry_family = geometry_family(&primary_col.geometry_types);
-    if geometry_family.is_none() {
-        errors.push(format!(
-            "`geo.columns[{primary}].geometry_types` must declare exactly one Point, Line, or Polygon family"
-        ));
-    }
-
-    let covering = match primary_col.covering.as_ref() {
-        Some(c) => c,
-        None => {
-            errors.push(format!(
-                "`geo.columns[{primary}].covering` is required by COGP §5.1"
-            ));
-            print_report(path, &errors, &warnings);
-            bail!("validation failed");
-        }
-    };
-
-    let bbox_paths = [
-        ("xmin", &covering.bbox.xmin),
-        ("ymin", &covering.bbox.ymin),
-        ("xmax", &covering.bbox.xmax),
-        ("ymax", &covering.bbox.ymax),
-    ];
-
-    // §5.3 cogp metadata
-    let cogp = match cogp_meta {
-        Some(c) => c,
-        None => {
-            errors.push("missing `cogp` key-value metadata".into());
-            print_report(path, &errors, &warnings);
-            bail!("validation failed");
-        }
-    };
-
     let num_rgs = metadata.num_row_groups();
-    if let Err(error) = cogp.validate(num_rgs) {
-        errors.push(error.to_string());
-    }
-    match geometry_family {
-        Some(GeometryFamily::Point) if cogp.overviews.is_some() => {
-            errors.push("Point-family files must not declare overviews".into())
-        }
-        Some(GeometryFamily::Line | GeometryFamily::Polygon) if cogp.overviews.is_none() => {
-            warnings
-                .push("Line/Polygon files should declare overviews for efficient rendering".into())
-        }
-        _ => {}
-    }
-
-    let parquet_schema = metadata.file_metadata().schema_descr();
-    match parquet_to_arrow_schema(parquet_schema, kv) {
-        Ok(schema) => match geometry_family {
-            Some(GeometryFamily::Point) => {
-                if schema.field_with_name(OVERVIEWS_COLUMN).is_ok() {
-                    errors.push("Point-family files must not contain an `overviews` column".into());
-                }
+    match &geo.lod {
+        Some(layout) => {
+            if let Err(e) = layout.validate(num_rgs) {
+                errors.push(e.to_string());
             }
-            Some(GeometryFamily::Line | GeometryFamily::Polygon) => {
-                if let Some(overviews) = &cogp.overviews {
-                    validate_overviews_schema(schema.fields(), overviews, &mut errors);
-                } else if schema.field_with_name(OVERVIEWS_COLUMN).is_ok() {
-                    errors.push(
-                        "files without overviews metadata must not contain an `overviews` column"
-                            .into(),
-                    );
-                }
+            if file_meta.num_rows() == 0 {
+                errors.push("empty files must omit geo.lod".into());
             }
-            None => {}
-        },
-        Err(error) => errors.push(format!("cannot decode Arrow schema: {error}")),
+        }
+        None if file_meta.num_rows() == 0 => {}
+        None => errors.push("missing geo.lod metadata".into()),
     }
+    let bbox_paths = primary_col
+        .covering
+        .as_ref()
+        .map(|covering| {
+            vec![
+                ("xmin", &covering.bbox.xmin),
+                ("ymin", &covering.bbox.ymin),
+                ("xmax", &covering.bbox.xmax),
+                ("ymax", &covering.bbox.ymax),
+            ]
+        })
+        .unwrap_or_default();
 
-    // §5.1 cont: bbox covering columns must have row group min/max stats.
+    if let Some(cogp) = &geo.lod {
+        if let Some(overviews) = &cogp.overviews {
+            if !matches!(
+                geometry_family(&primary_col.geometry_types),
+                Some(GeometryFamily::Line | GeometryFamily::Polygon)
+            ) {
+                errors.push("overviews require one Line or Polygon geometry family".into());
+            }
+            match parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), kv) {
+                Ok(schema) => validate_overviews_schema(schema.fields(), overviews, &mut errors),
+                Err(error) => errors.push(format!("cannot decode Arrow schema: {error}")),
+            }
+        }
+    }
+    // Missing statistics reduce pruning but do not invalidate the layout.
     // Locate the column indexes for each bbox sub-field.
     let schema = file_meta.schema_descr();
-    if let Some(primary_idx) =
-        (0..schema.num_columns()).find(|index| schema.column(*index).path().string() == primary)
-    {
-        for rg_i in 0..num_rgs {
-            if metadata
-                .row_group(rg_i)
-                .column(primary_idx)
-                .statistics()
-                .is_some()
-            {
-                errors.push(format!(
-                    "row group {rg_i} primary WKB column `{primary}` must not have statistics"
-                ));
-            }
-        }
-    } else {
-        errors.push(format!(
-            "primary geometry column `{primary}` not found in file schema"
-        ));
-    }
     for (name, path_parts) in &bbox_paths {
         let dotted = path_parts.join(".");
         let col_idx = (0..schema.num_columns()).find(|i| {
@@ -213,12 +153,12 @@ pub fn run(path: &Path) -> Result<()> {
                                 }
                             };
                             if !has_min_max {
-                                errors.push(format!(
+                                warnings.push(format!(
                                     "row group {rg_i} column `{dotted}` has no min/max stats"
                                 ));
                             }
                         }
-                        None => errors.push(format!(
+                        None => warnings.push(format!(
                             "row group {rg_i} column `{dotted}` has no statistics"
                         )),
                     }
@@ -227,8 +167,12 @@ pub fn run(path: &Path) -> Result<()> {
         }
     }
 
-    if errors.is_empty() && cogp.overviews.is_some() {
-        if let Err(error) = validate_lod_coverage(path, &cogp) {
+    if let Some(cogp) = geo
+        .lod
+        .as_ref()
+        .filter(|c| errors.is_empty() && c.overviews.is_some())
+    {
+        if let Err(error) = validate_lod_coverage(path, cogp) {
             errors.push(format!("{error:#}"));
         }
     }

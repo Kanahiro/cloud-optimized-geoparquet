@@ -1,41 +1,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const COGP_METADATA_KEY: &str = "cogp";
 pub const GEO_METADATA_KEY: &str = "geo";
-pub const COGP_VERSION: &str = "0.2.0";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
 pub const OVERVIEWS_COLUMN: &str = "overviews";
 pub const OVERVIEWS_ENCODING: &str = "quantized_xy_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CogpMeta {
-    pub version: String,
     pub levels: Vec<Level>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overviews: Option<OverviewsMeta>,
 }
 
 impl CogpMeta {
-    /// Validate the versioned metadata contract before interpreting row ranges.
+    /// Validate the layout and optional rendering contract before interpreting row ranges.
     /// Physical schema and per-row values are checked separately by the validator.
     pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
         use anyhow::{bail, ensure};
-        let parts: Vec<_> = self.version.split('.').collect();
-        ensure!(
-            parts.len() == 3
-                && parts.iter().all(|part| !part.is_empty()
-                    && part.bytes().all(|b| b.is_ascii_digit())
-                    && (part.len() == 1 || !part.starts_with('0'))),
-            "invalid cogp version `{}`; expected MAJOR.MINOR.PATCH",
-            self.version
-        );
-        ensure!(
-            (parts[0], parts[1]) == ("0", "2"),
-            "unsupported cogp version `{}`; supported draft is 0.2",
-            self.version
-        );
-        ensure!(!self.levels.is_empty(), "cogp.levels must be non-empty");
+        ensure!(!self.levels.is_empty(), "geo.lod.levels must be non-empty");
         ensure!(num_row_groups > 0, "file has zero row groups");
         let mut previous_end = -1;
         let mut previous_resolution = f64::INFINITY;
@@ -138,6 +121,8 @@ pub struct LodMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lod: Option<CogpMeta>,
     pub version: String,
     pub primary_column: String,
     pub columns: BTreeMap<String, GeoColumn>,
@@ -162,7 +147,7 @@ pub enum GeometryFamily {
     Polygon,
 }
 
-/// COGP keeps one topological geometry family per file. Singular and Multi
+/// Rendering overviews use one topological geometry family. Singular and Multi
 /// variants belong to the same family; dimensional suffixes such as `Z` and
 /// `ZM` do not change it.
 pub fn geometry_family(geometry_types: &[String]) -> Option<GeometryFamily> {
@@ -214,56 +199,8 @@ mod tests {
     }
 
     #[test]
-    fn draft_contracts_and_shared_lod_boundaries() {
-        let metadata: CogpMeta =
-            serde_json::from_str(include_str!("../tests/fixtures/metadata-0.2.json")).unwrap();
-        metadata.validate(4).unwrap();
-        assert_eq!(metadata.lod_row_group_end("l0"), Some(0));
-        assert_eq!(metadata.lod_row_group_end("l1"), Some(3));
-        assert_eq!(metadata.lod_row_group_end("missing"), None);
-        for version in [
-            "0.1.0",
-            "0.4.0",
-            "1.0.0",
-            "garbage",
-            "0.3",
-            "0.2",
-            "0.2.01",
-            "0.2.0-extra",
-            "0.3.0",
-        ] {
-            let mut invalid = metadata.clone();
-            invalid.version = version.into();
-            assert!(invalid.validate(4).is_err(), "{version}");
-        }
-        for version in ["0.2.0", "0.2.9"] {
-            let mut compatible = metadata.clone();
-            compatible.version = version.into();
-            compatible.validate(4).unwrap();
-        }
-        let mut invalid = metadata.clone();
-        invalid.levels[2].row_group_end = -1;
-        assert!(invalid.validate(4).is_err());
-        let mut invalid = metadata.clone();
-        invalid.levels[2].resolution = 500.0;
-        assert!(invalid.validate(4).is_err());
-        let mut invalid = metadata.clone();
-        invalid.overviews.as_mut().unwrap().lods.insert(
-            "unused".into(),
-            LodMeta {
-                scale: [1.0; 2],
-                offset: [0.0; 2],
-            },
-        );
-        assert!(invalid.validate(4).is_err());
-        assert!(metadata.validate(3).is_err());
-        assert!(metadata.validate(0).is_err());
-    }
-
-    #[test]
     fn overviews_are_optional_but_lod_is_conditional() {
         let metadata = CogpMeta {
-            version: COGP_VERSION.into(),
             levels: vec![Level {
                 row_group_end: 0,
                 resolution: 1000.0,
@@ -276,52 +213,6 @@ mod tests {
         let mut stray_lod = metadata;
         stray_lod.levels[0].lod = Some("l0".into());
         assert!(stray_lod.validate(1).is_err());
-    }
-
-    #[test]
-    fn cogp_meta_roundtrip() {
-        let m = CogpMeta {
-            version: COGP_VERSION.to_string(),
-            levels: vec![
-                Level {
-                    row_group_end: 0,
-                    resolution: 1000.0,
-                    lod: Some("l0".into()),
-                },
-                Level {
-                    row_group_end: 3,
-                    resolution: 250.0,
-                    lod: Some("l1".into()),
-                },
-            ],
-            overviews: Some(OverviewsMeta {
-                encoding: OVERVIEWS_ENCODING.into(),
-                lods: BTreeMap::from([
-                    (
-                        "l0".into(),
-                        LodMeta {
-                            scale: [1.0, 1.0],
-                            offset: [0.0, 0.0],
-                        },
-                    ),
-                    (
-                        "l1".into(),
-                        LodMeta {
-                            scale: [0.25, 0.25],
-                            offset: [0.0, 0.0],
-                        },
-                    ),
-                ]),
-            }),
-        };
-        let s = serde_json::to_string(&m).unwrap();
-        let parsed: CogpMeta = serde_json::from_str(&s).unwrap();
-        assert_eq!(parsed.version, COGP_VERSION);
-        assert_eq!(parsed.levels.len(), 2);
-        assert_eq!(parsed.levels[0].row_group_end, 0);
-        assert_eq!(parsed.levels[1].resolution, 250.0);
-        assert_eq!(parsed.levels[0].lod.as_deref(), Some("l0"));
-        assert_eq!(parsed.overviews.unwrap().encoding, OVERVIEWS_ENCODING);
     }
 
     #[test]
@@ -368,16 +259,5 @@ mod tests {
         assert!(!s.contains("covering"));
         assert!(!s.contains("bbox"));
         assert!(!s.contains("crs"));
-    }
-
-    #[test]
-    fn version_constants_match_spec() {
-        // Catch accidental edits — these strings appear in on-disk files.
-        assert_eq!(GEOPARQUET_VERSION, "1.1.0");
-        assert_eq!(COGP_METADATA_KEY, "cogp");
-        assert_eq!(GEO_METADATA_KEY, "geo");
-        // COGP_VERSION must be SemVer-like; major must parse.
-        let major: u32 = COGP_VERSION.split('.').next().unwrap().parse().unwrap();
-        assert_eq!(major, 0);
     }
 }

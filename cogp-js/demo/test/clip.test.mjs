@@ -5,7 +5,7 @@ import { clipLineString, clipPolygonRing, pointInBbox } from '../dist/clip-test/
 import {
   createOverviewMvtEncoder,
   encodeMvtTile,
-  encodePointFeature,
+  encodePrimaryFeature,
 } from '../dist/clip-test/mvt.js';
 
 const bbox = [0, 0, 10, 10];
@@ -65,11 +65,11 @@ test('encodes only the clipped boundary of a huge polygon', () => {
 });
 
 test('drops point-family coordinates outside the buffered tile', () => {
-  assert.equal(encodePointFeature({ type: 'Point', coordinates: [120, 45] }, 10, 512, 512), null);
+  assert.equal(encodePrimaryFeature({ type: 'Point', coordinates: [120, 45] }, 10, 512, 512), null);
 });
 
 test('encodes a source-row reference instead of eager properties', () => {
-  const feature = encodePointFeature(
+  const feature = encodePrimaryFeature(
     { type: 'Point', coordinates: [0, 0] },
     0,
     0,
@@ -79,4 +79,19 @@ test('encodes a source-row reference instead of eager properties', () => {
   assert.ok(feature);
   assert.equal(feature.id, 42);
   assert.ok(encodeMvtTile([feature]).byteLength > feature.geometry.byteLength);
+});
+
+test('primary lines and polygons render when the file has no overviews', () => {
+  const geometries = [
+    {type: 'LineString', coordinates: [[-10, 0], [10, 0]]},
+    {type: 'MultiLineString', coordinates: [[[-10, 0], [10, 0]]]},
+    {type: 'Polygon', coordinates: [[[-10, -10], [10, -10], [10, 10], [-10, -10]]]},
+    {type: 'MultiPolygon', coordinates: [[[[-10, -10], [10, -10], [10, 10], [-10, -10]]]]},
+  ];
+  for (const geometry of geometries) {
+    const feature = encodePrimaryFeature(geometry, 0, 0, 0, 7);
+    assert.equal(feature.id, 7);
+    assert.ok(feature.geometry.length > 0);
+    assert.equal(feature.type, geometry.type.includes('Line') ? 2 : 3);
+  }
 });

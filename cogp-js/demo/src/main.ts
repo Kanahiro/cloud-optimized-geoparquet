@@ -4,7 +4,7 @@ import {
   openDataset as openCogpDataset,
   readProperties,
   readTile,
-  type MetadataSummary,
+  type OpenResult,
 } from './dataset-service';
 import { MVT_LAYER_NAME } from './cogp-types';
 
@@ -275,7 +275,7 @@ function setStatus(msg: string): void {
 interface ActiveDataset {
   url: string;
   dataBbox: LngLatBoundsLike | null;
-  summary: MetadataSummary;
+  summary: OpenResult['geo'];
 }
 
 let active: ActiveDataset | null = null;
@@ -318,20 +318,20 @@ async function loadDataset(url: string): Promise<void> {
   datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { summary, dataBbox } = await openCogpDataset(url, controller.signal);
+    const { geo, numRowGroups, dataBbox } = await openCogpDataset(url, controller.signal);
     if (latestUrl !== url) return;
     active = {
       url,
       dataBbox,
-      summary,
+      summary: geo,
     };
-    renderMetadata(summary);
+    renderMetadata(geo);
     if (dataBbox) {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     installCogpSource();
     setStatus(
-      `Opened. ${summary.num_row_groups} row groups across ${summary.levels.length} levels; requesting MVT tiles.`,
+      `Opened. ${numRowGroups} row groups across ${geo.lod.levels.length} levels; requesting MVT tiles.`,
     );
   } catch (err) {
     if (latestUrl !== url) return;
@@ -347,6 +347,6 @@ async function loadDataset(url: string): Promise<void> {
   }
 }
 
-function renderMetadata(summary: MetadataSummary): void {
+function renderMetadata(summary: OpenResult['geo']): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
 }
