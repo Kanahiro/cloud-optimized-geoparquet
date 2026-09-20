@@ -912,11 +912,11 @@ fn base_layout_preserves_unrelated_overviews_attribute_and_optional_statistics()
     let tmp = TempDir::new("base-contract");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("geometry", DataType::Binary, false),
-        Field::new("west", DataType::Float64, false),
-        Field::new("south", DataType::Float64, false),
-        Field::new("east", DataType::Float64, false),
-        Field::new("north", DataType::Float64, false),
+        Field::new("geometry", DataType::Binary, true),
+        Field::new("west", DataType::Float64, true),
+        Field::new("south", DataType::Float64, true),
+        Field::new("east", DataType::Float64, true),
+        Field::new("north", DataType::Float64, true),
         Field::new("overviews", DataType::Utf8, false),
     ]));
     let points: Vec<_> = [0.0_f64, 10.0]
@@ -932,13 +932,21 @@ fn base_layout_preserves_unrelated_overviews_attribute_and_optional_statistics()
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int32Array::from(vec![0, 1])),
-            Arc::new(BinaryArray::from_iter_values(points.iter())),
-            Arc::new(Float64Array::from(vec![0.0, 10.0])),
-            Arc::new(Float64Array::from(vec![0.0, 10.0])),
-            Arc::new(Float64Array::from(vec![0.0, 10.0])),
-            Arc::new(Float64Array::from(vec![0.0, 10.0])),
-            Arc::new(StringArray::from(vec!["ordinary", "attribute"])),
+            Arc::new(Int32Array::from(vec![0, 1, 2])),
+            Arc::new(BinaryArray::from(vec![
+                Some(points[0].as_slice()),
+                Some(points[1].as_slice()),
+                None,
+            ])),
+            Arc::new(Float64Array::from(vec![Some(0.0), Some(10.0), None])),
+            Arc::new(Float64Array::from(vec![Some(0.0), Some(10.0), None])),
+            Arc::new(Float64Array::from(vec![Some(0.0), Some(10.0), None])),
+            Arc::new(Float64Array::from(vec![Some(0.0), Some(10.0), None])),
+            Arc::new(StringArray::from(vec![
+                "ordinary",
+                "attribute",
+                "null geometry",
+            ])),
         ],
     )
     .unwrap();

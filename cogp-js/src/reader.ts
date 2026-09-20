@@ -703,10 +703,10 @@ function readColumnNum(
   path: readonly string[],
 ): number | undefined {
   let value = columns.get(path[0]!)?.[row];
-  for (let i = 1; value !== undefined && i < path.length; i++) {
+  for (let i = 1; value != null && i < path.length; i++) {
     value = (value as Record<string, unknown>)[path[i]!];
   }
-  return value === undefined ? undefined : Number(value);
+  return value == null ? undefined : Number(value);
 }
 
 /**
@@ -781,6 +781,9 @@ function asNumberArray(input: unknown): NumberArray {
 // every segment is guaranteed to resolve to a number.
 function readNum(row: Record<string, unknown>, path: readonly string[]): number {
   let cur: unknown = row;
-  for (const p of path) cur = (cur as Record<string, unknown>)[p];
-  return cur as number;
+  for (const p of path) {
+    if (cur == null) return Number.NaN;
+    cur = (cur as Record<string, unknown>)[p];
+  }
+  return cur == null ? Number.NaN : Number(cur);
 }

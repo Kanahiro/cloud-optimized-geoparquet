@@ -30,7 +30,7 @@ The output COGP file itself is projection-agnostic — it can be consumed by
 any renderer regardless of projection. The defaults simply pick Resolutions tuned
 for a Web Mercator z0..=z16 tile pyramid (17 levels), since that's the most
 common viewer target. Pass `--resolution` to optimize for a different renderer.
-Works on any GeoParquet 1.x file with a WKB geometry column.
+Supports GeoParquet 1.x with WKB point, line, or polygon geometries, including Multi variants.
 
 ## Rendering overviews
 

@@ -97,5 +97,13 @@ test('base layout uses separate bbox roots without requiring statistics', async 
 test('base layout without covering conservatively retains candidates', async () => {
   const { reader } = await openFixture('base-no-covering');
   const rows = await reader.readRows({ columns: ['id', 'overviews'], bbox: [-1, -1, 1, 1] });
-  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }, { id: 1, overviews: 'attribute' }]);
+  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }, { id: 1, overviews: 'attribute' }, { id: 2, overviews: 'null geometry' }]);
+});
+
+test('base layout preserves null primary geometries in unfiltered reads', async () => {
+  const { reader } = await openFixture('base-covering');
+  const rows = await reader.readRows({ columns: ['id', 'geometry'] });
+  assert.equal(rows.length, 3);
+  assert.equal(rows[2].id, 2);
+  assert.equal(rows[2].geometry, null);
 });
