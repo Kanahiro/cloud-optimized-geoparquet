@@ -6,11 +6,17 @@ metadata and fetches only the Parquet ranges needed for a requested geographic
 area and rendering resolution in primary geometry CRS units. Bbox reads use covering-column statistics to
 prune row groups, then lazily fetch Parquet PageIndexes to prune pages inside
 the surviving groups. Files without PageIndexes fall back safely to Row Group
-reads. An exact per-feature bbox filter is applied to every surviving row.
+reads. Bbox predicates are used only for statistics-based pruning: returned rows
+are candidates and may lie outside the requested bbox. Callers apply geometry
+filtering or clipping when exact spatial results are needed. Covering data
+columns are not fetched implicitly for bbox queries; explicit `columns`
+projections can still request them.
 
 Remote reads coalesce nearby concurrent byte ranges by default. This reduces
 HTTP request count with three absolute bounds: a 32 KiB maximum gap, 128 KiB of
 cumulative extra bytes per merged request, and a 2 MiB maximum merged request.
+Unrequested covering data chunks also act as barriers to gap merging, so
+coalescing does not reintroduce bbox pages skipped by projection.
 Absolute byte budgets behave consistently for both tiny PageIndex reads and
 large data pages. PageIndexes are prefetched in bounded 16-RowGroup planning
 windows. Page-pruned bbox decode batches run with concurrency 4 so adjacent
@@ -76,12 +82,17 @@ const rows = await reader.readRows({
 ```
 
 `maxGeometryBytes` limits cumulative raw WKB bytes across returned geometry
-columns, not bytes per row or HTTP transfer size. A row exceeding the remaining
+columns, not bytes per row or HTTP transfer size. Both caps count returned
+candidates, including spatial false positives; a finite cap can omit later
+candidates that intersect the bbox. A row exceeding the remaining
 budget stops the read before decoding that row. Both output caps are optional.
 
 Readers validate all level boundaries against the footer before selecting a prefix.
 Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be
 regenerated with the current converter. Bbox covering and PageIndexes are optional.
-Without covering, bbox queries decode primary WKB and filter its envelope.
+Without covering or usable statistics, bbox queries conservatively retain
+candidates. With a bbox and no explicit projection, covering top-level columns
+are omitted; other attributes (even one named `bbox`) remain available. Reads
+without a bbox retain the default all-column projection.
 The demo expects longitude/latitude coordinates and passes degrees per pixel.
 Display prefixes are partial selections, not complete analytical query results.
