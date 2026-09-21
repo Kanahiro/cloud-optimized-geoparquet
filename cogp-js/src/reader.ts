@@ -117,19 +117,13 @@ export class CogpReader {
     if (opts.byteLength !== undefined) fetchOpts['byteLength'] = opts.byteLength;
     fetchOpts['requestInit'] = { ...opts.requestInit, cache: 'no-store' } satisfies RequestInit;
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });
-    // The footer is read before any data query. Once its column positions are
-    // known, avoid reintroducing unrequested bbox pages as coalescing gaps.
-    let bboxRanges: Array<{ start: number; end: number }> = [];
     const coalesced = opts.rangeCoalescing === false
       ? source
-      : coalescingAsyncBuffer(source, opts.rangeCoalescing,
-        (start, end) => !bboxRanges.some(range => range.start < end && start < range.end));
+      : coalescingAsyncBuffer(source, opts.rangeCoalescing);
     const file = opts.rangeCache === false
       ? coalesced
       : rangeCachedAsyncBuffer(coalesced, opts.rangeCache);
-    const reader = await CogpReader.fromAsyncBuffer(file);
-    bboxRanges = reader.bboxDataRanges();
-    return reader;
+    return CogpReader.fromAsyncBuffer(file);
   }
 
   /**
@@ -272,21 +266,6 @@ export class CogpReader {
     const rg = this.metadata.row_groups[rgIndex];
     if (!rg || !this.bboxColIdx) return null;
     return rowGroupBbox(rg, this.bboxColIdx);
-  }
-
-  private bboxDataRanges(): Array<{ start: number; end: number }> {
-    const paths = new Set(Object.values(this.bboxPaths ?? {}).map(path => path.join('.')));
-    const ranges: Array<{ start: number; end: number }> = [];
-    for (const group of this.metadata.row_groups) {
-      for (const column of group.columns) {
-        const meta = column.meta_data;
-        if (!meta || !paths.has(meta.path_in_schema.join('.'))) continue;
-        const start = meta.dictionary_page_offset ?? meta.data_page_offset;
-        if (start === undefined || meta.total_compressed_size === undefined) continue;
-        ranges.push({ start: Number(start), end: Number(start) + Number(meta.total_compressed_size) });
-      }
-    }
-    return ranges;
   }
 
   private candidateRowGroups(maxLevel: number, bbox?: Bbox): number[] {

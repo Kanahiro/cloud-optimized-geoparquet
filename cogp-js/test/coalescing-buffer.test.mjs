@@ -105,13 +105,3 @@ test('rejects invalid coalescing budgets', () => {
   assert.throws(() => coalescingAsyncBuffer(source, { maxExtraBytes: -1 }), /maxExtraBytes/);
   assert.throws(() => coalescingAsyncBuffer(source, { maxRequestBytes: 0 }), /maxRequestBytes/);
 });
-
-test('gap constraints prevent incidental column reads without blocking explicit slices', async () => {
-  const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, {}, (start, end) => !(start < 30 && end > 20));
-  await Promise.all([file.slice(0, 10), file.slice(40, 50)]);
-  assert.deepEqual(calls, [[0, 10], [40, 50]]);
-  calls.length = 0;
-  await Promise.all([file.slice(10, 25), file.slice(20, 40)]);
-  assert.deepEqual(calls, [[10, 40]]);
-});

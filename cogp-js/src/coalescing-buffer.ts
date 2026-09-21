@@ -44,8 +44,6 @@ const DEFAULT_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 export function coalescingAsyncBuffer(
   source: AsyncBufferLike,
   options: RangeCoalescingOptions = {},
-  // Internal transport constraint; explicit reads are always allowed.
-  canMergeGap: (start: number, end: number) => boolean = () => true,
 ): AsyncBufferLike {
   const maxGapBytes = options.maxGapBytes ?? DEFAULT_MAX_GAP_BYTES;
   const maxExtraBytes = options.maxExtraBytes ?? DEFAULT_MAX_EXTRA_BYTES;
@@ -61,7 +59,7 @@ export function coalescingAsyncBuffer(
     flushScheduled = false;
     const batch = pending;
     pending = [];
-    const runs = makeRuns(batch, maxGapBytes, maxExtraBytes, maxRequestBytes, canMergeGap);
+    const runs = makeRuns(batch, maxGapBytes, maxExtraBytes, maxRequestBytes);
     for (const run of runs) void fetchRun(source, run);
   };
 
@@ -95,7 +93,6 @@ function makeRuns(
   maxGapBytes: number,
   maxExtraBytes: number,
   maxRequestBytes: number,
-  canMergeGap: (start: number, end: number) => boolean,
 ): SliceRun[] {
   const sorted = batch.sort((a, b) => a.start - b.start || a.end - b.end);
   const runs: SliceRun[] = [];
@@ -121,8 +118,7 @@ function makeRuns(
       gap === 0 ||
       (gap <= maxGapBytes &&
         mergedExtraBytes <= maxExtraBytes &&
-        mergedSpan <= maxRequestBytes &&
-        canMergeGap(run.end, slice.start))
+        mergedSpan <= maxRequestBytes)
     ) {
       run.end = mergedEnd;
       run.extraBytes = mergedExtraBytes;

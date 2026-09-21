@@ -15,8 +15,6 @@ projections can still request them.
 Remote reads coalesce nearby concurrent byte ranges by default. This reduces
 HTTP request count with three absolute bounds: a 32 KiB maximum gap, 128 KiB of
 cumulative extra bytes per merged request, and a 2 MiB maximum merged request.
-Unrequested covering data chunks also act as barriers to gap merging, so
-coalescing does not reintroduce bbox pages skipped by projection.
 Absolute byte budgets behave consistently for both tiny PageIndex reads and
 large data pages. PageIndexes are prefetched in bounded 16-RowGroup planning
 windows. Page-pruned bbox decode batches run with concurrency 4 so adjacent

@@ -108,20 +108,3 @@ test('row-group rejection avoids data I/O and output caps count returned candida
   assert.deepEqual((await f.reader.readRows({ bbox, maxRows: 2 })).map(r => r.id), [0, 1]);
   assert.deepEqual((await f.reader.readRows({ bbox, maxGeometryBytes: 21 })).map(r => r.id), [0]);
 });
-
-test('default HTTP coalescing cannot fetch bbox pages as gaps; explicit bbox reads still work', async () => {
-  const f = await fixture();
-  const fetch = async (_url, init) => {
-    if (init.method === 'HEAD') return new Response(null, { headers: { 'Content-Length': String(f.bytes.length) } });
-    const [, start, end] = new Headers(init.headers).get('Range').match(/bytes=(\d+)-(\d+)/);
-    return new Response(f.file.slice(+start, +end + 1), { status: 206 });
-  };
-  const reader = await CogpReader.open('https://example.test/data.parquet', { fetch, rangeCache: false });
-  f.calls.length = 0; // Metadata opening is outside the data-read measurement.
-  const rows = await reader.readRows({ bbox });
-  assert.equal(rows.length, 8);
-  assert.ok(f.calls.length > 0);
-  assert.ok(f.calls.every(a => f.spans('bounds').every(b => !intersects(a, b))));
-  const explicit = await reader.readRows({ bbox, columns: ['id', 'bounds'] });
-  assert.equal(explicit[1].bounds.xmin, 1);
-});

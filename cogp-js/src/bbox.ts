@@ -24,9 +24,6 @@ export interface RowGroupStatistics {
 
 export interface ColumnChunkMeta {
   path_in_schema: string[];
-  data_page_offset?: number | bigint;
-  dictionary_page_offset?: number | bigint;
-  total_compressed_size?: number | bigint;
   statistics?: RowGroupStatistics | null;
 }
 
