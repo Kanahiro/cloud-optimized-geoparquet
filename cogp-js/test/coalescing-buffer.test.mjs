@@ -18,68 +18,24 @@ function sourceFixture(size = 256) {
   };
 }
 
-test('coalesces nearby concurrent slices and returns exact bytes', async () => {
+test('merges adjacent and overlapping slices but preserves even one-byte gaps', async () => {
   const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, {
-    maxGapBytes: 8,
-    maxExtraBytes: 8,
+  const file = coalescingAsyncBuffer(source);
+  // Deliberately unsorted, with a contained slice and a chain of adjacent ranges.
+  const ranges = [[31, 40], [20, 30], [12, 15], [5, 12], [10, 20], [41, 50]];
+  const buffers = await Promise.all(ranges.map(([start, end]) => file.slice(start, end)));
+
+  assert.deepEqual(calls, [[5, 30], [31, 40], [41, 50]]);
+  buffers.forEach((buffer, i) => {
+    const [start, end] = ranges[i];
+    assert.deepEqual([...new Uint8Array(buffer)],
+      Array.from({ length: end - start }, (_, offset) => start + offset));
   });
-
-  const [a, b, c] = await Promise.all([
-    file.slice(10, 20),
-    file.slice(25, 35),
-    file.slice(100, 110),
-  ]);
-
-  assert.deepEqual(calls, [[10, 35], [100, 110]]);
-  assert.deepEqual([...new Uint8Array(a)], [...Array(10)].map((_, i) => i + 10));
-  assert.deepEqual([...new Uint8Array(b)], [...Array(10)].map((_, i) => i + 25));
-  assert.deepEqual([...new Uint8Array(c)], [...Array(10)].map((_, i) => i + 100));
-});
-
-test('does not merge across the gap budget', async () => {
-  const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, { maxGapBytes: 8 });
-
-  await Promise.all([file.slice(0, 10), file.slice(19, 29), file.slice(40, 45)]);
-
-  assert.deepEqual(calls, [[0, 10], [19, 29], [40, 45]]);
-});
-
-test('limits cumulative extra transfer with an absolute byte budget', async () => {
-  const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, {
-    maxGapBytes: 100,
-    maxExtraBytes: 5,
-  });
-
-  await Promise.all([file.slice(0, 10), file.slice(15, 25), file.slice(31, 41)]);
-
-  // The first merge spends the five-byte budget. The next six-byte gap starts
-  // a new request even though it is within maxGapBytes by itself.
-  assert.deepEqual(calls, [[0, 25], [31, 41]]);
-});
-
-test('limits the size of a merged request', async () => {
-  const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, {
-    maxGapBytes: 8,
-    maxExtraBytes: 100,
-    maxRequestBytes: 20,
-  });
-
-  await Promise.all([file.slice(0, 10), file.slice(15, 25)]);
-
-  assert.deepEqual(calls, [[0, 10], [15, 25]]);
 });
 
 test('always merges overlapping slices', async () => {
   const { source, calls } = sourceFixture();
-  const file = coalescingAsyncBuffer(source, {
-    maxGapBytes: 0,
-    maxExtraBytes: 0,
-    maxRequestBytes: 1,
-  });
+  const file = coalescingAsyncBuffer(source);
 
   const [a, b] = await Promise.all([file.slice(10, 30), file.slice(20, 40)]);
 
@@ -97,11 +53,4 @@ test('supports an omitted end and rejects invalid bounds', async () => {
   assert.deepEqual([...new Uint8Array(tail)], [28, 29, 30, 31]);
   await assert.rejects(file.slice(-1, 2), /outside buffer/);
   await assert.rejects(file.slice(0, 33), /outside buffer/);
-});
-
-test('rejects invalid coalescing budgets', () => {
-  const { source } = sourceFixture();
-  assert.throws(() => coalescingAsyncBuffer(source, { maxGapBytes: -1 }), /maxGapBytes/);
-  assert.throws(() => coalescingAsyncBuffer(source, { maxExtraBytes: -1 }), /maxExtraBytes/);
-  assert.throws(() => coalescingAsyncBuffer(source, { maxRequestBytes: 0 }), /maxRequestBytes/);
 });
