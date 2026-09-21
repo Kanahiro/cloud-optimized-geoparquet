@@ -28,23 +28,15 @@ interface PendingSlice {
 interface SliceRun {
   start: number;
   end: number;
-  requestedBytes: number;
   slices: PendingSlice[];
 }
 
-// This is the measured knee across polygon, line, and building workloads:
-// larger budgets add transfer much faster than they reduce concurrent reads.
-const MAX_OVERFETCH_BYTES = 32 * 1024;
-
 /**
- * Batch concurrent AsyncBuffer slices into nearby contiguous reads.
+ * Batch overlapping or adjacent AsyncBuffer slices into contiguous reads.
  *
- * Parquet page pruning can issue one small slice per physical column and row
- * group. Waiting until the current microtask finishes exposes that batch
- * without adding a timer delay. Nearby slices are fetched as one ordinary HTTP
- * Range and split back into exact per-caller buffers. The cumulative
- * overfetch budget is deliberately the only merge policy: it bounds wasted
- * transfer and avoids exposing transport-tuning details to callers.
+ * Waiting until the current microtask finishes exposes concurrent page reads
+ * without adding a timer delay. Never fill gaps: this keeps transfer limited
+ * to requested bytes even when parallel runs change the batch boundaries.
  */
 export function coalescingAsyncBuffer(
   source: AsyncBufferLike,
@@ -59,7 +51,7 @@ export function coalescingAsyncBuffer(
     flushScheduled = false;
     const batch = pending;
     pending = [];
-    const runs = makeRuns(batch, protectedRanges);
+    const runs = makeRuns(batch);
     for (const run of runs) void fetchRun(source, run);
   };
 
@@ -97,48 +89,18 @@ export function coalescingAsyncBuffer(
   };
 }
 
-function makeRuns(
-  batch: PendingSlice[],
-  protectedRanges: readonly ByteRange[],
-): SliceRun[] {
+function makeRuns(batch: PendingSlice[]): SliceRun[] {
   const sorted = batch.filter(slice => !slice.settled)
     .sort((a, b) => a.start - b.start || a.end - b.end);
   const runs: SliceRun[] = [];
   for (const slice of sorted) {
     const run = runs[runs.length - 1];
-    if (!run) {
-      runs.push({
-        start: slice.start,
-        end: slice.end,
-        requestedBytes: slice.end - slice.start,
-        slices: [slice],
-      });
-      continue;
-    }
-
-    const gap = slice.start - run.end;
-    const mergedEnd = Math.max(run.end, slice.end);
-    const mergedSpan = mergedEnd - run.start;
-    const addedRequestedBytes = Math.max(0, slice.end - Math.max(slice.start, run.end));
-    const mergedRequestedBytes = run.requestedBytes + addedRequestedBytes;
-    const overfetchBytes = mergedSpan - mergedRequestedBytes;
-    // Overlapping ranges never add transfer bytes, so merge them regardless
-    // of the overfetch budget.
-    if (
-      gap <= 0 ||
-      (overfetchBytes <= MAX_OVERFETCH_BYTES
-        && !intersectsAny(run.end, slice.start, protectedRanges))
-    ) {
-      run.end = mergedEnd;
-      run.requestedBytes = mergedRequestedBytes;
+    // Each slice already excludes protected ranges; their gap-free union does too.
+    if (run && slice.start <= run.end) {
+      run.end = Math.max(run.end, slice.end);
       run.slices.push(slice);
     } else {
-      runs.push({
-        start: slice.start,
-        end: slice.end,
-        requestedBytes: slice.end - slice.start,
-        slices: [slice],
-      });
+      runs.push({ start: slice.start, end: slice.end, slices: [slice] });
     }
   }
   return runs;

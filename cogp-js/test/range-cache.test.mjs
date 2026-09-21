@@ -230,14 +230,16 @@ test('a failed gap cancels sibling gaps but preserves completed cached bytes', a
   assert.equal(calls.length, 3);
 });
 
-test('changed coalescing boundaries fetch only bytes beyond the cached union', async () => {
+test('coalescing preserves gaps until requested and reuses cached overlaps', async () => {
   const { source, calls, bytes } = sourceFixture();
   const file = coalescingAsyncBuffer(rangeCachedAsyncBuffer(source));
   await Promise.all([file.slice(0, 20), file.slice(40, 60)]);
   const results = await Promise.all([file.slice(30, 50), file.slice(70, 90)]);
-  assert.deepEqual(calls, [[0, 60], [60, 90]]);
+  assert.deepEqual(calls, [[0, 20], [40, 60], [30, 40], [70, 90]]);
   assert.deepEqual(new Uint8Array(results[0]), bytes.slice(30, 50));
   assert.deepEqual(new Uint8Array(results[1]), bytes.slice(70, 90));
   assert.deepEqual(new Uint8Array(await file.slice(10, 80)), bytes.slice(10, 80));
-  assert.equal(calls.length, 2);
+  assert.deepEqual(calls, [[0, 20], [40, 60], [30, 40], [70, 90], [20, 30], [60, 70]]);
+  await file.slice(10, 80);
+  assert.equal(calls.length, 6);
 });

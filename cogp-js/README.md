@@ -35,7 +35,9 @@ produces GeoJSON. `maxRows` caps returned candidates, including spatial false
 positives, so a finite cap can omit later matches; `signal` cancels requests.
 `includeRowIndex` attaches a non-enumerable source-row identity for lazy property
 reads. `fromAsyncBuffer` supports custom transports. HTTP requests use no-store,
-with bounded in-memory caching and coalescing that avoids primary WKB ranges.
+with bounded in-memory caching. Concurrent ranges are merged only when they
+overlap or touch; gaps are never fetched just to combine requests. Primary WKB
+ranges remain protected when rendering overviews.
 
 ## Development
 

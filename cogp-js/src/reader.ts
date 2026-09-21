@@ -74,7 +74,7 @@ export interface OpenOptions {
   requestInit?: Omit<RequestInit, 'cache' | 'signal'>;
   /** Abort opening the URL and fetching its Parquet metadata. */
   signal?: AbortSignal;
-  /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
+  /** Coalesce overlapping or adjacent concurrent HTTP ranges; enabled by default. */
   rangeCoalescing?: boolean;
   /** In-memory byte-range cache for this reader; enabled by default. */
   rangeCache?: RangeCacheOptions | false;
@@ -638,8 +638,7 @@ function bboxFilter(paths: BboxCovering, bbox: Bbox): ParquetQueryFilter {
 /**
  * Locate physical WKB chunks once, from the footer, and turn them into hard
  * transport barriers. Projection keeps them out of the Parquet plan; these
- * barriers additionally prevent request coalescing from transferring them as
- * an unrequested gap between useful chunks.
+ * barriers also reject accidental direct reads of primary WKB.
  */
 function wkbColumnRanges(metadata: FullFileMetadata, geo: GeoMeta): ByteRange[] {
   const wkbColumns = new Set(
