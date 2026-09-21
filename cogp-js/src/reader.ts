@@ -1,4 +1,4 @@
-import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects } from 'hyparquet';
+import { asyncBufferFromUrl, parquetMetadataAsync, parquetReadObjects, parquetSchema } from 'hyparquet';
 import { compressors } from 'hyparquet-compressors';
 import { DEFAULT_PARSERS } from 'hyparquet/src/convert.js';
 import { prefetchPageIndexes } from 'hyparquet/src/plan.js';
@@ -60,8 +60,8 @@ const BBOX_DECODE_CONCURRENCY = 4;
 // Custom parsers handed to hyparquet so it returns raw WKB bytes for
 // GEOMETRY/GEOGRAPHY columns instead of eagerly building nested-array
 // GeoJSON Geometry objects for every row. We decode WKB ourselves in
-// `readRows` only for rows that survive the bbox filter, which cuts peak
-// memory dramatically for small tile bboxes against dense files. The
+// `readRows` after page pruning and the geometry-byte budget check, avoiding
+// decoded objects for rows beyond the output budget. The
 // other (timestamp/date/string/uuid) parsers fall through to hyparquet's
 // defaults — supplying `parsers` replaces the whole table, so we must
 // re-export the rest.
@@ -81,25 +81,25 @@ function decodeWkb(bytes: Uint8Array): unknown {
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
-  /** Spatial filter; row groups whose covering envelope misses this bbox are skipped. */
+  /**
+   * Prune Row Groups and pages using covering statistics. Returns candidates,
+   * not exact spatial matches; no per-row bbox data is read for filtering.
+   */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];
   /**
-   * Output cap: stop streaming once this many rows have survived bbox
-   * filtering. Applied to the post-filter row count, so when a `bbox` is
-   * provided the value reflects rows actually returned to the caller, not
-   * the pre-filter row-group size. The check fires per surviving row, so
-   * the returned count never exceeds `maxRows`. Already-dispatched row
-   * batch fetches already dispatched upstream still complete, but later batches
-   * are skipped entirely.
+   * Output cap on returned candidate rows, including possible spatial false
+   * positives. A finite cap can omit later candidates inside the bbox. The
+   * returned count never exceeds `maxRows`. Already-dispatched batches still
+   * complete, but later batches are skipped.
    */
   maxRows?: number;
   /**
-   * Output cap on cumulative WKB byte size of surviving rows' geometry
+   * Output cap on cumulative WKB byte size of candidate rows' geometry
    * columns. Measured on the raw on-disk bytes before WKB → GeoJSON decode,
    * so a single huge polygon is caught even when row counts are tiny. The
-   * check fires per surviving row and is strict: a row whose geometry bytes
+   * check fires per candidate row and is strict: a row whose geometry bytes
    * would push the cumulative total over the cap is rejected (not decoded,
    * not returned) and streaming stops. This means a single polygon bigger
    * than the cap yields zero rows for that read — by design, since the
@@ -197,12 +197,14 @@ export class CogpReader {
   /**
    * Read a contiguous level prefix, optionally bbox-pruned, as plain row
    * records. The geometry column carries a GeoJSON Geometry object decoded
-   * from the on-disk WKB; decoding happens lazily after bbox filtering so
-   * rows that miss the query never pay for it.
+   * from the on-disk WKB; decoding happens lazily after page pruning so
+   * only candidates selected by the page plan are decoded.
    *
    * Row groups whose covering envelope misses the query are skipped entirely
-   * (no I/O). Rows in the remaining groups are filtered exactly against each
-   * row's per-feature bbox column.
+   * (no I/O). PageIndexes further narrow the candidate rows where available.
+   * Candidates may lie outside the bbox; callers clip or filter geometries as
+   * needed. Missing statistics conservatively retain candidates. Without a
+   * covering, the existing primary-geometry envelope filter applies.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.geo.lod.levels.length - 1;
@@ -211,20 +213,18 @@ export class CogpReader {
     const maxRows = opts.maxRows;
     const maxGeometryBytes = opts.maxGeometryBytes;
     let wkbBytes = 0;
-    // When filtering by bbox we need the per-row bbox struct on hand. If the
-    // caller provided a custom column selection that excludes it, splice the
-    // struct's top-level name in transparently — hyparquet reads the whole
-    // struct when you name its root.
+    // Covering values are for pruning, not implicit output attributes. Explicit
+    // projections can still request them like any other column.
     let columns = opts.columns;
     if (bbox && !this.bboxPaths && columns && !columns.includes(this.primaryGeometryColumn)) {
       columns = [...columns, this.primaryGeometryColumn];
     }
-    if (bbox && columns && this.bboxPaths) {
-      const top = this.bboxPaths.xmin[0]!;
-      if (!columns.includes(top)) columns = [...columns, top];
+    if (bbox && !columns) {
+      const coveringColumns = new Set(Object.values(this.bboxPaths ?? {}).map(path => path[0]));
+      columns = parquetSchema(this.metadata as never).children
+        .map(child => child.element.name).filter(name => !coveringColumns.has(name));
     }
     const out: Record<string, unknown>[] = [];
-    const paths = bbox ? this.bboxPaths : null;
     const geomCols = this.geomColumns;
     // Returns true once a cap has been reached, signalling callers to stop
     // iterating the current row group (and the outer stream) immediately
@@ -248,41 +248,15 @@ export class CogpReader {
         const v = row[col];
         if (v instanceof Uint8Array) row[col] = decodeWkb(v);
       }
-      if (bbox && !paths && !geometryIntersects(row[this.primaryGeometryColumn], bbox)) return false;
+      if (bbox && !this.bboxPaths && !geometryIntersects(row[this.primaryGeometryColumn], bbox)) return false;
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
-    let stopped = false;
     for await (const batch of this.streamBatches(rgs, columns, this.bboxPaths ? bbox : undefined)) {
-      if (!paths) {
-        for (const row of batch) {
-          if (acceptRow(row)) {
-            stopped = true;
-            break;
-          }
-        }
-      } else {
-        for (const row of batch) {
-          if (
-            bboxesIntersect(
-              {
-                minX: readNum(row, paths.xmin),
-                minY: readNum(row, paths.ymin),
-                maxX: readNum(row, paths.xmax),
-                maxY: readNum(row, paths.ymax),
-              },
-              bbox!,
-            )
-          ) {
-            if (acceptRow(row)) {
-              stopped = true;
-              break;
-            }
-          }
-        }
+      for (const row of batch) {
+        if (acceptRow(row)) return out;
       }
-      if (stopped) break;
     }
     return out;
   }
@@ -320,10 +294,9 @@ export class CogpReader {
   ): AsyncGenerator<Record<string, unknown>[]> {
     if (rgIndices.length === 0) return;
 
-    // Keep the four spatial predicates together: hyparquet uses this one
-    // expression for PageIndex pruning and exact row filtering. PageIndexes
-    // are fetched lazily only for bbox reads and only for candidate row groups.
-    const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths!, bbox) : undefined;
+    // Planning always uses the spatial predicate. Passing it to the value
+    // reader would also materialize its bbox columns, so statistics-only reads
+    // execute the precomputed page plan without a row filter.
     const indexWindows: number[][] = [];
     if (bbox && this.bboxPaths) {
       for (let i = 0; i < rgIndices.length; i += PAGE_INDEX_WINDOW_MAX_GROUPS) {
@@ -344,7 +317,7 @@ export class CogpReader {
         // prevents a fast batch from continuously running ahead of a slow one.
         const wave = await Promise.all(
           batches.slice(i, i + concurrency).map(batch =>
-            this.readBatch(batch, columns, filter, pageIndexPlan),
+            this.readBatch(batch, columns, pageIndexPlan),
           ),
         );
         for (const rows of wave) yield rows;
@@ -355,7 +328,6 @@ export class CogpReader {
   private async readBatch(
     batch: number[],
     columns: string[] | undefined,
-    filter: Record<string, unknown> | undefined,
     pageIndexPlan: PageIndexPlan | undefined,
   ): Promise<Record<string, unknown>[]> {
     const startRg = batch[0]!;
@@ -367,7 +339,6 @@ export class CogpReader {
       metadata: this.metadata,
       rowStart,
       rowEnd,
-      filter,
       usePageIndex: false,
       compressors,
       parsers: LAZY_GEO_PARSERS,
@@ -377,7 +348,6 @@ export class CogpReader {
       readArgs['pageLocationsByGroup'] = pageIndexPlan.pageLocationsByGroup;
     }
     if (columns) readArgs['columns'] = columns;
-    if (!filter) delete readArgs['filter'];
     return parquetReadObjects(readArgs as never) as Promise<Record<string, unknown>[]>;
   }
 
@@ -451,15 +421,6 @@ function normalizeBbox(input?: BboxInput): Bbox | undefined {
     return { minX: input[0]!, minY: input[1]!, maxX: input[2]!, maxY: input[3]! };
   }
   return input as Bbox;
-}
-
-// Walk a path-in-schema like `['bbox','xmin']` against a hyparquet row object.
-// The struct is mandated by COGP and read unconditionally when filtering, so
-// every segment is guaranteed to resolve to a number.
-function readNum(row: Record<string, unknown>, path: readonly string[]): number {
-  let cur: unknown = row;
-  for (const p of path) cur = (cur as Record<string, unknown>)[p];
-  return cur as number;
 }
 
 // Without a covering, decode the primary geometry and evaluate its envelope.

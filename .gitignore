@@ -19,3 +19,6 @@ __pycache__/
 
 # Local benchmark and demo data
 *.parquet
+
+# Small reproducible reader-contract fixtures
+!cogp-js/test/fixtures/*.parquet
