@@ -1127,7 +1127,7 @@ fn attribute_encodings_preserve_values_and_nested_paths() {
             assert!(column.dictionary_page_offset().is_none());
             let parts = column.column_path().parts();
             let expected = if parts[0] == "overviews" && parts.len() > 2 {
-                Encoding::BYTE_STREAM_SPLIT
+                Encoding::DELTA_BINARY_PACKED
             } else {
                 Encoding::PLAIN
             };

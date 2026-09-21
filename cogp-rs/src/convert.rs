@@ -588,9 +588,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         &output_covering.bbox.xmax,
         &output_covering.bbox.ymax,
     ];
-    // Byte-stream split keeps overview integers inexpensive to decode in JS
-    // while grouping their bytes for ZSTD compression. The logical schema and
-    // values stay unchanged; coordinates and topology offsets use the same policy.
+    // Overview coordinates and topology offsets are locally correlated integer
+    // sequences. Delta encoding preserves the simple logical schema while
+    // avoiding a dictionary that grows with every distinct coordinate.
     for overview in &overview_plan {
         for axis in ["x", "y"] {
             let path = ColumnPath::from(vec![
@@ -601,7 +601,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 "element".to_string(),
                 axis.to_string(),
             ]);
-            props_builder = props_builder.set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
+            props_builder = props_builder.set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
         }
         for child in ["part_ends", "polygon_ends"] {
             let path = ColumnPath::from(vec![
@@ -611,7 +611,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 "list".to_string(),
                 "element".to_string(),
             ]);
-            props_builder = props_builder.set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
+            props_builder = props_builder.set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
         }
     }
     for parts in bbox_paths {

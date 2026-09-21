@@ -43,7 +43,7 @@ mixed families, or an existing `overviews` attribute use the base layout.
 `--simplification-tolerance-factor` defaults to 1 and multiplies each CRS-unit
 resolution. Line and polygon features are deferred until both their visibility
 threshold and overview viability are met. Later levels can refine geometry
-without adding rows. ZSTD 9, byte-stream split encoding of overview integers, and omission
+without adding rows. ZSTD 9, delta encoding of overview integers, and omission
 of primary WKB statistics are internal writer choices.
 
 ## convert
@@ -99,11 +99,11 @@ Other options:
 
 The writer always disables dictionary encoding for all columns, including nested
 attributes, so selective reads do not need column-chunk-wide dictionaries. ZSTD
-compression and `BYTE_STREAM_SPLIT` encoding of overview coordinates/topology remain enabled.
+compression and the delta encoding of overview coordinates/topology remain enabled.
 All attribute leaves, including nested attributes, use `PLAIN` encoding followed
 by ZSTD compression. Physical-type-specific transforms can worsen the final
 compressed size, so only generated overview coordinates/topology use explicit
-`BYTE_STREAM_SPLIT` encoding. Logical types and attribute values are preserved.
+delta encoding. Logical types and attribute values are preserved.
 
 The primary geometry column comes from `geo.primary_column`. Auto-derived
 resolutions use its CRS horizontal units; absent CRS means CRS84. Null or
