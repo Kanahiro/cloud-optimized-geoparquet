@@ -1,11 +1,11 @@
 import { parquetMetadataAsync, parquetRead } from 'hyparquet';
+import { prefetchPageIndexes } from 'hyparquet/src/plan.js';
 import type { Compressors, ParquetQueryFilter } from 'hyparquet';
 import { compressors as defaultCompressors } from 'hyparquet-compressors';
 
 import {
   type Bbox,
   type BboxColumnIndexes,
-  bboxesIntersect,
   findBboxColumnIndexes,
   type FileMetadataLike,
   rowGroupBbox,
@@ -41,6 +41,8 @@ import { abortableAsyncBufferFromUrl } from './http-buffer.js';
 interface FullFileMetadata extends OverviewFileMetadata {
   key_value_metadata?: ReadonlyArray<{ key: string; value?: string | null }> | null;
 }
+
+type PageIndexPlan = Awaited<ReturnType<typeof prefetchPageIndexes>>;
 
 type NumberArray = ArrayLike<number> & { readonly length: number };
 
@@ -91,7 +93,7 @@ export const COGP_ROW_INDEX = Symbol('cogp.rowIndex');
 export interface ReadOptions {
   /** Inclusive level index; defaults to the finest level (all row groups). */
   maxLevel?: number;
-  /** Filters primary geometry covering bboxes; the selected overview only controls rendering. */
+  /** Prune groups and pages using primary covering statistics; returns spatial candidates. */
   bbox?: BboxInput;
   /** Subset of columns to materialize. */
   columns?: string[];
@@ -102,13 +104,9 @@ export interface ReadOptions {
    */
   overviewDecoder?: (overview: QuantizedOverviewGeometry | null) => unknown;
   /**
-   * Output cap: stop streaming once this many rows have survived bbox
-   * filtering. Applied to the post-filter row count, so when a `bbox` is
-   * provided the value reflects rows actually returned to the caller, not
-   * the pre-filter row-group size. The check fires per surviving row, so
-   * the returned count never exceeds `maxRows`. Already-dispatched row
-   * group fetches (runs coalesced upstream) still complete, but later runs
-   * are skipped entirely.
+   * Cap returned candidates, including spatial false positives. A finite cap
+   * can omit later matches. Already-dispatched fetches complete, but later
+   * runs are skipped.
    */
   maxRows?: number;
   /** Abort pending Range requests and stop before decoding further runs. */
@@ -282,8 +280,8 @@ export class CogpReader {
    * hyparquet's normal GeoParquet path.
    *
    * Row groups whose covering envelope misses the query are skipped entirely
-   * (no I/O). Rows in the remaining groups are filtered exactly against each
-   * row's per-feature bbox column.
+   * (no I/O). Page statistics narrow the remaining candidates without reading
+   * covering values. Callers clip or filter candidates for exact spatial results.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     throwIfAborted(opts.signal);
@@ -300,11 +298,10 @@ export class CogpReader {
     const bbox = normalizeBbox(opts.bbox);
     const rgs = this.candidateRowGroups(maxLevel, bbox);
     const maxRows = opts.maxRows;
-    // When filtering by bbox we need the per-row bbox struct on hand. If the
-    // caller provided a custom column selection that excludes it, splice the
-    // struct's top-level name in transparently — hyparquet reads the whole
-    // struct when you name its root.
-    const requested = opts.columns ?? rootColumnNames(this.metadata.schema);
+    // Default bbox reads omit covering attributes; explicit projections remain valid.
+    const coveringColumns = new Set(Object.values(this.bboxPaths ?? {}).map(path => path[0]));
+    const requested = opts.columns ?? rootColumnNames(this.metadata.schema)
+      .filter(column => !bbox || !coveringColumns.has(column));
     const wantsGeometry = opts.columns === undefined
       || opts.columns.includes(this.primaryGeometryColumn)
       || (this.usesOverviews && opts.columns.includes('overviews'));
@@ -313,18 +310,7 @@ export class CogpReader {
         && (!this.usesOverviews || column !== 'overviews'),
     );
     if (wantsGeometry && this.usesOverviews) columns.push('overviews');
-    const injectedBboxColumns: string[] = [];
-    if (bbox && this.bboxPaths) {
-      for (const path of Object.values(this.bboxPaths)) {
-        const top = path[0]!;
-        if (!columns.includes(top)) {
-          columns.push(top);
-          injectedBboxColumns.push(top);
-        }
-      }
-    }
     const out: Record<string, unknown>[] = [];
-    const paths = bbox ? this.bboxPaths : null;
     // Returns true once a cap has been reached, signalling callers to stop
     // iterating the current row group (and the outer stream) immediately
     // rather than draining the rest of the batch.
@@ -336,12 +322,10 @@ export class CogpReader {
           : decodeQuantizedOverview(overview);
         delete row['overviews'];
       }
-      for (const column of injectedBboxColumns) delete row[column];
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
     };
-    let stopped = false;
     for await (const batch of this.streamRuns(
       rgs,
       columns,
@@ -353,34 +337,9 @@ export class CogpReader {
       opts.includeRowIndex ?? false,
     )) {
       throwIfAborted(opts.signal);
-      if (!paths) {
-        for (const row of batch) {
-          if (acceptRow(row)) {
-            stopped = true;
-            break;
-          }
-        }
-      } else {
-        for (const row of batch) {
-          if (
-            bboxesIntersect(
-              {
-                minX: readNum(row, paths.xmin),
-                minY: readNum(row, paths.ymin),
-                maxX: readNum(row, paths.xmax),
-                maxY: readNum(row, paths.ymax),
-              },
-              bbox!,
-            )
-          ) {
-            if (acceptRow(row)) {
-              stopped = true;
-              break;
-            }
-          }
-        }
+      for (const row of batch) {
+        if (acceptRow(row)) return out;
       }
-      if (stopped) break;
     }
     throwIfAborted(opts.signal);
     return out;
@@ -433,6 +392,23 @@ export class CogpReader {
       const endRg = run[run.length - 1]!;
       const rowStart = this.rowOffsets[startRg]!;
       const rowEnd = rowStart + this.sumRowsInRange(startRg, endRg);
+      const pagePlan = filter ? await prefetchPageIndexes({
+        file: file as never,
+        metadata: metadata as never,
+        rowStart,
+        rowEnd,
+        columns,
+        filter,
+      }) : undefined;
+      const rowIndexes: number[] = [];
+      for (const group of run) {
+        const offset = this.rowOffsets[group]! - rowStart;
+        const ranges = pagePlan?.pageRangesByGroup[group]
+          ?? [[0, Number(metadata.row_groups[group]!.num_rows)]];
+        for (const [start, end] of ranges) {
+          for (let row = start; row < end; row++) rowIndexes.push(offset + row);
+        }
+      }
       const readsOverview = lod !== undefined && lodMetadata !== undefined;
       const objectColumns = readsOverview
         ? columns?.filter((column) => column !== 'overviews')
@@ -443,7 +419,7 @@ export class CogpReader {
         rowStart,
         rowEnd,
         objectColumns ?? [],
-        filter,
+        pagePlan,
       );
       const overviewPromise = readsOverview
         ? this.readOverviewLeaves(
@@ -453,15 +429,14 @@ export class CogpReader {
           rowEnd,
           lod,
           lodMetadata,
-          bbox,
+          rowIndexes,
+          pagePlan,
         )
         : undefined;
       const [columnValues, overviewSelection] = await Promise.all([
         columnsPromise,
         overviewPromise,
       ]);
-      const rowIndexes = overviewSelection?.rowIndexes
-        ?? selectedRowIndexes(columnValues, rowEnd - rowStart, this.bboxPaths, bbox);
       const rows = new Array<Record<string, unknown>>(rowIndexes.length);
       for (let i = 0; i < rowIndexes.length; i++) {
         const localRow = rowIndexes[i]!;
@@ -491,10 +466,10 @@ export class CogpReader {
     rowStart: number,
     rowEnd: number,
     columns: string[],
-    filter?: ParquetQueryFilter,
+    pagePlan?: PageIndexPlan,
   ): Promise<Map<string, unknown[]>> {
     const values = new Map<string, unknown[]>();
-    if (columns.length === 0 && !filter) return values;
+    if (columns.length === 0) return values;
     const rowCount = rowEnd - rowStart;
     await parquetRead({
       file: file as never,
@@ -506,8 +481,9 @@ export class CogpReader {
       rowFormat: 'object',
       // Only annotated strings are text; unannotated binary attributes stay bytes.
       utf8: false,
-      filter,
-      usePageIndex: filter !== undefined,
+      // The predicate belongs to planning only; passing it here reads bbox values.
+      ...pagePlan,
+      usePageIndex: false,
       useOffsetIndex: true,
       onChunk: ((chunk: ColumnChunk) => {
         let target = values.get(chunk.columnName);
@@ -536,7 +512,8 @@ export class CogpReader {
     rowEnd: number,
     lod: string,
     lodMetadata: LodMetadata,
-    bbox?: Bbox,
+    rowIndexes: number[],
+    pagePlan?: PageIndexPlan,
   ): Promise<OverviewSelection> {
     const rowCount = rowEnd - rowStart;
     const geometryTypes: Array<number | undefined> = new Array(rowCount);
@@ -544,10 +521,6 @@ export class CogpReader {
     const ys: Array<NumberArray | undefined> = new Array(rowCount);
     const partEnds: Array<NumberArray | undefined> = new Array(rowCount);
     const polygonEnds: Array<NumberArray | undefined> = new Array(rowCount);
-    const minXs: Array<number | undefined> = new Array(rowCount);
-    const minYs: Array<number | undefined> = new Array(rowCount);
-    const maxXs: Array<number | undefined> = new Array(rowCount);
-    const maxYs: Array<number | undefined> = new Array(rowCount);
 
     const assign = <T>(target: Array<T | undefined>, chunk: PageChunk, map: (value: unknown) => T) => {
       for (let i = 0; i < chunk.columnData.length; i++) {
@@ -568,17 +541,8 @@ export class CogpReader {
         assign(partEnds, chunk, asNumberArray);
       } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'polygon_ends') {
         assign(polygonEnds, chunk, asNumberArray);
-      } else if (this.bboxPaths && samePath(path, this.bboxPaths.xmin)) {
-        assign(minXs, chunk, Number);
-      } else if (this.bboxPaths && samePath(path, this.bboxPaths.ymin)) {
-        assign(minYs, chunk, Number);
-      } else if (this.bboxPaths && samePath(path, this.bboxPaths.xmax)) {
-        assign(maxXs, chunk, Number);
-      } else if (this.bboxPaths && samePath(path, this.bboxPaths.ymax)) {
-        assign(maxYs, chunk, Number);
       }
     };
-    const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths, bbox) : undefined;
     await parquetRead({
       file: file as never,
       metadata: metadata as never,
@@ -587,23 +551,15 @@ export class CogpReader {
       columns: ['overviews'],
       compressors: this.compressors,
       rowFormat: 'object',
-      filter,
-      usePageIndex: filter !== undefined,
+      // The predicate belongs to planning only; passing it here reads bbox values.
+      ...pagePlan,
+      usePageIndex: false,
       useOffsetIndex: true,
       onPage: onPage as never,
     });
 
-    const rowIndexes: number[] = [];
     const values: QuantizedOverviewGeometry[] = [];
-    for (let row = 0; row < rowCount; row++) {
-      if (bbox && this.bboxPaths) {
-        const values = [minXs[row], minYs[row], maxXs[row], maxYs[row]];
-        if (values.some((value) => value === undefined)) continue;
-        if (!bboxesIntersect(
-          { minX: values[0]!, minY: values[1]!, maxX: values[2]!, maxY: values[3]! },
-          bbox,
-        )) continue;
-      }
+    for (const row of rowIndexes) {
       const geometryType = geometryTypes[row];
       const rowXs = xs[row];
       const rowYs = ys[row];
@@ -612,7 +568,6 @@ export class CogpReader {
       if (geometryType === undefined || !rowXs || !rowYs || !rowPartEnds || !rowPolygonEnds) {
         throw new Error(`selected overview LoD \`${lod}\` is null or incomplete at row ${rowStart + row}`);
       }
-      rowIndexes.push(row);
       values.push(parseOverviewColumns(
         geometryType,
         rowXs,
@@ -680,39 +635,6 @@ function bboxFilter(paths: BboxCovering, bbox: Bbox): ParquetQueryFilter {
   };
 }
 
-function selectedRowIndexes(
-  columns: Map<string, unknown[]>,
-  rowCount: number,
-  paths: BboxCovering | undefined,
-  bbox?: Bbox,
-): number[] {
-  if (!bbox || !paths) return Array.from({ length: rowCount }, (_, row) => row);
-  const selected: number[] = [];
-  for (let row = 0; row < rowCount; row++) {
-    const minX = readColumnNum(columns, row, paths.xmin);
-    const minY = readColumnNum(columns, row, paths.ymin);
-    const maxX = readColumnNum(columns, row, paths.xmax);
-    const maxY = readColumnNum(columns, row, paths.ymax);
-    if (minX === undefined || minY === undefined || maxX === undefined || maxY === undefined) {
-      continue;
-    }
-    if (bboxesIntersect({ minX, minY, maxX, maxY }, bbox)) selected.push(row);
-  }
-  return selected;
-}
-
-function readColumnNum(
-  columns: Map<string, unknown[]>,
-  row: number,
-  path: readonly string[],
-): number | undefined {
-  let value = columns.get(path[0]!)?.[row];
-  for (let i = 1; value != null && i < path.length; i++) {
-    value = (value as Record<string, unknown>)[path[i]!];
-  }
-  return value == null ? undefined : Number(value);
-}
-
 /**
  * Locate physical WKB chunks once, from the footer, and turn them into hard
  * transport barriers. Projection keeps them out of the Parquet plan; these
@@ -758,10 +680,6 @@ function normalizeBbox(input?: BboxInput): Bbox | undefined {
   return input as Bbox;
 }
 
-function samePath(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((part, index) => part === right[index]);
-}
-
 // onPage keeps list nesting but does not assemble the surrounding struct. A
 // nullable LoD can add singleton wrappers outside the actual leaf list, so
 // remove only wrappers whose sole value is itself an array.
@@ -778,15 +696,4 @@ function asNumberArray(input: unknown): NumberArray {
     throw new Error('overview physical leaf is not an array');
   }
   return value as NumberArray;
-}
-
-// Walk a path-in-schema like `['bbox','xmin']` against a hyparquet row object.
-// Null geometry may have a null bbox; NaN keeps it out of bbox matches.
-function readNum(row: Record<string, unknown>, path: readonly string[]): number {
-  let cur: unknown = row;
-  for (const p of path) {
-    if (cur == null) return Number.NaN;
-    cur = (cur as Record<string, unknown>)[p];
-  }
-  return cur == null ? Number.NaN : Number(cur);
 }

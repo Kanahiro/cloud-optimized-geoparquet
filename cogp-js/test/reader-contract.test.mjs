@@ -34,6 +34,15 @@ for (const name of ['refinement', 'shared', 'legacy']) {
       const all = await reader.readRows({ columns, maxLevel });
       assert.deepEqual(all.map(row => row.id), reader.levels[maxLevel].row_group_end === 0 ? [0] : [0, 1]);
     }
+    const covering = new Set(Object.values(reader.geo.columns.geometry.covering.bbox).map(path => path.join('.')));
+    for (const group of reader.metadata.row_groups) {
+      for (const { meta_data: column } of group.columns) {
+        if (!covering.has(column.path_in_schema.join('.'))) continue;
+        const start = Number(column.dictionary_page_offset ?? column.data_page_offset);
+        const end = start + Number(column.total_compressed_size);
+        assert.ok(requests.every(([a, b]) => b <= start || a >= end), 'unexpected covering data read');
+      }
+    }
     // Reading only ID plus the rendering geometry never fetches primary WKB.
     for (const group of reader.metadata.row_groups) {
       const column = group.columns.find(column => column.meta_data.path_in_schema[0] === 'geometry').meta_data;
@@ -87,11 +96,11 @@ test('readRow projects one source row without requiring geometry', async () => {
   await assert.rejects(() => reader.readRow(2), /rowIndex/);
 });
 
-test('base layout uses separate bbox roots without requiring statistics', async () => {
+test('base layout with separate covering roots retains candidates without statistics', async () => {
   const { reader } = await openFixture('base-covering');
   assert.equal(reader.rowGroupEnvelope(0), null);
   const rows = await reader.readRows({ columns: ['id', 'overviews'], bbox: [-1, -1, 1, 1] });
-  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }]);
+  assert.deepEqual(rows, [{ id: 0, overviews: 'ordinary' }, { id: 1, overviews: 'attribute' }, { id: 2, overviews: 'null geometry' }]);
 });
 
 test('base layout without covering conservatively retains candidates', async () => {

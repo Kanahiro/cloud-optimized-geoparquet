@@ -19,7 +19,11 @@ console.log(reader.geo); // includes lod.levels and optional rendering metadata
 const properties = await reader.readRow(rows[0][COGP_ROW_INDEX], { columns: ['id'] });
 ```
 
-`readRows` selects primary covering bboxes within a cumulative row-group prefix.
+`readRows` uses primary covering statistics to prune row groups and pages within
+a cumulative prefix. It returns candidates without reading covering values for
+per-row filtering; callers clip or filter geometries for exact spatial results.
+Default bbox projections omit covering columns, while explicit projections can
+still request them.
 When overviews are declared, the requested geometry is decoded from the selected
 LoD; primary WKB is excluded from rendering reads. Missing declared overview
 values are errors. Without overviews, the reader uses the primary geometry.
@@ -27,7 +31,8 @@ Missing bbox statistics retain candidate groups; missing covering disables bbox
 pruning. Coarse reads are partial feature selections, not complete analytical results.
 
 `overviewDecoder` can consume `QuantizedOverviewGeometry` directly. The default
-produces GeoJSON. `maxRows` caps rows after filtering; `signal` cancels requests.
+produces GeoJSON. `maxRows` caps returned candidates, including spatial false
+positives, so a finite cap can omit later matches; `signal` cancels requests.
 `includeRowIndex` attaches a non-enumerable source-row identity for lazy property
 reads. `fromAsyncBuffer` supports custom transports. HTTP requests use no-store,
 with bounded in-memory caching and coalescing that avoids primary WKB ranges.

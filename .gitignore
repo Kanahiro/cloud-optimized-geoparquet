@@ -24,3 +24,5 @@ __pycache__/
 
 # Small generated reader contract fixtures
 !test-data/*.parquet
+
+!cogp-js/test/fixtures/*.parquet
