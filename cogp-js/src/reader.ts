@@ -7,6 +7,7 @@ import { wkbToGeojson } from 'hyparquet/src/wkb.js';
 import {
   type Bbox,
   type BboxColumnIndexes,
+  bboxesIntersect,
   findBboxColumnIndexes,
   type FileMetadataLike,
   rowGroupBbox,
@@ -208,7 +209,8 @@ export class CogpReader {
    * Row groups whose covering envelope misses the query are skipped entirely
    * (no I/O). PageIndexes further narrow the candidate rows where available.
    * Candidates may lie outside the bbox; callers clip or filter geometries as
-   * needed. Missing covering/statistics conservatively retain candidates.
+   * needed. Missing statistics conservatively retain candidates. Without a
+   * covering, the existing primary-geometry envelope filter applies.
    */
   async readRows(opts: ReadOptions = {}): Promise<Record<string, unknown>[]> {
     const maxLevel = opts.maxLevel ?? this.geo.lod.levels.length - 1;
@@ -220,6 +222,9 @@ export class CogpReader {
     // Covering values are for pruning, not implicit output attributes. Explicit
     // projections can still request them like any other column.
     let columns = opts.columns;
+    if (bbox && !this.bboxPaths && columns && !columns.includes(this.primaryGeometryColumn)) {
+      columns = [...columns, this.primaryGeometryColumn];
+    }
     if (bbox && !columns) {
       const coveringColumns = new Set(Object.values(this.bboxPaths ?? {}).map(path => path[0]));
       columns = parquetSchema(this.metadata as never).children
@@ -249,6 +254,7 @@ export class CogpReader {
         const v = row[col];
         if (v instanceof Uint8Array) row[col] = decodeWkb(v);
       }
+      if (bbox && !this.bboxPaths && !geometryIntersects(row[this.primaryGeometryColumn], bbox)) return false;
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
       return false;
@@ -436,4 +442,23 @@ function normalizeBbox(input?: BboxInput): Bbox | undefined {
     return { minX: input[0]!, minY: input[1]!, maxX: input[2]!, maxY: input[3]! };
   }
   return input as Bbox;
+}
+
+// Without a covering, decode the primary geometry and evaluate its envelope.
+function geometryIntersects(value: unknown, query: Bbox): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const geometry = value as { coordinates?: unknown; geometries?: unknown[] };
+  if (geometry.geometries) return geometry.geometries.some(g => geometryIntersects(g, query));
+  const envelope = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  const visit = (coords: unknown): void => {
+    if (!Array.isArray(coords)) return;
+    if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+      envelope.minX = Math.min(envelope.minX, coords[0]);
+      envelope.maxX = Math.max(envelope.maxX, coords[0]);
+      envelope.minY = Math.min(envelope.minY, coords[1]);
+      envelope.maxY = Math.max(envelope.maxY, coords[1]);
+    } else coords.forEach(visit);
+  };
+  visit(geometry.coordinates);
+  return bboxesIntersect(envelope, query);
 }

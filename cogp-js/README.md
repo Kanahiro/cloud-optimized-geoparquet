@@ -90,7 +90,8 @@ budget stops the read before decoding that row. Both output caps are optional.
 Readers validate all level boundaries against the footer before selecting a prefix.
 Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be
 regenerated with the current converter. Bbox covering and PageIndexes are optional.
-Without covering or usable statistics, bbox queries conservatively retain
+Without covering, bbox queries decode primary WKB and filter its envelope.
+With covering but no usable statistics, bbox queries conservatively retain
 candidates. With a bbox and no explicit projection, covering top-level columns
 are omitted; other attributes (even one named `bbox`) remain available. Reads
 without a bbox retain the default all-column projection.

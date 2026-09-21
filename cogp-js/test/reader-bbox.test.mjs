@@ -83,7 +83,7 @@ test('default projection omits metadata-defined covering, but explicit projectio
   assert.ok((await f.reader.readRows()).every(row => 'bounds' in row));
 });
 
-for (const [name, count] of [['no-index', 16], ['no-statistics', 48], ['no-covering', 48]]) {
+for (const [name, count] of [['no-index', 16], ['no-statistics', 48]]) {
   test(`${name} conservatively returns candidates without fetching bbox values`, async () => {
     const f = await fixture(name);
     const rows = await f.reader.readRows({ bbox, columns: ['id', 'geometry'] });
@@ -92,6 +92,14 @@ for (const [name, count] of [['no-index', 16], ['no-statistics', 48], ['no-cover
     assert.ok(f.calls.every(a => f.spans('bounds').every(b => !intersects(a, b))));
   });
 }
+
+test('without covering, the existing geometry-envelope filter and projection fallback remain', async () => {
+  const f = await fixture('no-covering');
+  const rows = await f.reader.readRows({ bbox, columns: ['id'] });
+  assert.deepEqual(rows.map(row => row.id), [1]);
+  assert.deepEqual(rows[0].geometry, { type: 'Point', coordinates: [1, 0] });
+  assert.ok(f.calls.every(a => f.spans('bounds').every(b => !intersects(a, b))));
+});
 
 test('row-group rejection avoids data I/O and output caps count returned candidates', async () => {
   const f = await fixture();
