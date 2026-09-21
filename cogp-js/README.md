@@ -12,25 +12,19 @@ filtering or clipping when exact spatial results are needed. Covering data
 columns are not fetched implicitly for bbox queries; explicit `columns`
 projections can still request them.
 
-Remote reads coalesce nearby concurrent byte ranges by default. This reduces
-HTTP request count with three absolute bounds: a 32 KiB maximum gap, 128 KiB of
-cumulative extra bytes per merged request, and a 2 MiB maximum merged request.
-Absolute byte budgets behave consistently for both tiny PageIndex reads and
-large data pages. PageIndexes are prefetched in bounded 16-RowGroup planning
-windows. Page-pruned bbox decode batches run with concurrency 4 so adjacent
-RowGroups do not serialize their HTTP requests; unfiltered reads remain serial
-to bound memory. Tune or disable coalescing when opening:
+Remote reads coalesce overlapping or adjacent concurrent byte ranges by default.
+Gaps are never fetched just to combine requests. PageIndexes are prefetched in
+bounded 16-RowGroup planning windows. Page-pruned bbox decode batches run with
+concurrency 4 so adjacent RowGroups do not serialize their HTTP requests;
+unfiltered reads remain serial to bound memory. Disable coalescing when opening:
 
 ```ts
-await CogpReader.open(url, {
-  rangeCoalescing: {
-    maxGapBytes: 64 * 1024,
-    maxExtraBytes: 256 * 1024,
-    maxRequestBytes: 2 * 1024 * 1024,
-  },
-});
 await CogpReader.open(url, { rangeCoalescing: false });
 ```
+
+`rangeCoalescing` is now a boolean; the `RangeCoalescingOptions` type and
+`maxGapBytes`, `maxExtraBytes`, and `maxRequestBytes` settings have been removed.
+Omit the option or use `true` to enable contiguous-range coalescing.
 
 `CogpReader.open()` forces Fetch's cache mode to `no-store`, including footer
 and byte-range requests. Other standard Fetch options can be supplied through

@@ -13,10 +13,7 @@ import {
   rowGroupBbox,
   rowGroupIntersects,
 } from './bbox.js';
-import {
-  coalescingAsyncBuffer,
-  type RangeCoalescingOptions,
-} from './coalescing-buffer.js';
+import { coalescingAsyncBuffer } from './coalescing-buffer.js';
 import { selectLevelByResolution } from './level.js';
 import { type BboxCovering, type CogpMeta, extractGeoMeta, type GeoMeta } from './meta.js';
 import { rangeCachedAsyncBuffer, type RangeCacheOptions } from './range-cache.js';
@@ -36,8 +33,8 @@ export interface OpenOptions {
   byteLength?: number;
   /** Additional HTTP options. Browser caching is always forced to `no-store`. */
   requestInit?: Omit<RequestInit, 'cache'>;
-  /** Coalesce nearby concurrent HTTP ranges; enabled by default. */
-  rangeCoalescing?: RangeCoalescingOptions | false;
+  /** Coalesce overlapping or adjacent concurrent HTTP ranges; enabled by default. */
+  rangeCoalescing?: boolean;
   /** In-memory compressed range cache; enabled with a 64 MiB limit by default. */
   rangeCache?: RangeCacheOptions | false;
 }
@@ -119,7 +116,7 @@ export class CogpReader {
     const source = await asyncBufferFromUrl(fetchOpts as { url: string });
     const coalesced = opts.rangeCoalescing === false
       ? source
-      : coalescingAsyncBuffer(source, opts.rangeCoalescing);
+      : coalescingAsyncBuffer(source);
     const file = opts.rangeCache === false
       ? coalesced
       : rangeCachedAsyncBuffer(coalesced, opts.rangeCache);
