@@ -385,8 +385,16 @@ export class CogpReader {
     if (rgIndices.length === 0) return;
 
     const filter = bbox && this.bboxPaths ? bboxFilter(this.bboxPaths, bbox) : undefined;
+    throwIfAborted(signal);
+    const callerSignal = signal;
+    const controller = new AbortController();
+    const abort = () => controller.abort(callerSignal?.reason);
+    callerSignal?.addEventListener('abort', abort, { once: true });
+    signal = controller.signal;
     const file = bindAbortSignal(this.file as AsyncBufferLike, signal);
-    for (const run of this.coalescedRuns(rgIndices)) {
+    // Start every run immediately; only consumption follows source order.
+    // Settled outcomes handle early failures even while an earlier run is pending.
+    const batches = this.coalescedRuns(rgIndices).map(async (run) => {
       throwIfAborted(signal);
       const startRg = run[0]!;
       const endRg = run[run.length - 1]!;
@@ -455,7 +463,25 @@ export class CogpReader {
         rows[i] = row;
       }
       throwIfAborted(signal);
-      yield rows;
+      return rows;
+    }).map(promise => promise.then(
+      rows => ({ rows }),
+      error => {
+        controller.abort(error);
+        return { error };
+      },
+    ));
+    try {
+      for (const batch of batches) {
+        const result = await batch;
+        if ('error' in result) throw result.error;
+        throwIfAborted(signal);
+        yield result.rows;
+      }
+    } finally {
+      // A row limit, consumer failure, or cancellation also stops pending runs.
+      controller.abort();
+      callerSignal?.removeEventListener('abort', abort);
     }
   }
 

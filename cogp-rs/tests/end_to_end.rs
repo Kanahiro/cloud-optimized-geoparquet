@@ -1125,11 +1125,12 @@ fn attribute_encodings_preserve_values_and_nested_paths() {
     for group in reader.metadata().row_groups() {
         for column in group.columns() {
             assert!(column.dictionary_page_offset().is_none());
-            let root = &column.column_path().parts()[0];
-            if root == "overviews" {
-                continue;
-            }
-            let expected = Encoding::PLAIN;
+            let parts = column.column_path().parts();
+            let expected = if parts[0] == "overviews" && parts.len() > 2 {
+                Encoding::BYTE_STREAM_SPLIT
+            } else {
+                Encoding::PLAIN
+            };
             assert!(
                 column.encodings().contains(&expected),
                 "{}: {:?}",

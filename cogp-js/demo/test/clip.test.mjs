@@ -125,3 +125,28 @@ test('popup attributes survive MVT decoding with existing display formatting', (
   assert.equal(layer._keys.length, Object.keys(feature.properties).length);
   assert.equal(layer._values.length, Object.keys(feature.properties).length);
 });
+
+test('overview latitude rejection preserves rounded buffer edges and either scale sign', () => {
+  const z = 10, tileY = 403;
+  const latitude = py => Math.atan(Math.sinh(Math.PI * (1 - 2 * (tileY + py / 4096) / 2 ** z))) * 180 / Math.PI;
+  const encode = createOverviewMvtEncoder(z, 909, tileY);
+  for (const py of [-65, -64.4, -64, 0, 4096, 4160, 4160.4, 4161]) {
+    for (const scale of [1, -1]) {
+      const lat = latitude(py);
+      const expected = encodePrimaryFeature({ type: 'Point', coordinates: [139.75, lat] }, z, 909, tileY, 7);
+      const actual = encode({ type: 1, x: [139.75], y: [lat / scale], partEnds: [], polygonEnds: [], scale: [1, scale], offset: [0, 0] }, 7);
+      assert.deepEqual(actual, expected, `py=${py}, scale=${scale}`);
+    }
+  }
+});
+
+test('overview latitude rejection retains crossing paths and clamped polar points', () => {
+  const encode = createOverviewMvtEncoder(10, 512, 512);
+  assert.ok(encode({ type: 2, x: [0.1, 0.1], y: [-20, 20], partEnds: [], polygonEnds: [], scale: [1, 1], offset: [0, 0] }, 1));
+  const world = createOverviewMvtEncoder(0, 0, 0);
+  for (const latitude of [-90, 90]) {
+    assert.deepEqual(world({ type: 1, x: [0], y: [latitude], partEnds: [], polygonEnds: [], scale: [1, 1], offset: [0, 0] }, 1),
+      encodePrimaryFeature({ type: 'Point', coordinates: [0, latitude] }, 0, 0, 0, 1));
+  }
+  assert.equal(encode({ type: 2, x: [], y: [], partEnds: [], polygonEnds: [], scale: [1, 1], offset: [0, 0] }, 1), null);
+});

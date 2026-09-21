@@ -36,8 +36,8 @@ export interface EncodedMvtFeature {
  * typed arrays in place and writes MVT command integers directly: no WKB,
  * GeoJSON coordinate tree, geojson-vt index, or Point wrapper is allocated.
  *
- * Features are first bbox-filtered by CogpReader, then clipped here to the
- * buffered MVT extent so large geometries are not repeatedly sent to MapLibre.
+ * CogpReader bbox-prunes candidates at page granularity. Clipping them here
+ * to the buffered extent avoids sending whole large geometries to MapLibre.
  */
 export function createOverviewMvtEncoder(
   z: number,
@@ -164,6 +164,21 @@ function encodeOverviewFeature(
   projection: TileProjection,
   id: number,
 ): EncodedMvtFeature | null {
+  // Page-level pruning can leave many off-tile features. Latitude bounds are
+  // monotonic in Mercator, even across the antimeridian; reject them before
+  // allocating projected paths or evaluating trigonometry for every vertex.
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < overview.y.length; i++) {
+    const y = Number(overview.y[i]);
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  if (overview.y.length === 0) return null;
+  const a = projection.y(overview.offset[1] + overview.scale[1] * minY);
+  const b = projection.y(overview.offset[1] + overview.scale[1] * maxY);
+  if (Math.max(a, b) < MVT_CLIP_BBOX[1] || Math.min(a, b) > MVT_CLIP_BBOX[3]) return null;
+
   const mvtType = overview.type === 1 || overview.type === 4
     ? 1
     : overview.type === 2 || overview.type === 5

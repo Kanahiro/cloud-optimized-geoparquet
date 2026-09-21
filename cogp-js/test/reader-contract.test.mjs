@@ -18,7 +18,7 @@ async function openFixture(name) {
   return { reader, requests };
 }
 
-for (const name of ['refinement', 'shared', 'legacy']) {
+for (const name of ['refinement', 'refinement-delta', 'shared', 'legacy']) {
   test(`${name}: primary bbox selects features independently of the overview`, async () => {
     const { reader, requests } = await openFixture(name);
     const columns = ['id', 'geometry'];
