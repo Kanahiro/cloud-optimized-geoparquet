@@ -778,6 +778,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let cogp_meta = CogpMeta {
         levels: levels_meta,
         overviews: (!overview_plan.is_empty()).then(|| OverviewsMeta {
+            column: OVERVIEWS_COLUMN.into(),
             encoding: OVERVIEWS_ENCODING.to_string(),
             lods: overview_plan
                 .iter()
@@ -785,6 +786,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     (
                         overview.id.clone(),
                         LodMeta {
+                            geometry_type: None,
                             scale: overview.scale,
                             offset: overview.offset,
                         },

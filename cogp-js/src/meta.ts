@@ -7,12 +7,14 @@ export interface Level {
 }
 
 export interface LodMetadata {
+  geometry_type?: 'LineString' | 'MultiLineString' | 'Polygon' | 'MultiPolygon';
   scale: [number, number];
   offset: [number, number];
 }
 
 export interface OverviewsMetadata {
-  encoding: 'quantized_xy_v1';
+  encoding: 'quantized_xy_v1' | 'quantized_geoarrow';
+  column: string;
   lods: Record<string, LodMetadata>;
 }
 
@@ -57,8 +59,12 @@ export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
     throw new Error('geo.lod: levels must be a non-empty array');
   }
   if (parsed.overviews !== undefined) {
-    if (parsed.overviews?.encoding !== 'quantized_xy_v1') {
+    if (!['quantized_xy_v1', 'quantized_geoarrow'].includes(parsed.overviews?.encoding)) {
       throw new Error('geo.lod: unsupported `overviews.encoding`');
+    }
+    const column = parsed.overviews.column;
+    if (typeof column !== 'string' || !column) {
+      throw new Error('geo.lod: missing or invalid `overviews.column`');
     }
     if (!parsed.overviews.lods || typeof parsed.overviews.lods !== 'object') {
       throw new Error('geo.lod: missing `overviews.lods`');
@@ -68,7 +74,11 @@ export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
       throw new Error('geo.lod: `overviews.lods` must be non-empty');
     }
     for (const [lod, metadata] of lodEntries) {
-      if (!lod || lod === 'geometry_type') throw new Error('geo.lod: invalid overview LoD name');
+      if (!lod || (parsed.overviews.encoding === 'quantized_xy_v1' && lod === 'geometry_type')) throw new Error('geo.lod: invalid overview LoD name');
+      if (parsed.overviews.encoding === 'quantized_geoarrow'
+        && !['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon'].includes(metadata?.geometry_type ?? '')) {
+        throw new Error(`geo.lod: invalid geometry_type for overview ${lod}`);
+      }
       if (!validPair(metadata?.scale, true)) {
         throw new Error(`geo.lod: overviews.lods.${lod}.scale must contain two positive numbers`);
       }
@@ -163,6 +173,14 @@ export function extractGeoMeta(
   const family = geometryFamily(geo.columns[geo.primary_column]?.geometry_types ?? []);
   if (lod.overviews && family !== 'line' && family !== 'polygon') {
     throw new Error('overviews require a Line or Polygon family; points must not declare overviews');
+  }
+  if (lod.overviews) {
+    if (lod.overviews.column === geo.primary_column) throw new Error('overview column must differ from primary geometry');
+    for (const value of Object.values(lod.overviews.lods)) {
+      if (value.geometry_type && geometryFamily([value.geometry_type]) !== family) {
+        throw new Error('overview geometry_type must match primary geometry family');
+      }
+    }
   }
   return { ...geo, lod };
 }

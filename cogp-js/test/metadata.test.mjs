@@ -13,6 +13,7 @@ function document(overrides = {}) {
     ],
     overviews: {
       encoding: 'quantized_xy_v1',
+      column: 'overviews',
       lods: {
         l0: { scale: [1, 1], offset: [0, 0] },
         l1: { scale: [0.125, 0.125], offset: [0, 0] },
@@ -117,3 +118,33 @@ test('rejects decreasing boundaries, orphan LoDs, and reserved LoD names', () =>
   reserved.overviews.lods.geometry_type = { scale: [1, 1], offset: [0, 0] };
   assert.throws(() => parseCogpMeta(JSON.stringify(reserved)), /invalid overview LoD name/);
 });
+
+test('quantized_geoarrow requires an explicit column and supported per-LoD geometry types', () => {
+  const metadata = structuredClone(specExample);
+  metadata.overviews.encoding = 'quantized_geoarrow';
+  metadata.overviews.column = 'render_geometry';
+  for (const lod of Object.values(metadata.overviews.lods)) lod.geometry_type = 'MultiPolygon';
+  assert.equal(parseCogpMeta(JSON.stringify(metadata)).overviews.column, 'render_geometry');
+  const missingColumn = structuredClone(metadata);
+  delete missingColumn.overviews.column;
+  assert.throws(() => parseCogpMeta(JSON.stringify(missingColumn)), /column/);
+  const emptyColumn = structuredClone(metadata);
+  emptyColumn.overviews.column = '';
+  assert.throws(() => parseCogpMeta(JSON.stringify(emptyColumn)), /column/);
+  const missingType = structuredClone(metadata);
+  delete missingType.overviews.lods.l0.geometry_type;
+  assert.throws(() => parseCogpMeta(JSON.stringify(missingType)), /geometry_type/);
+  metadata.overviews.lods.l0.geometry_type = 'Point';
+  assert.throws(() => parseCogpMeta(JSON.stringify(metadata)), /geometry_type/);
+});
+
+for (const encoding of ['quantized_xy_v1', 'quantized_geoarrow']) {
+  test(`${encoding}: column is required and must be a nonempty string`, () => {
+    for (const column of [undefined, null, '', 12]) {
+      const metadata = structuredClone(specExample);
+      metadata.overviews.encoding = encoding;
+      metadata.overviews.column = column;
+      assert.throws(() => parseCogpMeta(JSON.stringify(metadata)), /overviews.column/);
+    }
+  });
+}

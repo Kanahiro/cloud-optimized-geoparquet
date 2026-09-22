@@ -10,7 +10,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::meta::{
-    geometry_family, CogpMeta, GeoMeta, GeometryFamily, GEO_METADATA_KEY, OVERVIEWS_COLUMN,
+    geometry_family, CogpMeta, GeoMeta, GeometryFamily, GEOARROW_ENCODING, GEO_METADATA_KEY,
 };
 
 pub fn run(path: &Path) -> Result<()> {
@@ -186,6 +186,7 @@ pub fn run(path: &Path) -> Result<()> {
 /// One required child preserves its optional LoD parent's definition level.
 /// Read the small topology leaf, not every coordinate or primary WKB page.
 fn validate_lod_coverage(path: &Path, cogp: &CogpMeta) -> Result<()> {
+    let overviews = cogp.overviews.as_ref().unwrap();
     let file = File::open(path)?;
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let schema = metadata.metadata().file_metadata().schema_descr();
@@ -197,8 +198,14 @@ fn validate_lod_coverage(path: &Path, cogp: &CogpMeta) -> Result<()> {
             .enumerate()
             .filter(|(_, column)| {
                 let parts = column.path().parts();
-                parts.first().is_some_and(|name| name == OVERVIEWS_COLUMN)
-                    && parts.get(2).is_some_and(|name| name == "part_ends")
+                parts
+                    .first()
+                    .is_some_and(|name| name == overviews.column.as_str())
+                    && if overviews.encoding == GEOARROW_ENCODING {
+                        parts.last().is_some_and(|name| name == "x")
+                    } else {
+                        parts.get(2).is_some_and(|name| name == "part_ends")
+                    }
             })
             .map(|(index, _)| index),
     );
@@ -211,7 +218,7 @@ fn validate_lod_coverage(path: &Path, cogp: &CogpMeta) -> Result<()> {
         for batch in batches {
             let batch = batch?;
             let root = batch
-                .column_by_name(OVERVIEWS_COLUMN)
+                .column_by_name(overviews.column.as_str())
                 .and_then(|array| array.as_any().downcast_ref::<StructArray>())
                 .context("missing overviews while checking LoD coverage")?;
             for lod in cogp.overviews.as_ref().unwrap().lods.keys() {
@@ -236,22 +243,63 @@ fn validate_lod_coverage(path: &Path, cogp: &CogpMeta) -> Result<()> {
     Ok(())
 }
 
-fn validate_overviews_schema(
+pub(crate) fn validate_overviews_schema(
     fields: &Fields,
     overviews: &crate::meta::OverviewsMeta,
     errors: &mut Vec<String>,
 ) {
-    let Some(root) = fields.iter().find(|field| field.name() == OVERVIEWS_COLUMN) else {
-        errors.push(format!("missing required `{OVERVIEWS_COLUMN}` struct"));
+    let Some(root) = fields
+        .iter()
+        .find(|field| field.name() == overviews.column.as_str())
+    else {
+        errors.push(format!(
+            "missing required `{}` struct",
+            overviews.column.as_str()
+        ));
         return;
     };
     if root.is_nullable() {
-        errors.push(format!("`{OVERVIEWS_COLUMN}` struct must be required"));
+        errors.push(format!(
+            "`{}` struct must be required",
+            overviews.column.as_str()
+        ));
     }
     let DataType::Struct(children) = root.data_type() else {
-        errors.push(format!("`{OVERVIEWS_COLUMN}` must be a struct"));
+        errors.push(format!("`{}` must be a struct", overviews.column.as_str()));
         return;
     };
+    if overviews.encoding == GEOARROW_ENCODING {
+        if children.len() != overviews.lods.len() {
+            errors.push("overview fields must match declared LoDs".into());
+        }
+        for (name, lod) in &overviews.lods {
+            let Some((_, field)) = children.find(name) else {
+                errors.push(format!("missing overview LoD {name}"));
+                continue;
+            };
+            let Some(depth) = lod.list_depth() else {
+                continue;
+            };
+            let mut data_type = field.data_type();
+            let mut valid = field.is_nullable();
+            for _ in 0..depth {
+                if let DataType::List(element) = data_type {
+                    valid &= !element.is_nullable();
+                    data_type = element.data_type();
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            valid &= matches!(data_type, DataType::Struct(axes)
+                if axes.len() == 2 && ["x", "y"].iter().zip(axes.iter()).all(|(name, axis)|
+                    axis.name() == name && axis.data_type() == &DataType::Int32 && !axis.is_nullable()));
+            if !valid {
+                errors.push(format!("invalid quantized_geoarrow schema for LoD {name}"));
+            }
+        }
+        return;
+    }
     match children.find("geometry_type") {
         Some((_, field)) if field.data_type() == &DataType::Int8 && !field.is_nullable() => {}
         _ => errors.push("`overviews.geometry_type` must be required int8".into()),

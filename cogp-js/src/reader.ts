@@ -27,6 +27,7 @@ import {
 import {
   decodeQuantizedOverview,
   parseOverviewColumns,
+  parseGeoArrowLeaves,
   projectOverviewMetadata,
   rootColumnNames,
   type QuantizedOverviewGeometry,
@@ -168,6 +169,7 @@ export class CogpReader {
   private readonly geomColumns: readonly string[];
   /** Whether rendering uses the overview column instead of primary WKB. */
   private readonly usesOverviews: boolean;
+  private readonly overviewColumn: string | undefined;
   /** Codec table is resolved once so every page read shares initialized decoders. */
   private readonly compressors: Compressors;
   /** Two adjacent zoom levels cover normal pan/zoom without retaining every projection. */
@@ -183,9 +185,10 @@ export class CogpReader {
     this.geo = geo;
     this.compressors = { ...defaultCompressors, ...compressors };
     this.usesOverviews = this.geo.lod.overviews !== undefined;
-    const hasOverviewsColumn = rootColumnNames(metadata.schema).includes('overviews');
+    this.overviewColumn = geo.lod.overviews?.column;
+    const hasOverviewsColumn = this.overviewColumn !== undefined && rootColumnNames(metadata.schema).includes(this.overviewColumn);
     if (this.usesOverviews && !hasOverviewsColumn) {
-      throw new Error('cogp file is missing declared `overviews` column');
+      throw new Error(`cogp file is missing declared overview column: ${this.overviewColumn}`);
     }
     const finalBoundary = this.geo.lod.levels[this.geo.lod.levels.length - 1]!.row_group_end;
     if (finalBoundary !== metadata.row_groups.length - 1) {
@@ -304,23 +307,23 @@ export class CogpReader {
       .filter(column => !bbox || !coveringColumns.has(column));
     const wantsGeometry = opts.columns === undefined
       || opts.columns.includes(this.primaryGeometryColumn)
-      || (this.usesOverviews && opts.columns.includes('overviews'));
+      || (this.usesOverviews && opts.columns.includes(this.overviewColumn!));
     let columns = requested.filter(
       (column) => (!this.usesOverviews || !this.geomColumns.includes(column))
-        && (!this.usesOverviews || column !== 'overviews'),
+        && (!this.usesOverviews || column !== this.overviewColumn),
     );
-    if (wantsGeometry && this.usesOverviews) columns.push('overviews');
+    if (wantsGeometry && this.usesOverviews) columns.push(this.overviewColumn!);
     const out: Record<string, unknown>[] = [];
     // Returns true once a cap has been reached, signalling callers to stop
     // iterating the current row group (and the outer stream) immediately
     // rather than draining the rest of the batch.
     const acceptRow = (row: Record<string, unknown>): boolean => {
       if (wantsGeometry && lodMetadata) {
-        const overview = row['overviews'] as QuantizedOverviewGeometry | null;
+        const overview = row[this.overviewColumn!] as QuantizedOverviewGeometry | null;
         row[this.primaryGeometryColumn] = opts.overviewDecoder
           ? opts.overviewDecoder(overview)
           : decodeQuantizedOverview(overview);
-        delete row['overviews'];
+        delete row[this.overviewColumn!];
       }
       out.push(row);
       if (maxRows !== undefined && out.length >= maxRows) return true;
@@ -419,7 +422,7 @@ export class CogpReader {
       }
       const readsOverview = lod !== undefined && lodMetadata !== undefined;
       const objectColumns = readsOverview
-        ? columns?.filter((column) => column !== 'overviews')
+        ? columns?.filter((column) => column !== this.overviewColumn)
         : columns;
       const columnsPromise = this.readColumnValues(
         file,
@@ -456,7 +459,7 @@ export class CogpReader {
           }
           row[column] = values[localRow];
         }
-        if (overviewSelection) row['overviews'] = overviewSelection.values[i]!;
+        if (overviewSelection) row[this.overviewColumn!] = overviewSelection.values[i]!;
         if (includeRowIndex) {
           Object.defineProperty(row, COGP_ROW_INDEX, { value: rowStart + localRow });
         }
@@ -556,16 +559,22 @@ export class CogpReader {
         }
       }
     };
+    const nested = this.geo.lod.overviews!.encoding === 'quantized_geoarrow';
+    const nestedXs: unknown[] = new Array(rowCount);
+    const nestedYs: unknown[] = new Array(rowCount);
     const onPage = (chunk: PageChunk) => {
       const path = chunk.pathInSchema;
-      if (path[0] === 'overviews' && path[1] === 'geometry_type') {
+      if (nested && path[0] === this.overviewColumn && path[1] === lod) {
+        if (path.at(-1) === 'x') assign(nestedXs, chunk, value => value);
+        if (path.at(-1) === 'y') assign(nestedYs, chunk, value => value);
+      } else if (path[0] === this.overviewColumn && path[1] === 'geometry_type') {
         assign(geometryTypes, chunk, Number);
-      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'coordinates') {
+      } else if (path[0] === this.overviewColumn && path[1] === lod && path[2] === 'coordinates') {
         if (path[path.length - 1] === 'x') assign(xs, chunk, asNumberArray);
         if (path[path.length - 1] === 'y') assign(ys, chunk, asNumberArray);
-      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'part_ends') {
+      } else if (path[0] === this.overviewColumn && path[1] === lod && path[2] === 'part_ends') {
         assign(partEnds, chunk, asNumberArray);
-      } else if (path[0] === 'overviews' && path[1] === lod && path[2] === 'polygon_ends') {
+      } else if (path[0] === this.overviewColumn && path[1] === lod && path[2] === 'polygon_ends') {
         assign(polygonEnds, chunk, asNumberArray);
       }
     };
@@ -574,7 +583,7 @@ export class CogpReader {
       metadata: metadata as never,
       rowStart,
       rowEnd,
-      columns: ['overviews'],
+      columns: [this.overviewColumn!],
       compressors: this.compressors,
       rowFormat: 'object',
       // The predicate belongs to planning only; passing it here reads bbox values.
@@ -586,6 +595,10 @@ export class CogpReader {
 
     const values: QuantizedOverviewGeometry[] = [];
     for (const row of rowIndexes) {
+      if (nested) {
+        values.push(parseGeoArrowLeaves(nestedXs[row], nestedYs[row], lodMetadata));
+        continue;
+      }
       const geometryType = geometryTypes[row];
       const rowXs = xs[row];
       const rowYs = ys[row];
@@ -639,7 +652,7 @@ export class CogpReader {
       this.overviewMetadataCache.set(lod, cached);
       return cached;
     }
-    const projected = projectOverviewMetadata(this.metadata, lod);
+    const projected = projectOverviewMetadata(this.metadata, lod, this.overviewColumn!, this.geo.lod.overviews!.encoding);
     this.overviewMetadataCache.set(lod, projected);
     if (this.overviewMetadataCache.size > 2) {
       const oldest = this.overviewMetadataCache.keys().next().value as string | undefined;

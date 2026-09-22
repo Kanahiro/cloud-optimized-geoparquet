@@ -23,6 +23,7 @@
   ],
   "overviews": {
     "encoding": "quantized_xy_v1",
+    "column": "overviews",
     "lods": {
       "l0": {
         "scale": [

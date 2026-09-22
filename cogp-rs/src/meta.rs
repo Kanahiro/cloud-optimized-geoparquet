@@ -5,6 +5,7 @@ pub const GEO_METADATA_KEY: &str = "geo";
 pub const GEOPARQUET_VERSION: &str = "1.1.0";
 pub const OVERVIEWS_COLUMN: &str = "overviews";
 pub const OVERVIEWS_ENCODING: &str = "quantized_xy_v1";
+pub const GEOARROW_ENCODING: &str = "quantized_geoarrow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CogpMeta {
@@ -42,7 +43,7 @@ impl CogpMeta {
                 (Some(overviews), Some(lod)) => {
                     ensure!(
                         !lod.is_empty()
-                            && lod != "geometry_type"
+                            && (overviews.encoding != OVERVIEWS_ENCODING || lod != "geometry_type")
                             && overviews.lods.contains_key(lod),
                         "levels[{index}].lod does not name an overview LoD"
                     );
@@ -60,16 +61,30 @@ impl CogpMeta {
         );
         if let Some(overviews) = &self.overviews {
             ensure!(
-                overviews.encoding == OVERVIEWS_ENCODING,
+                matches!(
+                    overviews.encoding.as_str(),
+                    OVERVIEWS_ENCODING | GEOARROW_ENCODING
+                ),
                 "unsupported overviews.encoding"
             );
             ensure!(
                 !overviews.lods.is_empty(),
                 "overviews.lods must be non-empty"
             );
+            ensure!(
+                !overviews.column.is_empty(),
+                "overview column must be non-empty"
+            );
             for (lod, transform) in &overviews.lods {
+                if overviews.encoding == GEOARROW_ENCODING {
+                    ensure!(
+                        transform.list_depth().is_some(),
+                        "overview `{lod}` has invalid geometry_type"
+                    );
+                }
                 ensure!(
-                    !lod.is_empty() && lod != "geometry_type",
+                    !lod.is_empty()
+                        && (overviews.encoding != OVERVIEWS_ENCODING || lod != "geometry_type"),
                     "invalid overview LoD name `{lod}`"
                 );
                 ensure!(
@@ -109,14 +124,28 @@ pub struct Level {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverviewsMeta {
+    pub column: String,
     pub encoding: String,
     pub lods: BTreeMap<String, LodMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LodMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_type: Option<String>,
     pub scale: [f64; 2],
     pub offset: [f64; 2],
+}
+
+impl LodMeta {
+    pub fn list_depth(&self) -> Option<usize> {
+        match self.geometry_type.as_deref()? {
+            "LineString" => Some(1),
+            "MultiLineString" | "Polygon" => Some(2),
+            "MultiPolygon" => Some(3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

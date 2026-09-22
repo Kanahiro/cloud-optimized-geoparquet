@@ -63,12 +63,17 @@ remain aligned with the source table: each row's overview represents that row's
 primary geometry. Files MAY omit overviews, in which case rendering readers use
 the lossless primary geometry.
 
-The `quantized_xy_v1` identifier is defined in
-[Quantized XY encoding](encodings/quantized-xy-v1.md). Its physical schema and
-coordinate transforms are specific to that encoding, not requirements for
-other encodings. Every additional encoding identifier MUST resolve to an
-unambiguous definition of the rules above; naming a serialization format alone
-is insufficient.
+The following encoding identifiers have definitions:
+
+| Identifier | Definition |
+| --- | --- |
+| `quantized_geoarrow` | [Quantized GeoArrow](encodings/quantized-geoarrow.md): nested geometry lists with int32 XY coordinates. |
+| `quantized_xy_v1` | [Quantized XY](encodings/quantized-xy-v1.md): flattened int32 XY coordinates with explicit part and polygon boundaries. |
+
+Their physical schemas and coordinate transforms are specific to each encoding,
+not requirements for other encodings. Every additional encoding identifier MUST
+resolve to an unambiguous definition of the rules above; naming a serialization
+format alone is insufficient.
 
 ## Metadata
 
@@ -86,8 +91,8 @@ The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet 
 | `overviews.lods` | object | **REQUIRED** within `overviews`. Non-empty mapping from LoD names to encoding-specific metadata objects. |
 
 Example of the `geo.lod` object for the eight-row-group file above, using
-[`quantized_xy_v1`](encodings/quantized-xy-v1.md) for the rendering geometries.
-The `scale` and `offset` fields belong to that encoding; the level-selection
+[`quantized_geoarrow`](encodings/quantized-geoarrow.md) for the rendering geometries.
+The `geometry_type`, `scale`, and `offset` fields belong to that encoding; the level-selection
 contract does not depend on them:
 
 ```json
@@ -99,11 +104,11 @@ contract does not depend on them:
   ],
   "overviews": {
     "column": "render_geometry",
-    "encoding": "quantized_xy_v1",
+    "encoding": "quantized_geoarrow",
     "lods": {
-      "l0": { "scale": [512, 512], "offset": [0, 0] },
-      "l1": { "scale": [64, 64], "offset": [0, 0] },
-      "l2": { "scale": [8, 8], "offset": [0, 0] }
+      "l0": { "geometry_type": "MultiPolygon", "scale": [512, 512], "offset": [0, 0] },
+      "l1": { "geometry_type": "MultiPolygon", "scale": [64, 64], "offset": [0, 0] },
+      "l2": { "geometry_type": "MultiPolygon", "scale": [8, 8], "offset": [0, 0] }
     }
   }
 }

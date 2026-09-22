@@ -124,7 +124,8 @@ async function readTile(
 }
 
 function propertyColumnNames(reader: CogpReader): string[] {
-  const excluded = new Set<string>(['overviews', ...Object.keys(reader.geo.columns)]);
+  const excluded = new Set<string>(Object.keys(reader.geo.columns));
+  if (reader.geo.lod.overviews) excluded.add(reader.geo.lod.overviews.column);
   for (const column of Object.values(reader.geo.columns)) {
     const covering = column.covering?.bbox;
     for (const path of covering

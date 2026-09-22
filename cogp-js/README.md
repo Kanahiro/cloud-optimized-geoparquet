@@ -25,7 +25,9 @@ per-row filtering; callers clip or filter geometries for exact spatial results.
 Default bbox projections omit covering columns, while explicit projections can
 still request them.
 When overviews are declared, the requested geometry is decoded from the selected
-LoD; primary WKB is excluded from rendering reads. Missing declared overview
+LoD; primary WKB is excluded from rendering reads. Both `quantized_xy_v1` and
+`quantized_geoarrow` are supported, with the root column selected by
+`geo.lod.overviews.column`, which is required for both encodings. Missing declared overview
 values are errors. Without overviews, the reader uses the primary geometry.
 Missing bbox statistics retain candidate groups; missing covering disables bbox
 pruning. Coarse reads are partial feature selections, not complete analytical results.

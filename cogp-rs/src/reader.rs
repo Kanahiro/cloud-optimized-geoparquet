@@ -17,9 +17,9 @@
 //!   [`parquet::arrow::async_reader::AsyncFileReader`]. Enable the
 //!   `object_store` feature to use `ParquetObjectReader` with S3 / GCS / HTTP.
 //!
-//! Geometries stay in their on-disk WKB form in the returned
-//! [`arrow_array::RecordBatch`]es; downstream callers convert them via
-//! [`geozero`](https://crates.io/crates/geozero) — see the README.
+//! Returned [`arrow_array::RecordBatch`]es preserve the physical geometry
+//! columns: primary WKB and, when declared, integer overview arrays. Callers
+//! select the LoD and apply its scale/offset when decoding overview coordinates.
 use anyhow::{anyhow, bail, Context, Result};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
@@ -43,9 +43,7 @@ pub use parquet::arrow::async_reader::ParquetObjectReader;
 #[cfg(feature = "async")]
 pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
 
-use crate::meta::{
-    geometry_family, CogpMeta, GeoMeta, GeometryFamily, Level, GEO_METADATA_KEY, OVERVIEWS_COLUMN,
-};
+use crate::meta::{geometry_family, CogpMeta, GeoMeta, GeometryFamily, Level, GEO_METADATA_KEY};
 
 /// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
 /// Cheap to clone (the underlying `ArrowReaderMetadata` is `Arc`-backed) and
@@ -100,7 +98,7 @@ impl Reader {
                     geo_meta.primary_column
                 )
             })?;
-        if cogp_meta.overviews.is_some() {
+        if let Some(overviews) = &cogp_meta.overviews {
             if !matches!(
                 geometry_family(&primary.geometry_types),
                 Some(GeometryFamily::Line | GeometryFamily::Polygon)
@@ -109,10 +107,31 @@ impl Reader {
             }
             if arrow_meta
                 .schema()
-                .field_with_name(OVERVIEWS_COLUMN)
+                .field_with_name(overviews.column.as_str())
                 .is_err()
             {
                 bail!("file is missing declared overviews column");
+            }
+            if overviews.column.as_str() == geo_meta.primary_column {
+                bail!("overview column must differ from primary geometry");
+            }
+            for lod in overviews.lods.values() {
+                if let Some(kind) = &lod.geometry_type {
+                    if geometry_family(std::slice::from_ref(kind))
+                        != geometry_family(&primary.geometry_types)
+                    {
+                        bail!("overview geometry_type must match primary geometry family");
+                    }
+                }
+            }
+            let mut errors = Vec::new();
+            crate::validate::validate_overviews_schema(
+                arrow_meta.schema().fields(),
+                overviews,
+                &mut errors,
+            );
+            if !errors.is_empty() {
+                bail!("{}", errors.join("; "));
             }
         }
         Ok(Self {

@@ -120,7 +120,7 @@ test('metadata projection removes sibling LoDs from range planning', () => {
       ],
     }],
   };
-  const projected = projectOverviewMetadata(metadata, 'l1');
+  const projected = projectOverviewMetadata(metadata, 'l1', 'overviews', 'quantized_xy_v1');
   const paths = projected.row_groups[0].columns.map((column) => column.meta_data.path_in_schema);
   assert.deepEqual(paths, [
     ['geometry'],

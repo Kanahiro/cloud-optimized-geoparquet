@@ -1,4 +1,4 @@
-import type { LodMetadata } from './meta.js';
+import type { LodMetadata, OverviewsMetadata } from './meta.js';
 import type { FileMetadataLike } from './bbox.js';
 
 interface SchemaElementLike {
@@ -52,27 +52,27 @@ export function rootColumnNames(schema: readonly SchemaElementLike[]): string[] 
  * excludes primary WKB from the requested root-column list. The file itself
  * and its public schema are unchanged.
  */
-export function projectOverviewMetadata<T extends OverviewFileMetadata>(metadata: T, lod: string): T {
-  const { start, end, node, children } = overviewRange(metadata.schema);
+export function projectOverviewMetadata<T extends OverviewFileMetadata>(metadata: T, lod: string, column: string, encoding: OverviewsMetadata['encoding']): T {
+  const { start, end, node, children } = overviewRange(metadata.schema, column);
   const geometryType = children.find(({ index }) => metadata.schema[index]!.name === 'geometry_type');
   const selected = children.find(({ index }) => metadata.schema[index]!.name === lod);
-  if (!geometryType || geometryType.size !== 1) {
+  if (encoding === 'quantized_xy_v1' && (!geometryType || geometryType.size !== 1)) {
     throw new Error('overviews.geometry_type is missing or nested');
   }
   if (!selected) throw new Error(`overview LoD \`${lod}\` is missing from the Parquet schema`);
 
   const schema = [
     ...metadata.schema.slice(0, start),
-    { ...node, num_children: 2 },
-    ...metadata.schema.slice(geometryType.index, geometryType.index + geometryType.size),
+    { ...node, num_children: encoding === 'quantized_xy_v1' ? 2 : 1 },
+    ...(encoding === 'quantized_xy_v1' ? metadata.schema.slice(geometryType!.index, geometryType!.index + geometryType!.size) : []),
     ...metadata.schema.slice(selected.index, selected.index + selected.size),
     ...metadata.schema.slice(end),
   ];
   const row_groups = metadata.row_groups.map((rowGroup) => ({
     ...rowGroup,
-    columns: rowGroup.columns.filter((column) => {
-      const path = column.meta_data?.path_in_schema;
-      return path?.[0] !== 'overviews' || path[1] === 'geometry_type' || path[1] === lod;
+    columns: rowGroup.columns.filter((chunk) => {
+      const path = chunk.meta_data?.path_in_schema;
+      return path?.[0] !== column || (encoding === 'quantized_xy_v1' && path[1] === 'geometry_type') || path[1] === lod;
     }),
   }));
   return { ...metadata, schema, row_groups } as T;
@@ -254,14 +254,14 @@ function subtreeSize(schema: readonly SchemaElementLike[], index: number): numbe
   return size;
 }
 
-function overviewRange(schema: readonly SchemaElementLike[]) {
+function overviewRange(schema: readonly SchemaElementLike[], column: string) {
   const root = schema[0];
   if (!root) throw new Error('parquet schema is empty');
   let index = 1;
   for (let i = 0; i < (root.num_children ?? 0); i++) {
     const size = subtreeSize(schema, index);
     const node = schema[index]!;
-    if (node.name === 'overviews') {
+    if (node.name === column) {
       const children: Array<{ index: number; size: number }> = [];
       let child = index + 1;
       for (let j = 0; j < (node.num_children ?? 0); j++) {
@@ -274,4 +274,42 @@ function overviewRange(schema: readonly SchemaElementLike[]) {
     index += size;
   }
   throw new Error('required `overviews` column is missing');
+}
+
+/** Normalize nested physical XY leaves to the same renderer-facing view as flat overviews. */
+export function parseGeoArrowLeaves(x: unknown, y: unknown, metadata: LodMetadata): QuantizedOverviewGeometry {
+  const types: Record<string, OverviewGeometryType> = { LineString: 2, Polygon: 3, MultiLineString: 5, MultiPolygon: 6 };
+  const type = types[metadata.geometry_type ?? ''];
+  if (!type) throw new Error('invalid quantized_geoarrow geometry_type');
+  const depth = type === 2 ? 1 : type === 6 ? 3 : 2;
+  const isList = (v: unknown): v is ArrayLike<unknown> => Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
+  // Physical page output may wrap the nullable parent; preserve all geometry list levels.
+  const nesting = (v: unknown): number => isList(v) ? 1 + (v.length ? nesting(v[0]) : 0) : 0;
+  const unwrap = (v: unknown): unknown => {
+    while (isList(v) && v.length === 1 && nesting(v) > depth) v = v[0];
+    return v;
+  };
+  const xs: number[] = [], ys: number[] = [], parts: number[] = [], polygons: number[] = [];
+  const visit = (a: unknown, b: unknown, remaining: number): void => {
+    if (!isList(a) || !isList(b) || a.length !== b.length || !a.length) {
+      throw new Error('quantized_geoarrow overview is null, empty or has mismatched XY topology');
+    }
+    for (let i = 0; i < a.length; i++) {
+      if (remaining > 1) visit(a[i], b[i], remaining - 1);
+      else {
+        const vx = a[i], vy = b[i];
+        if (typeof vx !== 'number' || typeof vy !== 'number'
+          || !Number.isInteger(vx) || !Number.isInteger(vy)
+          || vx < -2147483648 || vx > 2147483647 || vy < -2147483648 || vy > 2147483647) {
+          throw new Error('quantized_geoarrow coordinates must be int32');
+        }
+        xs.push(vx); ys.push(vy);
+      }
+    }
+    if (remaining === 1 && type !== 2) parts.push(xs.length);
+    if (remaining === 2 && type === 6) polygons.push(parts.length);
+  };
+  visit(unwrap(x), unwrap(y), depth);
+  return parseOverviewColumns(type, Int32Array.from(xs), Int32Array.from(ys),
+    Int32Array.from(parts), Int32Array.from(polygons), metadata);
 }
