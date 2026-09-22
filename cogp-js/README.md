@@ -1,6 +1,6 @@
 # COGP JavaScript reader
 
-Release 2.0.0 reads `geo.lod` and the optional [quantized rendering extension](../OVERVIEWS.md).
+Release 2.0.0 reads `geo.lod` and the optional [quantized rendering geometries](../SPEC.md#geometry-representation).
 Legacy `cogp` and `coarse_to_fine` metadata are not used. Rendering resolutions
 are in the primary geometry CRS units, including degrees for geographic data.
 

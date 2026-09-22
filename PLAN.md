@@ -1,8 +1,8 @@
 # Implementation status
 
 Release 2.0.0 combines the upstream versionless `geo.lod` feature layout with
-the optional rendering extension in `OVERVIEWS.md`. `SPEC.md` remains the upstream
-LoD proposal. Resolution values use primary CRS units.
+the optional rendering overviews, both specified in [SPEC.md](SPEC.md).
+Resolution values use primary CRS units.
 
 The writer preserves source rows and attributes, existing bbox covering paths,
 unknown GeoParquet fields, null CRS values, and non-layout key-value metadata.

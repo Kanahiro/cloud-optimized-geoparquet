@@ -62,7 +62,7 @@ Because the base LoD layout does not simplify geometries, datasets dominated by 
 
 ## Specification
 
-See [`SPEC.md`](./SPEC.md) for the base LoD proposal and [`OVERVIEWS.md`](./OVERVIEWS.md) for the optional quantized rendering extension.
+See [`SPEC.md`](./SPEC.md) for the LoD proposal, including optional [quantized geometry overviews](./SPEC.md#geometry-representation).
 
 ## Implementations
 

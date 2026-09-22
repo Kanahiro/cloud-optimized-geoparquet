@@ -5,7 +5,7 @@ Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://g
 `convert` reorders the features of a GeoParquet file across row groups using
 point-grid density thinning, extent-based line/polygon visibility, and
 Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
-structural rules in SPEC.md and any declared rendering extension in OVERVIEWS.md.
+structural rules and any declared rendering overviews in [SPEC.md](../SPEC.md).
 
 ## Install
 
@@ -34,7 +34,7 @@ Supports GeoParquet 1.x with WKB point, line, or polygon geometries, including M
 
 ## Rendering overviews
 
-Release 2.0.0 adds the optional [quantized rendering extension](../OVERVIEWS.md).
+Release 2.0.0 adds the optional [quantized rendering geometries](../SPEC.md#geometry-representation).
 The base layout remains `geo.lod`, without an independent version. Eligible
 line/polygon tables receive separate int32 XY overviews; the primary geometry
 and source attributes remain unchanged. Tables with null/empty geometries,
