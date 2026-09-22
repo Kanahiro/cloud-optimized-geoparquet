@@ -78,6 +78,17 @@ readable by any renderer regardless of which path you pick.
 
 Other options:
 
+- `--min-root-features` (default `2048`) — minimum cumulative feature count for
+  the root (coarsest output level), across the whole dataset. After assigning
+  features, the writer folds sparse leading levels into the first level whose
+  cumulative count meets the minimum. The omitted resolutions are not emitted
+  in `geo.lod`; a coarser reader request therefore falls back to the new root.
+  If the entire dataset has fewer rows, all rows use the finest requested
+  resolution. Applies to all geometry families and both resolution options;
+  later levels have no minimum. Set to `1` for the previous behavior.
+  This counts stored features, not pixels or visible features in a viewport;
+  it does not guarantee spatial coverage. Geometry and attributes are preserved.
+
 - `--row-group-size` (default `65536`) — max Parquet row group size in rows.
 - `--page-row-count` (default `2048`) — maximum top-level rows per data page.
   Page Indexes and spatial page packing are always enabled. Row Groups never
