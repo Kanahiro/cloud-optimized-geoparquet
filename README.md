@@ -143,6 +143,12 @@ Compression is **ZSTD level 9**. Dictionary encoding is disabled for the primary
 WKB geometry and covering bbox leaves. Other columns retain the Parquet writer's
 default dictionary behavior.
 
+The writer requires **2,048 cumulative features** in the root level by default
+(`--min-root-features`). Sparse leading levels are folded into the first finer
+level reaching that count. If the whole input is smaller, it is written at the
+finest requested resolution. Later levels are unchanged; `--min-root-features 1`
+restores the previous behavior. Existing files need regeneration to use this policy.
+
 All three visibility factors default to **4**, expressing a common four-resolution-
 unit scale. Points use that scale as grid width; lines and polygons use it as a
 bbox-diagonal threshold, so equal factors do not imply equal visual density.

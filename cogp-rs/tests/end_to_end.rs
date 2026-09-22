@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Float64Array, Int32Array, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, Float64Array, Int32Array, ListArray, RecordBatch, StringArray,
     StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -135,6 +135,7 @@ fn write_input(path: &std::path::Path) {
 fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArgs {
     ConvertArgs {
         simplification_tolerance_factor: 1.0,
+        min_root_features: 1, // Existing fixtures exercise the complete candidate ladder.
         input: input.to_path_buf(),
         output: output.to_path_buf(),
         resolution: vec![],
@@ -268,6 +269,92 @@ fn convert_reader_validate_pipeline() {
         }
         other => panic!("bbox must be a struct, got {other:?}"),
     }
+}
+
+#[test]
+fn root_minimum_preserves_rows_and_uses_the_first_sufficient_resolution() {
+    let tmp = TempDir::new("root-minimum");
+    let input = tmp.path().join("input.parquet");
+    write_input(&input);
+    // 26 large polygons enter at 0.1; 14 small ones enter at 0.01.
+    for (minimum, root_resolution, root_rows, level_count) in [
+        (1, 0.1, 26, 3),
+        (26, 0.1, 26, 3),
+        (27, 0.01, 40, 2),
+        (2048, 0.001, 40, 1),
+    ] {
+        let output = tmp.path().join(format!("root-{minimum}.parquet"));
+        let mut args = convert_args(&input, &output);
+        args.resolution = vec![1.0, 0.1, 0.01, 0.001];
+        args.min_root_features = minimum;
+        cogp::convert::run(args).unwrap();
+        cogp::validate::run(&output).unwrap();
+        let reader = Reader::open(&output).unwrap();
+        assert_eq!(reader.levels().len(), level_count);
+        assert_eq!(reader.levels()[0].resolution, root_resolution);
+        let coarse_groups = reader.row_groups_up_to_resolution(1000.0);
+        let count: i64 = coarse_groups
+            .map(|i| reader.parquet_metadata().row_group(i).num_rows())
+            .sum();
+        assert_eq!(count, root_rows);
+        let groups: Vec<_> = (0..reader.num_row_groups()).collect();
+        let mut ids_seen = std::collections::BTreeSet::new();
+        for batch in reader
+            .sync_batch_reader(File::open(&output).unwrap(), &groups)
+            .unwrap()
+        {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let geoms = batch
+                .column_by_name("geometry")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let id = ids.value(row);
+                assert!(ids_seen.insert(id));
+                assert_eq!(names.value(row), format!("feature-{id}"));
+                let x = f64::from(id % 10);
+                let y = f64::from(id / 10);
+                let size = if id % 3 == 0 { 0.05 } else { 0.5 };
+                assert_eq!(
+                    geoms.value(row),
+                    wkb::polygon(&[
+                        (x, y),
+                        (x + size, y),
+                        (x + size, y + size),
+                        (x, y + size),
+                        (x, y),
+                    ])
+                );
+            }
+        }
+        assert_eq!(ids_seen, (0..40).collect());
+    }
+}
+
+#[test]
+fn root_minimum_rejects_zero() {
+    let tmp = TempDir::new("invalid-root-minimum");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    let mut args = convert_args(&input, &output);
+    args.min_root_features = 0;
+    let error = cogp::convert::run(args).unwrap_err();
+    assert!(error.to_string().contains("--min-root-features"));
+    assert!(!output.exists());
 }
 
 #[test]
@@ -638,6 +725,12 @@ fn cli_defaults_write_page_indexes() {
     );
     let reader = Reader::open(&output).unwrap();
     assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
+    assert_eq!(reader.levels().len(), 1);
+    assert!(
+        (reader.levels()[0].resolution - 40_075_016.685_578_49 / (1024.0 * 65536.0 * 111_320.0))
+            .abs()
+            < 1e-12
+    );
     for group in reader.parquet_metadata().row_groups() {
         assert!(group
             .columns()
@@ -716,6 +809,70 @@ fn write_line_input(path: &std::path::Path, lines: &[Vec<(f64, f64)>]) {
         ),
     });
     writer.close().unwrap();
+}
+
+#[test]
+fn root_minimum_is_applied_after_overview_viability() {
+    let tmp = TempDir::new("root-overview-viability");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    write_line_input(
+        &input,
+        &[
+            vec![(0.4, 0.4), (100.4, 0.4)],
+            vec![(0.4, 10.4), (10.4, 10.4)],
+        ],
+    );
+    let mut args = convert_args(&input, &output);
+    args.resolution = vec![16.0, 4.0, 1.0, 0.25];
+    args.line_visibility_factor = 1;
+    args.simplification_tolerance_factor = 8.0;
+    args.min_root_features = 2;
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+    let reader = Reader::open(&output).unwrap();
+    assert_eq!(
+        reader
+            .levels()
+            .iter()
+            .map(|level| level.resolution)
+            .collect::<Vec<_>>(),
+        vec![1.0, 0.25]
+    );
+    assert_eq!(reader.row_groups_up_to_resolution(1000.0), 0..1);
+    assert_eq!(reader.parquet_metadata().row_group(0).num_rows(), 2);
+    let batch = reader
+        .sync_batch_reader(File::open(&output).unwrap(), &[0])
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let overviews = batch
+        .column_by_name("overviews")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    // The root contains both usable overviews and retains the finer refinement.
+    for lod in ["l0", "l1"] {
+        let lod = overviews
+            .column_by_name(lod)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let coordinates = lod
+            .column_by_name("coordinates")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for row in 0..2 {
+            assert!(!lod.is_null(row));
+            assert!(!coordinates.is_null(row));
+            assert!(coordinates.value_length(row) >= 2);
+        }
+    }
 }
 
 #[test]
