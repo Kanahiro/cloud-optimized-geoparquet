@@ -53,6 +53,12 @@ pub struct ConvertArgs {
     /// when --resolution is omitted. Same Web Mercator assumption as --webmerc-minzoom.
     #[arg(long, default_value_t = 16)]
     pub webmerc_maxzoom: u32,
+    /// Minimum cumulative feature count for the coarsest output level.
+    /// Sparse coarse levels are folded into the first level reaching this count.
+    /// If the entire input is smaller, all rows use the finest requested level.
+    /// Set to 1 to retain the first occupied level.
+    #[arg(long, default_value_t = 2048)]
+    pub min_root_features: usize,
     /// Maximum Parquet row group size in rows.
     #[arg(long, default_value_t = 65_536)]
     pub row_group_size: usize,
@@ -222,6 +228,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             bail!("Resolution values must be positive, got {:?}", resolutions);
         }
     }
+    if args.min_root_features == 0 {
+        bail!("--min-root-features must be >= 1");
+    }
     if args.point_thinning_factor == 0 {
         bail!(
             "--point-thinning-factor must be >= 1 (got {})",
@@ -375,7 +384,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     eprintln!("[3/4] Assigning features to {} level(s)", resolutions.len());
-    let assignment = assign_levels(
+    let mut assignment = assign_levels(
         &bboxes,
         &kinds,
         &resolutions,
@@ -386,6 +395,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         },
         &sort_ranks,
     )?;
+    consolidate_sparse_root(&mut assignment, resolutions.len(), args.min_root_features);
     let mut per_level_full: Vec<Vec<u32>> = vec![Vec::new(); resolutions.len()];
     for (idx, level_i) in assignment.iter().enumerate() {
         per_level_full[*level_i as usize].push(idx as u32);
@@ -1132,6 +1142,27 @@ fn gather_chunk(
     Ok(out)
 }
 
+/// Fold sparse leading levels into the first cumulative prefix meeting the
+/// root minimum. Keep later assignments intact: this is not a minimum for every
+/// level. Falling back to the final candidate preserves all rows for small inputs.
+fn consolidate_sparse_root(assignment: &mut [u16], level_count: usize, minimum: usize) {
+    let mut counts = vec![0usize; level_count];
+    for &level in assignment.iter() {
+        counts[level as usize] += 1;
+    }
+    let mut cumulative = 0;
+    let root = counts
+        .iter()
+        .position(|count| {
+            cumulative += count;
+            cumulative >= minimum
+        })
+        .unwrap_or(level_count - 1) as u16;
+    for level in assignment {
+        *level = (*level).max(root);
+    }
+}
+
 /// Per-kind multipliers on `prec` for the visibility (eligibility) threshold.
 /// Points are excluded — they have no extent, so they are always eligible
 /// from level 0 regardless of any factor.
@@ -1542,6 +1573,7 @@ mod tests {
             "asc",
         ])
         .unwrap();
+        assert_eq!(cli.args.min_root_features, 2048);
         assert_eq!(cli.args.point_thinning_factor, 4);
         assert_eq!(cli.args.line_visibility_factor, 4);
         assert_eq!(cli.args.polygon_visibility_factor, 4);
@@ -1551,6 +1583,31 @@ mod tests {
             cli.args.priority_column_order,
             PriorityColumnOrder::Asc
         ));
+    }
+
+    #[test]
+    fn sparse_root_uses_cumulative_count_and_preserves_finer_levels() {
+        let mut levels = vec![0, 0, 2, 2, 3, 4];
+        consolidate_sparse_root(&mut levels, 5, 4);
+        assert_eq!(levels, vec![2, 2, 2, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sparse_root_handles_exact_threshold_small_inputs_and_opt_out() {
+        let mut exact = vec![0; 2048];
+        exact.push(1);
+        let expected = exact.clone();
+        consolidate_sparse_root(&mut exact, 3, 2048);
+        assert_eq!(exact, expected);
+        let mut small = vec![0, 1, 1];
+        consolidate_sparse_root(&mut small, 5, 2048);
+        assert_eq!(small, vec![4; 3]);
+        let mut single_level = vec![0; 3];
+        consolidate_sparse_root(&mut single_level, 1, 2048);
+        assert_eq!(single_level, vec![0; 3]);
+        let mut unchanged = vec![1, 1, 3];
+        consolidate_sparse_root(&mut unchanged, 5, 1);
+        assert_eq!(unchanged, vec![1, 1, 3]);
     }
 
     fn bb(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Bbox {
