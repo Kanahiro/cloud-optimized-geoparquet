@@ -2,35 +2,52 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractGeoMeta, parseCogpMeta } from '../dist/meta.js';
+import { extractGeoMeta, lodForLevel, parseCogpMeta } from '../dist/meta.js';
 import { selectLevelByResolution } from '../dist/level.js';
 
 function document(overrides = {}) {
   return JSON.stringify({
     levels: [
-      { row_group_end: 0, resolution: 1000, lod: 'l0' },
-      { row_group_end: 2, resolution: 100, lod: 'l1' },
+      { row_group_end: 0, resolution: 1000 },
+      { row_group_end: 2, resolution: 100 },
     ],
     overviews: {
       encoding: 'quantized_xy_v1',
       column: 'overviews',
       lods: {
-        l0: { scale: [1, 1], offset: [0, 0] },
-        l1: { scale: [0.125, 0.125], offset: [0, 0] },
+        l0: { level_indices: [0], scale: [1, 1], offset: [0, 0] },
+        l1: { level_indices: [1], scale: [0.125, 0.125], offset: [0, 0] },
       },
     },
     ...overrides,
   });
 }
 
-test('requires an explicit valid LoD on every level', () => {
-  const parsed = JSON.parse(document());
-  delete parsed.levels[0].lod;
-  parsed.default_lod = 'l0';
-  assert.throws(() => parseCogpMeta(JSON.stringify(parsed)), /levels\[0\]\.lod/);
+test('requires a complete and unique assignment of levels to overviews', () => {
+  for (const indices of [undefined, null, [], '0', [-1], [2], [0.5], [0, 0], [1]]) {
+    const parsed = JSON.parse(document());
+    parsed.overviews.lods.l0.level_indices = indices;
+    assert.throws(() => parseCogpMeta(JSON.stringify(parsed)), /level_indices|assigned/);
+  }
+  const missing = JSON.parse(document());
+  delete missing.overviews.lods.l0;
+  assert.throws(() => parseCogpMeta(JSON.stringify(missing)), /every level/);
+});
 
-  parsed.levels[0].lod = 'missing';
-  assert.throws(() => parseCogpMeta(JSON.stringify(parsed)), /does not name/);
+test('level structure is unchanged by optional overviews', () => {
+  const withOverviews = parseCogpMeta(document());
+  const without = parseCogpMeta(document({ overviews: undefined }));
+  assert.deepEqual(withOverviews.levels, without.levels);
+  assert.deepEqual(Object.keys(withOverviews.levels[0]), ['row_group_end', 'resolution']);
+  assert.equal(lodForLevel(without, 0), undefined);
+});
+
+test('explicit assignments are independent of dictionary and index order', () => {
+  const metadata = structuredClone(specExample);
+  metadata.overviews.lods = Object.fromEntries(Object.entries(metadata.overviews.lods).reverse());
+  metadata.overviews.lods.l1.level_indices.reverse();
+  const parsed = parseCogpMeta(JSON.stringify(metadata));
+  assert.deepEqual(parsed.levels.map((_, i) => lodForLevel(parsed, i)), ['l0', 'l1', 'l1', 'l2']);
 });
 
 test('validates LoD transforms and ordered levels', () => {
@@ -47,7 +64,7 @@ test('selects the level and required LoD for a target resolution', () => {
   const metadata = parseCogpMeta(document());
   assert.equal(selectLevelByResolution(metadata.levels, 500), 0);
   assert.equal(selectLevelByResolution(metadata.levels, 50), 1);
-  assert.equal(metadata.levels[selectLevelByResolution(metadata.levels, 50)].lod, 'l1');
+  assert.equal(lodForLevel(metadata, selectLevelByResolution(metadata.levels, 50)), 'l1');
 });
 
 test('Point-family metadata omits overviews and level LoDs', () => {
@@ -64,10 +81,6 @@ test('Point-family metadata omits overviews and level LoDs', () => {
   ], 1);
   assert.equal(parsed.lod.overviews, undefined);
   assert.equal(parsed.lod.levels[0].lod, undefined);
-
-  const strayLod = JSON.parse(cogp);
-  strayLod.levels[0].lod = 'l0';
-  assert.throws(() => parseCogpMeta(JSON.stringify(strayLod)), /requires overviews/);
 
   assert.throws(() => extractGeoMeta([
     { key: 'geo', value: JSON.stringify({...JSON.parse(geo), lod: JSON.parse(document())}) },
@@ -97,8 +110,8 @@ const specExample = JSON.parse(readFileSync(new URL('../../cogp-rs/tests/fixture
 test('rendering extension selects a new LoD on the same prefix and shares LoDs across prefixes', () => {
   const metadata = parseCogpMeta(JSON.stringify(specExample));
   const selected = [1000, 500, 250, 100].map(resolution => {
-    const level = metadata.levels[selectLevelByResolution(metadata.levels, resolution)];
-    return [level.row_group_end, level.lod];
+    const index = selectLevelByResolution(metadata.levels, resolution);
+    return [metadata.levels[index].row_group_end, lodForLevel(metadata, index)];
   });
   assert.deepEqual(selected, [[0, 'l0'], [0, 'l1'], [3, 'l1'], [3, 'l2']]);
 });
@@ -112,8 +125,8 @@ test('rejects decreasing boundaries, orphan LoDs, and reserved LoD names', () =>
   decreasing.levels[3].row_group_end = 2;
   assert.throws(() => parseCogpMeta(JSON.stringify(decreasing)), /non-decreasing/);
   const orphan = structuredClone(specExample);
-  orphan.overviews.lods.unused = { scale: [1, 1], offset: [0, 0] };
-  assert.throws(() => parseCogpMeta(JSON.stringify(orphan)), /not referenced/);
+  orphan.overviews.lods.unused = { level_indices: [], scale: [1, 1], offset: [0, 0] };
+  assert.throws(() => parseCogpMeta(JSON.stringify(orphan)), /level_indices/);
   const reserved = structuredClone(specExample);
   reserved.overviews.lods.geometry_type = { scale: [1, 1], offset: [0, 0] };
   assert.throws(() => parseCogpMeta(JSON.stringify(reserved)), /invalid overview LoD name/);

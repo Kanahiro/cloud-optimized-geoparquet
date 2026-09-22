@@ -58,8 +58,8 @@ incompatible changes require a distinct identifier. Encoding-specific fields
 MUST NOT change the level-selection or non-null coverage rules defined here.
 
 Every LoD declared in `overviews.lods` MUST identify a representation in the
-referenced column and MUST be referenced by at least one level. Representations
-remain aligned with the source table: each row's overview represents that row's
+referenced column and MUST select at least one level through `level_indices`.
+Representations remain aligned with the source table: each row's overview represents that row's
 primary geometry. Files MAY omit overviews, in which case rendering readers use
 the lossless primary geometry.
 
@@ -84,11 +84,11 @@ The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet 
 | `levels` | array of objects | **REQUIRED.** Non-empty list of levels, ordered from coarse to fine. |
 | `levels[].row_group_end` | integer | **REQUIRED.** Zero-based, inclusive end of the selected row group prefix. |
 | `levels[].resolution` | number | **REQUIRED.** Positive, finite nominal rendering resolution in the primary geometry column's CRS units. |
-| `levels[].lod` | string | **REQUIRED** when `overviews` is declared; otherwise MUST be absent. Names the rendering geometry used for this level. |
 | `overviews` | object | **OPTIONAL.** Declares rendering geometries. |
 | `overviews.column` | string | **REQUIRED** within `overviews`. Name of the top-level column containing the rendering geometries. |
 | `overviews.encoding` | string | **REQUIRED** within `overviews`. Identifier of the overview encoding. |
-| `overviews.lods` | object | **REQUIRED** within `overviews`. Non-empty mapping from LoD names to encoding-specific metadata objects. |
+| `overviews.lods` | object | **REQUIRED** within `overviews`. Non-empty mapping from physical LoD field names to their level assignments and encoding-specific metadata. |
+| `overviews.lods.<name>.level_indices` | array of integers | **REQUIRED** for each LoD. Non-empty list of zero-based indices into `levels` at which this rendering geometry is used. |
 
 Example of the `geo.lod` object for the eight-row-group file above, using
 [`quantized_geoarrow`](encodings/quantized-geoarrow.md) for the rendering geometries.
@@ -98,23 +98,33 @@ contract does not depend on them:
 ```json
 {
   "levels": [
-    { "row_group_end": 0, "resolution": 1000, "lod": "l0" },
-    { "row_group_end": 2, "resolution": 100, "lod": "l1" },
-    { "row_group_end": 7, "resolution": 10, "lod": "l2" }
+    { "row_group_end": 0, "resolution": 1000 },
+    { "row_group_end": 2, "resolution": 100 },
+    { "row_group_end": 7, "resolution": 10 }
   ],
   "overviews": {
     "column": "render_geometry",
     "encoding": "quantized_geoarrow",
     "lods": {
-      "l0": { "geometry_type": "MultiPolygon", "scale": [512, 512], "offset": [0, 0] },
-      "l1": { "geometry_type": "MultiPolygon", "scale": [64, 64], "offset": [0, 0] },
-      "l2": { "geometry_type": "MultiPolygon", "scale": [8, 8], "offset": [0, 0] }
+      "l0": { "level_indices": [0], "geometry_type": "MultiPolygon", "scale": [512, 512], "offset": [0, 0] },
+      "l1": { "level_indices": [1], "geometry_type": "MultiPolygon", "scale": [64, 64], "offset": [0, 0] },
+      "l2": { "level_indices": [2], "geometry_type": "MultiPolygon", "scale": [8, 8], "offset": [0, 0] }
     }
   }
 }
 ```
 
-When `overviews` is declared, each level MUST name a LoD in `overviews.lods`. Consecutive levels may select the same row-group prefix with different LoDs, refining geometry without adding features. A LoD may serve multiple prefixes. Files without overviews omit both `overviews` and every level's `lod`.
+`levels` has the same structure with or without overviews. When `overviews` is
+present, every level index MUST occur exactly once across all `level_indices`
+arrays. Each index MUST be an integer in the range `0 <= index < levels.length`.
+Duplicate indices, including duplicates within one LoD, and unassigned levels
+are invalid. The order of LoD entries and of indices within an entry has no
+meaning. Inserting or removing a level requires updating these indices.
+
+Consecutive levels may select the same row-group prefix with different LoDs,
+refining geometry without adding features. One LoD may serve multiple prefixes
+by listing multiple indices, for example `"level_indices": [0, 1]`. Files without
+overviews omit `overviews`; their levels need no rendering-specific fields.
 
 ### Boundaries
 
@@ -128,9 +138,10 @@ For a file containing `N` row groups:
 Boundaries refer to this file's footer, not to row numbers, byte offsets, or row groups in another file. Partitioned datasets apply the extension independently to each file; this draft does not define a dataset-wide level index.
 
 For each LoD, its effective boundary is the maximum `row_group_end` among all
-levels referencing it. The representation of that LoD MUST be non-null for every row from row group
-`0` through that effective boundary, inclusive, and MUST be null in every
-later row group. Multiple levels MAY reference the same LoD. This makes each
+levels identified by its `level_indices`. The representation of that LoD MUST be
+non-null for every row from row group `0` through that effective boundary,
+inclusive, and MUST be null in every
+later row group. Multiple levels MAY use the same LoD. This makes each
 selected prefix independently renderable without a per-row fallback.
 
 ### Resolution
@@ -159,7 +170,7 @@ A typical rendering reader:
 2. Chooses a level for its target resolution or rendering budget.
 3. Applies row group spatial pruning within the selected prefix, from `0` through `row_group_end`.
 4. Can further prune pages within the retained row groups when page indexes are available.
-5. Selects the rendering geometry named by the level's `lod` when overviews are declared and their encoding is supported; otherwise selects the primary geometry.
+5. Selects the rendering geometry whose `level_indices` contains the selected level index when overviews are declared and their encoding is supported; otherwise selects the primary geometry.
 6. Fetches the selected geometry and required attribute data and evaluates the per-feature predicate.
 7. Fetches additional data when finer detail or a different viewport is requested, reusing cached data where possible.
 

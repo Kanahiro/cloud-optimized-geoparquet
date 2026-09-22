@@ -2,23 +2,19 @@
   "levels": [
     {
       "row_group_end": 0,
-      "resolution": 1000,
-      "lod": "l0"
+      "resolution": 1000
     },
     {
       "row_group_end": 0,
-      "resolution": 500,
-      "lod": "l1"
+      "resolution": 500
     },
     {
       "row_group_end": 3,
-      "resolution": 250,
-      "lod": "l1"
+      "resolution": 250
     },
     {
       "row_group_end": 3,
-      "resolution": 100,
-      "lod": "l2"
+      "resolution": 100
     }
   ],
   "overviews": {
@@ -33,6 +29,9 @@
         "offset": [
           0,
           0
+        ],
+        "level_indices": [
+          0
         ]
       },
       "l1": {
@@ -43,6 +42,10 @@
         "offset": [
           0,
           0
+        ],
+        "level_indices": [
+          1,
+          2
         ]
       },
       "l2": {
@@ -53,6 +56,9 @@
         "offset": [
           0,
           0
+        ],
+        "level_indices": [
+          3
         ]
       }
     }

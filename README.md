@@ -156,7 +156,13 @@ Each factor remains independently configurable.
 
 The published v2.0.0 samples were generated with 65,536-row groups, 2,048-row
 pages, and point/line/polygon factors **4/4/4**. Their level metadata is stored
-in `geo.lod.levels`. Line and polygon overviews use `geo.lod.overviews` and per-level `lod` references; these extra fields are ignored by base LoD readers.
+in `geo.lod.levels`.
+
+The current overview contract uses `geo.lod.overviews`, whose named LoDs select
+levels through `level_indices`.
+The `levels` structure is unchanged when overviews are present; base LoD readers
+can ignore `overviews`. Files with earlier per-level `lod` references must migrate
+those assignments to `level_indices` before being read by this implementation.
 
 ## Development
 

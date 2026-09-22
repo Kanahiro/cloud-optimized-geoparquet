@@ -21,6 +21,7 @@ import {
   type BboxCovering,
   type CogpMeta,
   extractGeoMeta,
+  lodForLevel,
   type GeoMeta,
   type LodMetadata,
 } from './meta.js';
@@ -291,7 +292,7 @@ export class CogpReader {
     const maxLevel = opts.maxLevel ?? this.levels.length - 1;
     const level = this.levels[maxLevel];
     if (!level) throw new Error(`maxLevel ${maxLevel} out of range [0, ${this.levels.length})`);
-    const lod = level.lod;
+    const lod = lodForLevel(this.geo.lod, maxLevel);
     const lodMetadata = this.usesOverviews
       ? this.geo.lod.overviews!.lods[lod!]!
       : undefined;

@@ -1016,9 +1016,11 @@ fn shared_lod_contract_and_legacy_interoperability() {
         cogp::meta::Level {
             row_group_end: 0,
             resolution: 4.0,
-            lod: Some("l1".into()),
         },
     );
+    let lods = &mut shared.overviews.as_mut().unwrap().lods;
+    lods.get_mut("l1").unwrap().level_indices = vec![1, 2];
+    lods.get_mut("l2").unwrap().level_indices = vec![3];
     let shared_file = tmp.path().join("shared.parquet");
     rewrite_contract(&output, &shared_file, &shared);
     cogp::validate::run(&shared_file).unwrap();
@@ -1036,9 +1038,11 @@ fn shared_lod_contract_and_legacy_interoperability() {
         cogp::meta::Level {
             row_group_end: 1,
             resolution: 0.75,
-            lod: Some("l0".into()),
         },
     );
+    let lods = &mut invalid.overviews.as_mut().unwrap().lods;
+    lods.get_mut("l0").unwrap().level_indices = vec![0, 3];
+    lods.get_mut("l2").unwrap().level_indices = vec![4];
     invalid.validate(2).unwrap();
     let invalid_file = tmp.path().join("invalid.parquet");
     rewrite_contract(&output, &invalid_file, &invalid);

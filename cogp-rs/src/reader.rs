@@ -175,7 +175,7 @@ impl Reader {
             .iter()
             .rposition(|level| level.resolution >= target_resolution)
             .unwrap_or(0);
-        self.cogp_meta.levels[level].lod.as_deref()
+        self.cogp_meta.lod_for_level(level)
     }
 
     pub fn num_row_groups(&self) -> usize {
@@ -481,7 +481,6 @@ mod tests {
         Level {
             row_group_end,
             resolution,
-            lod: None,
         }
     }
 

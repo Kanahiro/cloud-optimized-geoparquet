@@ -36,7 +36,8 @@ The referenced column has this logical structure (`<column>` is the name from
 
 Every key in `overviews.lods` MUST name exactly one `<lod>` child, and every
 `<lod>` child MUST have corresponding metadata. LoD names MUST NOT be
-`geometry_type`. Each LoD's metadata MUST contain `scale` and `offset`, each an
+`geometry_type`. In addition to the `level_indices` required by SPEC.md, each
+LoD's metadata MUST contain `scale` and `offset`, each an
 array of exactly two finite numbers. Scale values MUST be positive. Both use
 primary geometry CRS units.
 

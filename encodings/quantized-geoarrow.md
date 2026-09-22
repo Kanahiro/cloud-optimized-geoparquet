@@ -20,7 +20,8 @@ document are to be interpreted as described in
 `geo.lod.overviews.column` contains the representations described below; no column
 name is reserved.
 
-Each entry in `geo.lod.overviews.lods` MUST contain:
+In addition to the `level_indices` required by SPEC.md, each entry in
+`geo.lod.overviews.lods` MUST contain:
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -106,8 +107,8 @@ non-null, non-empty source geometries; files with null or empty source geometrie
 may omit overviews.
 
 Producers SHOULD derive simplification tolerance and quantization scale from
-the finest `resolution` of any level referencing the LoD. Simplification and
-quantization MUST be considered together: the resulting integer geometry MUST
+the finest `resolution` among the levels identified by the LoD's `level_indices`.
+Simplification and quantization MUST be considered together: the resulting integer geometry MUST
 retain valid line or polygon structure, including non-degenerate parts and rings.
 If the chosen parameters collapse or invalidate a geometry, producers must adjust
 the parameters or repair the geometry while preserving the required coverage.

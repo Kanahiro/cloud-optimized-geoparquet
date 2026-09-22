@@ -149,12 +149,10 @@ fn validate_happy_path_accepts_well_formed_file() {
         overviews: None,
         levels: vec![
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 1000.0,
             },
             Level {
-                lod: None,
                 row_group_end: 2,
                 resolution: 100.0,
             },
@@ -171,7 +169,6 @@ fn validate_rejects_missing_geo() {
     let cogp = CogpMeta {
         overviews: None,
         levels: vec![Level {
-            lod: None,
             row_group_end: 0,
             resolution: 1.0,
         }],
@@ -196,13 +193,11 @@ fn validate_rejects_non_decreasing_resolution() {
         overviews: None,
         levels: vec![
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 100.0,
             },
             // equal to previous → must be strictly less
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 100.0,
             },
@@ -220,12 +215,10 @@ fn validate_rejects_non_increasing_row_group_end() {
         overviews: None,
         levels: vec![
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 100.0,
             },
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 10.0,
             }, // decreasing
@@ -244,12 +237,10 @@ fn validate_rejects_final_row_group_end_mismatch() {
         overviews: None,
         levels: vec![
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 100.0,
             },
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 10.0,
             },
@@ -266,7 +257,6 @@ fn validate_rejects_negative_resolution() {
     let cogp = CogpMeta {
         overviews: None,
         levels: vec![Level {
-            lod: None,
             row_group_end: 0,
             resolution: -1.0,
         }],
@@ -292,7 +282,6 @@ fn validate_rejects_missing_covering_column_in_schema() {
     let cogp = CogpMeta {
         overviews: None,
         levels: vec![Level {
-            lod: None,
             row_group_end: 0,
             resolution: 1.0,
         }],
@@ -323,17 +312,14 @@ fn repeated_boundaries_and_optional_covering_are_valid() {
         overviews: None,
         levels: vec![
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 1.0,
             },
             Level {
-                lod: None,
                 row_group_end: 0,
                 resolution: 0.1,
             },
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 0.01,
             },
@@ -355,28 +341,23 @@ fn reader_rejects_invalid_prefix_before_selection() {
     let path = tmp.path().join("bad.parquet");
     for levels in [
         vec![Level {
-            lod: None,
             row_group_end: 0,
             resolution: 1.0,
         }],
         vec![Level {
-            lod: None,
             row_group_end: 2,
             resolution: 1.0,
         }],
         vec![Level {
-            lod: None,
             row_group_end: 1,
             resolution: -1.0,
         }],
         vec![
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 1.0,
             },
             Level {
-                lod: None,
                 row_group_end: 1,
                 resolution: 2.0,
             },

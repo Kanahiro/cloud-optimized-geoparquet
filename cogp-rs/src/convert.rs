@@ -706,12 +706,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             if prev != level_i {
                 writer.flush()?;
                 let boundary = flushed_row_group_end(&writer)?;
-                for (level, &resolution) in resolutions.iter().enumerate().take(level_i).skip(prev)
-                {
+                for &resolution in resolutions.iter().take(level_i).skip(prev) {
                     levels_meta.push(Level {
                         row_group_end: boundary,
                         resolution,
-                        lod: overview_plan.get(level).map(|overview| overview.id.clone()),
                     });
                 }
             }
@@ -722,11 +720,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if let Some(prev) = last_level {
         writer.flush()?;
         let boundary = flushed_row_group_end(&writer)?;
-        for (level, &resolution) in resolutions.iter().enumerate().skip(prev) {
+        for &resolution in resolutions.iter().skip(prev) {
             levels_meta.push(Level {
                 row_group_end: boundary,
                 resolution,
-                lod: overview_plan.get(level).map(|overview| overview.id.clone()),
             });
         }
     }
@@ -782,10 +779,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             encoding: OVERVIEWS_ENCODING.to_string(),
             lods: overview_plan
                 .iter()
-                .map(|overview| {
+                .enumerate()
+                .map(|(index, overview)| {
                     (
                         overview.id.clone(),
                         LodMeta {
+                            level_indices: vec![index],
                             geometry_type: None,
                             scale: overview.scale,
                             offset: overview.offset,

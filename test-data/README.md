@@ -21,7 +21,10 @@ Regenerate explicitly from the repository root:
 COGP_TEST_FIXTURE_DIR="$PWD/test-data" cargo test -p cogp --test end_to_end shared_lod_contract_and_legacy_interoperability
 ```
 
-Normal test runs write only to temporary directories.
+Normal test runs write only to temporary directories. Overview assignments use
+`overviews.lods.<name>.level_indices`; `levels` contains only feature-selection
+metadata. The migration to this contract updates fixture footers without changing
+data pages or page indexes.
 
 `base-covering.parquet` and `base-no-covering.parquet` exercise ordinary attributes
 named `overviews`, independent bbox roots, and missing statistics/covering.

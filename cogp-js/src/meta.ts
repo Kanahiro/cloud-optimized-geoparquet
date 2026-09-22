@@ -3,10 +3,10 @@ export const GEO_METADATA_KEY = 'geo';
 export interface Level {
   row_group_end: number;
   resolution: number;
-  lod?: string;
 }
 
 export interface LodMetadata {
+  level_indices: number[];
   geometry_type?: 'LineString' | 'MultiLineString' | 'Polygon' | 'MultiPolygon';
   scale: [number, number];
   offset: [number, number];
@@ -66,18 +66,29 @@ export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
     if (typeof column !== 'string' || !column) {
       throw new Error('geo.lod: missing or invalid `overviews.column`');
     }
-    if (!parsed.overviews.lods || typeof parsed.overviews.lods !== 'object') {
+    if (!parsed.overviews.lods || typeof parsed.overviews.lods !== 'object' || Array.isArray(parsed.overviews.lods)) {
       throw new Error('geo.lod: missing `overviews.lods`');
     }
     const lodEntries = Object.entries(parsed.overviews.lods);
     if (lodEntries.length === 0) {
       throw new Error('geo.lod: `overviews.lods` must be non-empty');
     }
+    const assigned = new Set<number>();
     for (const [lod, metadata] of lodEntries) {
       if (!lod || (parsed.overviews.encoding === 'quantized_xy_v1' && lod === 'geometry_type')) throw new Error('geo.lod: invalid overview LoD name');
       if (parsed.overviews.encoding === 'quantized_geoarrow'
         && !['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon'].includes(metadata?.geometry_type ?? '')) {
         throw new Error(`geo.lod: invalid geometry_type for overview ${lod}`);
+      }
+      if (!Array.isArray(metadata?.level_indices) || metadata.level_indices.length === 0) {
+        throw new Error(`geo.lod: overview ${lod} level_indices must be a non-empty array`);
+      }
+      for (const index of metadata.level_indices) {
+        if (!Number.isSafeInteger(index) || index < 0 || index >= parsed.levels.length) {
+          throw new Error(`geo.lod: overview ${lod} level_indices index out of range`);
+        }
+        if (assigned.has(index)) throw new Error(`geo.lod: level ${index} is assigned more than once`);
+        assigned.add(index);
       }
       if (!validPair(metadata?.scale, true)) {
         throw new Error(`geo.lod: overviews.lods.${lod}.scale must contain two positive numbers`);
@@ -86,25 +97,17 @@ export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
         throw new Error(`geo.lod: overviews.lods.${lod}.offset must contain two finite numbers`);
       }
     }
+    if (assigned.size !== parsed.levels.length) {
+      throw new Error('geo.lod: every level must be assigned to an overview');
+    }
   }
-  const referenced = new Set<string>();
   let previousRowGroupEnd = -1;
   let previousResolution = Number.POSITIVE_INFINITY;
   for (const [index, level] of parsed.levels.entries()) {
     if (!level || typeof level !== 'object') throw new Error(`geo.lod: levels[${index}] must be an object`);
-    if (parsed.overviews !== undefined
-      && (typeof level.lod !== 'string' || !Object.prototype.hasOwnProperty.call(parsed.overviews.lods, level.lod))) {
-      throw new Error(`geo.lod: levels[${index}].lod does not name an overview LoD`);
-    }
-    if (parsed.overviews === undefined && level.lod !== undefined) {
-      throw new Error(`geo.lod: levels[${index}].lod requires overviews`);
-    }
     if (!Number.isSafeInteger(level.row_group_end) || level.row_group_end < 0
       || level.row_group_end < previousRowGroupEnd) {
       throw new Error(`geo.lod: levels[${index}].row_group_end must be non-decreasing`);
-    }
-    if (level.lod !== undefined) {
-      referenced.add(level.lod);
     }
     if (!(Number.isFinite(level.resolution) && level.resolution > 0)) {
       throw new Error(`geo.lod: levels[${index}].resolution must be positive`);
@@ -115,15 +118,16 @@ export function parseCogpMeta(json: string, numRowGroups?: number): CogpMeta {
     previousRowGroupEnd = level.row_group_end;
     previousResolution = level.resolution;
   }
-  if (parsed.overviews) {
-    for (const lod of Object.keys(parsed.overviews.lods)) {
-      if (!referenced.has(lod)) throw new Error(`geo.lod: overview LoD \`${lod}\` is not referenced by a level`);
-    }
-  }
   if (numRowGroups !== undefined && (!Number.isSafeInteger(numRowGroups) || numRowGroups <= 0 || previousRowGroupEnd !== numRowGroups - 1)) {
     throw new Error('geo.lod: final boundary must cover all row groups; empty files must omit the extension');
   }
   return parsed;
+}
+
+/** Metadata must be validated before resolving a level's rendering geometry. */
+export function lodForLevel(metadata: CogpMeta, index: number): string | undefined {
+  return Object.entries(metadata.overviews?.lods ?? {})
+    .find(([, lod]) => lod.level_indices.includes(index))?.[0];
 }
 
 function validPair(value: unknown, positive: boolean): value is [number, number] {

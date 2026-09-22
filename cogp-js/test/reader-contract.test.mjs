@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { lodForLevel } from '../dist/meta.js';
 import { COGP_ROW_INDEX, CogpReader } from '../dist/index.js';
 
 async function openFixture(name) {
@@ -67,7 +68,7 @@ test('same-prefix LoD switches update geometry and can switch back', async () =>
 test('shared LoD remains readable beyond its first referenced prefix', async () => {
   const { reader } = await openFixture('shared');
   const columns = ['id', 'geometry'];
-  assert.deepEqual(reader.levels.map(level => [level.row_group_end, level.lod]),
+  assert.deepEqual(reader.levels.map((level, index) => [level.row_group_end, lodForLevel(reader.geo.lod, index)]),
     [[0, 'l0'], [0, 'l1'], [1, 'l1'], [1, 'l2']]);
   const first = await reader.readRows({ maxLevel: 1, columns });
   const extended = await reader.readRows({ maxLevel: 2, columns });

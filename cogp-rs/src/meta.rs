@@ -18,12 +18,11 @@ impl CogpMeta {
     /// Validate the layout and optional rendering contract before interpreting row ranges.
     /// Physical schema and per-row values are checked separately by the validator.
     pub fn validate(&self, num_row_groups: usize) -> anyhow::Result<()> {
-        use anyhow::{bail, ensure};
+        use anyhow::ensure;
         ensure!(!self.levels.is_empty(), "geo.lod.levels must be non-empty");
         ensure!(num_row_groups > 0, "file has zero row groups");
         let mut previous_end = -1;
         let mut previous_resolution = f64::INFINITY;
-        let mut referenced = BTreeMap::new();
         for (index, level) in self.levels.iter().enumerate() {
             ensure!(
                 level.row_group_end >= 0 && (level.row_group_end as u64) < num_row_groups as u64,
@@ -39,19 +38,6 @@ impl CogpMeta {
                     && level.resolution < previous_resolution,
                 "levels[{index}].resolution must be positive, finite and strictly decreasing"
             );
-            match (&self.overviews, &level.lod) {
-                (Some(overviews), Some(lod)) => {
-                    ensure!(
-                        !lod.is_empty()
-                            && (overviews.encoding != OVERVIEWS_ENCODING || lod != "geometry_type")
-                            && overviews.lods.contains_key(lod),
-                        "levels[{index}].lod does not name an overview LoD"
-                    );
-                    referenced.insert(lod.as_str(), level.row_group_end);
-                }
-                (None, None) => {}
-                _ => bail!("levels[{index}].lod is required exactly when overviews are declared"),
-            }
             previous_end = level.row_group_end;
             previous_resolution = level.resolution;
         }
@@ -75,6 +61,7 @@ impl CogpMeta {
                 !overviews.column.is_empty(),
                 "overview column must be non-empty"
             );
+            let mut assigned = vec![false; self.levels.len()];
             for (lod, transform) in &overviews.lods {
                 if overviews.encoding == GEOARROW_ENCODING {
                     ensure!(
@@ -88,9 +75,17 @@ impl CogpMeta {
                     "invalid overview LoD name `{lod}`"
                 );
                 ensure!(
-                    referenced.contains_key(lod.as_str()),
-                    "overview LoD `{lod}` is not referenced by a level"
+                    !transform.level_indices.is_empty(),
+                    "overview `{lod}` level_indices must be non-empty"
                 );
+                for &index in &transform.level_indices {
+                    ensure!(
+                        index < assigned.len(),
+                        "overview `{lod}` level_indices index {index} out of range"
+                    );
+                    ensure!(!assigned[index], "level {index} is assigned more than once");
+                    assigned[index] = true;
+                }
                 ensure!(
                     transform.scale.iter().all(|v| v.is_finite() && *v > 0.0),
                     "overview `{lod}` scale must be positive and finite"
@@ -100,15 +95,33 @@ impl CogpMeta {
                     "overview `{lod}` offset must be finite"
                 );
             }
+            ensure!(
+                assigned.iter().all(|value| *value),
+                "every level must be assigned to an overview"
+            );
         }
         Ok(())
     }
 
+    /// Resolve rendering independently of the feature-selection level structure.
+    pub fn lod_for_level(&self, index: usize) -> Option<&str> {
+        self.overviews
+            .as_ref()?
+            .lods
+            .iter()
+            .find(|(_, metadata)| metadata.level_indices.contains(&index))
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The shared LoD is present through the largest prefix that selects it.
     pub fn lod_row_group_end(&self, lod: &str) -> Option<i64> {
-        self.levels
+        self.overviews
+            .as_ref()?
+            .lods
+            .get(lod)?
+            .level_indices
             .iter()
-            .filter(|level| level.lod.as_deref() == Some(lod))
+            .filter_map(|&index| self.levels.get(index))
             .map(|level| level.row_group_end)
             .max()
     }
@@ -118,8 +131,6 @@ impl CogpMeta {
 pub struct Level {
     pub row_group_end: i64,
     pub resolution: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lod: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +142,7 @@ pub struct OverviewsMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LodMeta {
+    pub level_indices: Vec<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry_type: Option<String>,
     pub scale: [f64; 2],
@@ -228,20 +240,95 @@ mod tests {
     }
 
     #[test]
-    fn overviews_are_optional_but_lod_is_conditional() {
+    fn levels_are_independent_of_optional_overviews() {
         let metadata = CogpMeta {
             levels: vec![Level {
                 row_group_end: 0,
                 resolution: 1000.0,
-                lod: None,
             }],
             overviews: None,
         };
         metadata.validate(1).unwrap();
 
-        let mut stray_lod = metadata;
-        stray_lod.levels[0].lod = Some("l0".into());
-        assert!(stray_lod.validate(1).is_err());
+        let serialized = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            serialized,
+            json!({"levels": [{"row_group_end": 0, "resolution": 1000.0}]})
+        );
+    }
+
+    #[test]
+    fn overview_assignments_are_complete_unique_and_in_range() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/metadata-overviews.json"))
+                .unwrap();
+        for indices in [json!([]), json!([4]), json!([0, 0]), json!([1])] {
+            let mut value = fixture.clone();
+            value["overviews"]["lods"]["l0"]["level_indices"] = indices;
+            let metadata: CogpMeta = serde_json::from_value(value).unwrap();
+            assert!(metadata.validate(4).is_err());
+        }
+        for indices in [
+            json!(null),
+            json!(-1),
+            json!([-1]),
+            json!([0.5]),
+            json!("0"),
+        ] {
+            let mut value = fixture.clone();
+            value["overviews"]["lods"]["l0"]["level_indices"] = indices;
+            assert!(serde_json::from_value::<CogpMeta>(value).is_err());
+        }
+        let mut missing = fixture.clone();
+        missing["overviews"]["lods"]
+            .as_object_mut()
+            .unwrap()
+            .remove("l0");
+        assert!(serde_json::from_value::<CogpMeta>(missing)
+            .unwrap()
+            .validate(4)
+            .is_err());
+        let mut old = fixture;
+        old["overviews"]["lods"]["l0"]
+            .as_object_mut()
+            .unwrap()
+            .remove("level_indices");
+        assert!(serde_json::from_value::<CogpMeta>(old).is_err());
+    }
+
+    #[test]
+    fn shared_overviews_use_explicit_indices_and_maximum_coverage() {
+        let mut metadata: CogpMeta =
+            serde_json::from_str(include_str!("../tests/fixtures/metadata-overviews.json"))
+                .unwrap();
+        metadata
+            .overviews
+            .as_mut()
+            .unwrap()
+            .lods
+            .get_mut("l1")
+            .unwrap()
+            .level_indices = vec![2, 1];
+        metadata.validate(4).unwrap();
+        assert_eq!(metadata.lod_for_level(1), Some("l1"));
+        assert_eq!(metadata.lod_for_level(2), Some("l1"));
+        assert_eq!(metadata.lod_row_group_end("l1"), Some(3));
+        assert_eq!(metadata.lod_for_level(4), None);
+        assert_eq!(metadata.lod_row_group_end("missing"), None);
+        // Shared levels need not be adjacent, nor their indices sorted.
+        let lods = &mut metadata.overviews.as_mut().unwrap().lods;
+        lods.get_mut("l0").unwrap().level_indices = vec![2, 0];
+        lods.get_mut("l1").unwrap().level_indices = vec![1];
+        metadata.validate(4).unwrap();
+        assert_eq!(metadata.lod_row_group_end("l0"), Some(3));
+        let with_overviews = serde_json::to_value(&metadata).unwrap();
+        metadata.overviews = None;
+        metadata.validate(4).unwrap();
+        assert_eq!(
+            with_overviews["levels"],
+            serde_json::to_value(&metadata).unwrap()["levels"]
+        );
+        assert_eq!(metadata.lod_for_level(0), None);
     }
 
     #[test]
