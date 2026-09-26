@@ -1,9 +1,12 @@
 [package]
 name = "cogp"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "Reference CLI for the Cloud Optimized GeoParquet Profile (COGP)"
+description = "Reference CLI and reader library for the Cloud Optimized GeoParquet Profile (COGP)"
 license = "MIT"
+repository = "https://github.com/Kanahiro/cloud-optimized-geoparquet"
+homepage = "https://github.com/Kanahiro/cloud-optimized-geoparquet"
+documentation = "https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/cogp-rs/README.md"
 
 [[bin]]
 name = "cogp"
@@ -22,6 +25,9 @@ arrow-buffer = "56"
 arrow-schema = "56"
 parquet = { version = "56", default-features = false, features = ["arrow", "snap", "zstd", "brotli", "lz4"] }
 byteorder = "1"
+geo = "0.33"
+rstar = "0.12"
+i_overlay = "4.5.2"
 rayon = "1"
 thrift = { version = "0.17", default-features = false }
 
@@ -33,3 +39,7 @@ async = ["parquet/async", "dep:futures"]
 # Re-exports `parquet::arrow::async_reader::ParquetObjectReader` for using
 # `object_store` (S3, GCS, HTTP, …) as the remote source.
 object_store = ["async", "parquet/object_store"]
+
+[[bench]]
+name = "geometry_validation"
+harness = false

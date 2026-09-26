@@ -1,0 +1,69 @@
+{
+  "levels": [
+    {
+      "row_group_end": 0,
+      "resolution": 1000
+    },
+    {
+      "row_group_end": 0,
+      "resolution": 500
+    },
+    {
+      "row_group_end": 3,
+      "resolution": 250
+    },
+    {
+      "row_group_end": 3,
+      "resolution": 100
+    }
+  ],
+  "overviews": {
+    "encoding": "quantized_geoarrow",
+    "column": "overviews",
+    "lods": {
+      "l0": {
+        "scale": [
+          256,
+          256
+        ],
+        "offset": [
+          0,
+          0
+        ],
+        "level_indices": [
+          0
+        ],
+        "geometry_type": "MultiLineString"
+      },
+      "l1": {
+        "scale": [
+          64,
+          64
+        ],
+        "offset": [
+          0,
+          0
+        ],
+        "level_indices": [
+          1,
+          2
+        ],
+        "geometry_type": "MultiLineString"
+      },
+      "l2": {
+        "scale": [
+          32,
+          32
+        ],
+        "offset": [
+          0,
+          0
+        ],
+        "level_indices": [
+          3
+        ],
+        "geometry_type": "MultiLineString"
+      }
+    }
+  }
+}

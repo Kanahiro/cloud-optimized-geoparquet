@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use cogp::meta::{
-    BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, Level, GEOPARQUET_VERSION,
+    BboxCovering, Covering, GeoColumn, GeoMeta, Level, LodMeta, GEOPARQUET_VERSION,
     GEO_METADATA_KEY,
 };
 use parquet::arrow::ArrowWriter;
@@ -117,10 +117,10 @@ fn write_file(path: &std::path::Path, row_groups: usize, kv: Vec<KeyValue>) {
     writer.close().unwrap();
 }
 
-fn kv(geo: Option<GeoMeta>, cogp: Option<CogpMeta>) -> Vec<KeyValue> {
+fn kv(geo: Option<GeoMeta>, lod: Option<LodMeta>) -> Vec<KeyValue> {
     let mut out = Vec::new();
     if let Some(mut g) = geo {
-        g.lod = cogp;
+        g.lod = lod;
         out.push(KeyValue {
             key: GEO_METADATA_KEY.into(),
             value: Some(serde_json::to_string(&g).unwrap()),
@@ -130,22 +130,26 @@ fn kv(geo: Option<GeoMeta>, cogp: Option<CogpMeta>) -> Vec<KeyValue> {
     out
 }
 
-fn assert_validate_fails(path: &std::path::Path, _msg_substring: &str) {
-    // The detail goes to stdout via `print_report`; the returned error is the
-    // generic "validation failed" sentinel. We assert on it to confirm the
-    // call returned an `Err` rather than silently passing.
-    let Err(err) = cogp::validate::run(path) else {
-        panic!("expected validate to fail for {}", path.display());
-    };
-    let s = format!("{err:#}");
-    assert!(s.contains("validation failed"), "unexpected error: {s}");
+fn assert_validate_fails(path: &std::path::Path, msg_substring: &str) {
+    let report = cogp::validate::check(path).unwrap();
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains(msg_substring)),
+        "expected an error containing `{msg_substring}` for {}: {:?}",
+        path.display(),
+        report.errors
+    );
+    assert!(cogp::validate::run(path).is_err());
 }
 
 #[test]
 fn validate_happy_path_accepts_well_formed_file() {
     let tmp = TempDir::new("happy");
     let p = tmp.path().join("ok.parquet");
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![
             Level {
                 row_group_end: 0,
@@ -157,7 +161,7 @@ fn validate_happy_path_accepts_well_formed_file() {
             },
         ],
     };
-    write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
+    write_file(&p, 3, kv(Some(standard_geo()), Some(lod)));
     cogp::validate::run(&p).unwrap();
 }
 
@@ -165,29 +169,54 @@ fn validate_happy_path_accepts_well_formed_file() {
 fn validate_rejects_missing_geo() {
     let tmp = TempDir::new("missing-geo");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![Level {
             row_group_end: 0,
             resolution: 1.0,
         }],
     };
-    write_file(&p, 1, kv(None, Some(cogp)));
+    write_file(&p, 1, kv(None, Some(lod)));
     assert_validate_fails(&p, "geo");
 }
 
 #[test]
-fn validate_rejects_missing_cogp() {
-    let tmp = TempDir::new("missing-cogp");
+fn validate_requires_geo_lod() {
+    let tmp = TempDir::new("missing-lod");
     let p = tmp.path().join("bad.parquet");
     write_file(&p, 1, kv(Some(standard_geo()), None));
-    assert_validate_fails(&p, "cogp");
+    assert_validate_fails(&p, "geo.lod");
+}
+
+#[test]
+fn validate_requires_geoparquet_fields_that_readers_tolerate() {
+    let tmp = TempDir::new("geoparquet-fields");
+    let p = tmp.path().join("bad.parquet");
+    let mut geo = serde_json::to_value(standard_geo()).unwrap();
+    geo["lod"] = serde_json::json!({"levels": [{"row_group_end": 0, "resolution": 1.0}]});
+    geo.as_object_mut().unwrap().remove("version");
+    geo["columns"]["geometry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("geometry_types");
+    write_file(
+        &p,
+        1,
+        vec![KeyValue {
+            key: GEO_METADATA_KEY.into(),
+            value: Some(geo.to_string()),
+        }],
+    );
+    assert_validate_fails(&p, "geo.version");
+    assert_validate_fails(&p, "geometry_types");
 }
 
 #[test]
 fn validate_rejects_non_decreasing_resolution() {
     let tmp = TempDir::new("flat-resolution");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![
             Level {
                 row_group_end: 0,
@@ -200,7 +229,7 @@ fn validate_rejects_non_decreasing_resolution() {
             },
         ],
     };
-    write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
+    write_file(&p, 2, kv(Some(standard_geo()), Some(lod)));
     assert_validate_fails(&p, "resolution");
 }
 
@@ -208,7 +237,8 @@ fn validate_rejects_non_decreasing_resolution() {
 fn validate_rejects_non_increasing_row_group_end() {
     let tmp = TempDir::new("flat-rge");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![
             Level {
                 row_group_end: 1,
@@ -220,7 +250,7 @@ fn validate_rejects_non_increasing_row_group_end() {
             }, // decreasing
         ],
     };
-    write_file(&p, 2, kv(Some(standard_geo()), Some(cogp)));
+    write_file(&p, 2, kv(Some(standard_geo()), Some(lod)));
     assert_validate_fails(&p, "row_group_end");
 }
 
@@ -229,7 +259,8 @@ fn validate_rejects_final_row_group_end_mismatch() {
     let tmp = TempDir::new("trailing-rg");
     let p = tmp.path().join("bad.parquet");
     // File has 3 row groups, but levels stop at index 1 → 2 ≠ 3-1.
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![
             Level {
                 row_group_end: 0,
@@ -241,7 +272,7 @@ fn validate_rejects_final_row_group_end_mismatch() {
             },
         ],
     };
-    write_file(&p, 3, kv(Some(standard_geo()), Some(cogp)));
+    write_file(&p, 3, kv(Some(standard_geo()), Some(lod)));
     assert_validate_fails(&p, "num_row_groups");
 }
 
@@ -249,13 +280,14 @@ fn validate_rejects_final_row_group_end_mismatch() {
 fn validate_rejects_negative_resolution() {
     let tmp = TempDir::new("neg-resolution");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![Level {
             row_group_end: 0,
             resolution: -1.0,
         }],
     };
-    write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
+    write_file(&p, 1, kv(Some(standard_geo()), Some(lod)));
     assert_validate_fails(&p, "positive");
 }
 
@@ -273,13 +305,14 @@ fn validate_rejects_missing_covering_column_in_schema() {
             ymax: vec!["nope".into(), "ymax".into()],
         },
     });
-    let cogp = CogpMeta {
+    let lod = LodMeta {
+        overviews: None,
         levels: vec![Level {
             row_group_end: 0,
             resolution: 1.0,
         }],
     };
-    write_file(&p, 1, kv(Some(geo), Some(cogp)));
+    write_file(&p, 1, kv(Some(geo), Some(lod)));
     assert_validate_fails(&p, "covering");
 }
 
@@ -287,8 +320,11 @@ fn validate_rejects_missing_covering_column_in_schema() {
 fn validate_rejects_empty_levels() {
     let tmp = TempDir::new("empty-levels");
     let p = tmp.path().join("bad.parquet");
-    let cogp = CogpMeta { levels: vec![] };
-    write_file(&p, 1, kv(Some(standard_geo()), Some(cogp)));
+    let lod = LodMeta {
+        levels: vec![],
+        overviews: None,
+    };
+    write_file(&p, 1, kv(Some(standard_geo()), Some(lod)));
     assert_validate_fails(&p, "non-empty");
 }
 
@@ -298,7 +334,8 @@ fn repeated_boundaries_and_optional_covering_are_valid() {
     let path = tmp.path().join("valid.parquet");
     let mut geo = standard_geo();
     geo.columns.get_mut("geometry").unwrap().covering = None;
-    let layout = CogpMeta {
+    let layout = LodMeta {
+        overviews: None,
         levels: vec![
             Level {
                 row_group_end: 0,
@@ -355,7 +392,13 @@ fn reader_rejects_invalid_prefix_before_selection() {
         write_file(
             &path,
             2,
-            kv(Some(standard_geo()), Some(CogpMeta { levels })),
+            kv(
+                Some(standard_geo()),
+                Some(LodMeta {
+                    levels,
+                    overviews: None,
+                }),
+            ),
         );
         assert!(cogp::reader::Reader::open(&path).is_err());
     }

@@ -5,4 +5,8 @@ mod page_index;
 mod range_coalescing;
 pub mod reader;
 pub mod validate;
-mod wkb_bbox;
+pub mod wkb_bbox;
+mod wkb_simplify;
+
+mod geometry_validation;
+mod overview_validation;
