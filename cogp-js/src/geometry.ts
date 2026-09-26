@@ -122,12 +122,20 @@ export function geometryColumnFromWkb(values: ArrayLike<Uint8Array | null | unde
 }
 
 /** Columns to convert; pass `read()` results as `{ geometry, ids: rowIndex, properties: columns }`. */
+/** Rows to convert; a `CogpBatch` can be passed as is. */
 export interface FeatureSource {
-  geometry: GeometryColumn;
+  /** Required at runtime; optional only so a `CogpBatch` type-checks. */
+  geometry?: GeometryColumn;
   /** Feature IDs by row. Omitted IDs are not written. */
-  ids?: ArrayLike<number>;
+  rowIndex?: ArrayLike<number>;
   /** Attribute columns by name, one value per row. */
-  properties?: Readonly<Record<string, ArrayLike<unknown>>>;
+  columns?: Readonly<Record<string, ArrayLike<unknown>>>;
+}
+
+/** The source geometry, or an error naming the likely cause. */
+export function requireGeometry(source: FeatureSource): GeometryColumn {
+  if (!source.geometry) throw new Error('source has no geometry; include the geometry column when reading');
+  return source.geometry;
 }
 
 /**
@@ -135,8 +143,9 @@ export interface FeatureSource {
  * features with `geometry: null`; property values are passed through as decoded.
  */
 export function toGeoJSON(source: FeatureSource): { type: 'FeatureCollection'; features: unknown[] } {
-  const { geometry, ids, properties } = source;
-  const columns = properties ? Object.entries(properties) : [];
+  const geometry = requireGeometry(source);
+  const ids = source.rowIndex;
+  const columns = source.columns ? Object.entries(source.columns) : [];
   const features = new Array<unknown>(geometry.length);
   for (let i = 0; i < geometry.length; i++) {
     const values: Record<string, unknown> = {};

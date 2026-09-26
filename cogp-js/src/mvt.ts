@@ -1,5 +1,5 @@
 import { throwIfAborted } from './abort.js';
-import type { FeatureSource, GeometryColumn } from './geometry.js';
+import { requireGeometry, type FeatureSource, type GeometryColumn } from './geometry.js';
 import { formatPropertyValue } from './properties.js';
 import {
   clipLineString,
@@ -41,7 +41,8 @@ export interface MvtTileOptions {
  * Columns are read in place: no GeoJSON or per-row feature object is built.
  */
 export function toMvt(source: FeatureSource, options: MvtTileOptions): ArrayBuffer {
-  const { geometry, ids, properties } = source;
+  const geometry = requireGeometry(source);
+  const ids = source.rowIndex;
   const projection = new TileProjection(options.z, options.x, options.y);
   const encoded: EncodedMvtFeature[] = [];
   for (let row = 0; row < geometry.length; row++) {
@@ -50,7 +51,7 @@ export function toMvt(source: FeatureSource, options: MvtTileOptions): ArrayBuff
     if (feature) { feature.row = row; encoded.push(feature); }
   }
   throwIfAborted(options.signal);
-  const columns = properties ? Object.entries(properties) : [];
+  const columns = source.columns ? Object.entries(source.columns) : [];
   return writeTile(encoded, options.layer ?? DEFAULT_LAYER_NAME, (feature, tag) => {
     for (const [key, values] of columns) tag(key, values[feature.row!]);
   });

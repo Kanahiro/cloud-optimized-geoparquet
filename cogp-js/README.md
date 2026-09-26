@@ -17,9 +17,8 @@ const batch = await reader.read({
 });
 console.log(reader.geo); // includes lod.levels and optional rendering metadata
 batch.length; batch.rowIndex; batch.columns.name; // aligned per-row arrays
-const features = { geometry: batch.geometry!, ids: batch.rowIndex, properties: batch.columns };
-const geojson = toGeoJSON(features); // FeatureCollection of every row
-const tile = toMvt(features, { z: 10, x: 909, y: 403 });
+const geojson = toGeoJSON(batch); // FeatureCollection of every row
+const tile = toMvt(batch, { z: 10, x: 909, y: 403 });
 const detail = await reader.readRow(batch.rowIndex[0]!, { columns: ['id'] }); // a one-row batch
 ```
 
@@ -35,9 +34,11 @@ quantized `Int32Array`s; otherwise primary WKB is parsed into `Float64Array`s wi
 scale `[1, 1]` and offset `[0, 0]` (Z is kept as `z`, M is dropped,
 GeometryCollection is rejected). `geometryColumnFromWkb` exposes the same parsing
 for other WKB, and other WKB columns are returned as bytes. Convert explicitly
-with `toGeoJSON({ geometry, ids, properties })`, which returns a FeatureCollection
-of every row (null geometries stay as `geometry: null`, property values as decoded),
-or encode a tile with `toMvt` from the same source and `{ z, x, y, layer, signal }`. `toMvt` reads
+with `toGeoJSON(batch)`, which returns a FeatureCollection of every row with
+`rowIndex` as feature IDs (null geometries stay as `geometry: null`, property
+values as decoded), or encode a tile with `toMvt(batch, { z, x, y, layer, signal })`.
+Both accept any `{ geometry, rowIndex?, columns? }`, so other IDs or a
+`geometryColumnFromWkb` result can be passed as well. `toMvt` reads
 the columns in place, assumes longitude/latitude input, projects to Web Mercator,
 clips to a 64-unit buffer around a 4096 extent (`MVT_BUFFER`, `MVT_EXTENT`),
 skips null or off-tile rows and writes properties as display strings.

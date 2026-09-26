@@ -181,3 +181,16 @@ test('plain attribute encoding preserves scalars, binary and nested values', asy
   const first = await readRecord(reader, 0, { columns });
   assert.deepEqual(first, rows[0]);
 });
+
+test('toGeoJSON and toMvt accept a CogpBatch as is', async () => {
+  const { toGeoJSON, toMvt } = await import('../dist/index.js');
+  const { reader } = await openFixture('shared');
+  const batch = await reader.read({ columns: ['id', 'geometry'] });
+  const geojson = toGeoJSON(batch);
+  assert.deepEqual(geojson.features.map(f => f.id), Array.from(batch.rowIndex));
+  assert.deepEqual(geojson.features.map(f => f.properties.id), Array.from(batch.columns.id));
+  assert.ok(toMvt(batch, { z: 0, x: 0, y: 0 }).byteLength > 0);
+  const noGeometry = await reader.read({ columns: ['id'] });
+  assert.throws(() => toGeoJSON(noGeometry), /no geometry/);
+  assert.throws(() => toMvt(noGeometry, { z: 0, x: 0, y: 0 }), /no geometry/);
+});
