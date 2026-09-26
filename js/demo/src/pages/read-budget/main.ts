@@ -12,6 +12,7 @@ import {
   readBudget,
   type OpenResult,
 } from '../../shared/dataset-service';
+import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { attributeTooltip, createDeckMap, type Tooltip } from '../../shared/deck-map';
 import { datasetName, escapeHtml, formatBytes, formatDistance } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
@@ -342,6 +343,7 @@ async function loadDataset(url: string): Promise<void> {
       colors: levelColors(geo.lod.levels.length),
       revision: ++datasetRevision,
     };
+    writeDatasetQuery(url);
     setDataLayer(null);
     renderLevelOptions(geo.lod.levels);
     statsEl.hidden = false;
@@ -370,4 +372,7 @@ showBudget();
 // Keep a shared view from the URL; otherwise frame the area in central Tokyo.
 if (!location.hash) mapView.fitBounds(START_BOUNDS);
 setDataLayer(null);
+// A shared link may name any COGP file, not only a preset.
+const initialUrl = datasetFromQuery();
+if (initialUrl) selectPreset(presetSelect, initialUrl, true);
 void loadDataset(presetSelect.value);

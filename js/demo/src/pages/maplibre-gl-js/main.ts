@@ -8,6 +8,7 @@ import {
   type OpenResult,
 } from '../../shared/dataset-service';
 import { MVT_LAYER_NAME, type NetworkStats } from '../../shared/cogp-types';
+import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
 
@@ -321,7 +322,8 @@ flyBtn.addEventListener('click', () => {
   map.fitBounds(active.dataBbox, { padding: 40, maxZoom: 14 });
 });
 
-async function loadDataset(url: string): Promise<void> {
+/** `keepView` leaves the map where it is instead of fitting it to the data. */
+async function loadDataset(url: string, keepView = false): Promise<void> {
   if (!url) {
     setStatus('Enter a URL first.');
     return;
@@ -343,8 +345,9 @@ async function loadDataset(url: string): Promise<void> {
       dataBbox,
       summary: geo,
     };
+    writeDatasetQuery(url);
     renderMetadata(geo);
-    if (dataBbox) {
+    if (dataBbox && !keepView) {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     flyBtn.disabled = !dataBbox;
@@ -374,4 +377,12 @@ async function loadDataset(url: string): Promise<void> {
 
 function renderMetadata(summary: OpenResult['geo']): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
+}
+
+// Reopen the dataset of a shared link, keeping its view when it has one.
+const initialUrl = datasetFromQuery();
+if (initialUrl) {
+  urlInput.value = initialUrl;
+  selectPreset(presetSelect, initialUrl);
+  void loadDataset(initialUrl, Boolean(location.hash));
 }
