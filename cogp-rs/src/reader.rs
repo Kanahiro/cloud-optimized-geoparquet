@@ -1,6 +1,6 @@
 //! Reader for COGP (Cloud Optimized GeoParquet Profile) files.
 //!
-//! The Parquet footer (and the `geo.lod` metadata it carries) is
+//! The Parquet footer (and the `geo` key-value metadata it carries) is
 //! parsed exactly once when the reader is constructed and cached as an
 //! [`ArrowReaderMetadata`]. All later reads — sync or async, local or remote —
 //! reuse that cached metadata via `new_with_metadata`, so the footer is never
@@ -17,10 +17,10 @@
 //!   [`parquet::arrow::async_reader::AsyncFileReader`]. Enable the
 //!   `object_store` feature to use `ParquetObjectReader` with S3 / GCS / HTTP.
 //!
-//! Geometries stay in their on-disk WKB form in the returned
-//! [`arrow_array::RecordBatch`]es; downstream callers convert them via
-//! [`geozero`](https://crates.io/crates/geozero) — see the README.
-use anyhow::{anyhow, Context, Result};
+//! Returned [`arrow_array::RecordBatch`]es preserve the physical geometry
+//! columns: primary WKB and, when declared, integer overview arrays. Callers
+//! select the LoD and apply its scale/offset when decoding overview coordinates.
+use anyhow::{anyhow, bail, Context, Result};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
@@ -43,16 +43,16 @@ pub use parquet::arrow::async_reader::ParquetObjectReader;
 #[cfg(feature = "async")]
 pub use crate::range_coalescing::{RangeCoalescingOptions, RangeCoalescingReader};
 
-use crate::meta::{CogpMeta, GeoMeta, Level, GEO_METADATA_KEY};
+use crate::meta::{geometry_family, GeoMeta, GeometryFamily, Level, LodMeta, GEO_METADATA_KEY};
 
-/// Cached COGP file handle. Holds the parsed footer + COGP/GeoParquet metadata.
+/// Cached COGP file handle. Holds the parsed footer and its GeoParquet `geo.lod` metadata.
 /// Cheap to clone (the underlying `ArrowReaderMetadata` is `Arc`-backed) and
 /// `Send + Sync`, so it can live in shared server state.
 #[derive(Clone)]
 pub struct Reader {
     arrow_meta: ArrowReaderMetadata,
     geo_meta: GeoMeta,
-    cogp_meta: CogpMeta,
+    lod_meta: LodMeta,
 }
 
 impl Reader {
@@ -87,11 +87,64 @@ impl Reader {
     /// caller has its own footer cache (e.g. a CDN / Redis layer in front of
     /// S3) and wants to skip even the initial range request.
     pub fn from_arrow_metadata(arrow_meta: ArrowReaderMetadata) -> Result<Self> {
-        let (geo_meta, cogp_meta) = parse_cogp_kv(arrow_meta.metadata())?;
+        let (geo_meta, lod_meta) = parse_geo_kv(arrow_meta.metadata())?;
+        anyhow::ensure!(
+            arrow_meta.metadata().file_metadata().num_rows() > 0,
+            "empty files must omit geo.lod"
+        );
+        lod_meta.validate(arrow_meta.metadata().num_row_groups())?;
+        // A missing primary entry only disables bbox pruning and overviews.
+        let primary_types = geo_meta
+            .columns
+            .get(&geo_meta.primary_column)
+            .map(|column| column.geometry_types.as_slice())
+            .unwrap_or_default();
+        if let Some(overviews) = &lod_meta.overviews {
+            if overviews.column == geo_meta.primary_column {
+                bail!("overview column must differ from primary geometry");
+            }
+            if arrow_meta
+                .schema()
+                .field_with_name(overviews.column.as_str())
+                .is_err()
+            {
+                bail!(
+                    "file is missing declared overview column `{}`",
+                    overviews.column
+                );
+            }
+        }
+        if let Some(overviews) = lod_meta.overviews.as_ref().filter(|o| o.is_supported()) {
+            let family = geometry_family(primary_types);
+            if !matches!(family, Some(GeometryFamily::Line | GeometryFamily::Polygon)) {
+                bail!(
+                    "overviews require a Line or Polygon family; points must not declare overviews"
+                );
+            }
+            for lod in overviews.lods.values() {
+                if geometry_family(&[lod.quantization()?.geometry_type]) != family {
+                    bail!("overview geometry_type must match primary geometry family");
+                }
+            }
+            let mut errors = Vec::new();
+            crate::validate::validate_overviews_schema(
+                arrow_meta.schema().fields(),
+                overviews,
+                &mut errors,
+            );
+            crate::validate::validate_standard_lists(
+                arrow_meta.metadata().file_metadata().schema_descr(),
+                &overviews.column,
+                &mut errors,
+            );
+            if !errors.is_empty() {
+                bail!("{}", errors.join("; "));
+            }
+        }
         Ok(Self {
             arrow_meta,
             geo_meta,
-            cogp_meta,
+            lod_meta,
         })
     }
 
@@ -107,31 +160,53 @@ impl Reader {
         &self.geo_meta
     }
 
-    pub fn cogp_meta(&self) -> &CogpMeta {
-        &self.cogp_meta
+    pub fn lod_meta(&self) -> &LodMeta {
+        &self.lod_meta
+    }
+
+    /// Whether the file declares overviews in an encoding this crate can decode.
+    /// Undecodable overviews leave level selection usable; render primary WKB instead.
+    pub fn has_overviews(&self) -> bool {
+        self.lod_meta
+            .overviews
+            .as_ref()
+            .is_some_and(|overviews| overviews.is_supported())
     }
 
     pub fn levels(&self) -> &[Level] {
-        &self.cogp_meta.levels
+        &self.lod_meta.levels
     }
 
     pub fn primary_column(&self) -> &str {
         &self.geo_meta.primary_column
     }
 
+    /// Select the overview LoD declared by the level appropriate for the
+    /// target resolution in primary geometry CRS units. Returns `None` when the file has no overviews
+    /// and renders primary WKB instead.
+    pub fn lod_for_resolution(&self, target_resolution: f64) -> Option<&str> {
+        let level = self
+            .lod_meta
+            .levels
+            .iter()
+            .rposition(|level| level.resolution >= target_resolution)
+            .unwrap_or(0);
+        self.lod_meta.lod_for_level(level)
+    }
+
     pub fn num_row_groups(&self) -> usize {
         self.arrow_meta.metadata().num_row_groups()
     }
 
-    /// Row groups belonging to a single level (start..=end), or `None` if `level`
-    /// is out of range. Row groups within one level are STR-packed so reading in
-    /// natural order yields a spatially coherent stream.
+    /// Row groups newly added by a level (start..end), or `None` if `level`
+    /// is out of range. A geometry-only refinement adds an empty range. Row groups
+    /// within one level are STR-packed for a spatially coherent stream.
     pub fn row_groups_in_level(&self, level: usize) -> Option<Range<usize>> {
-        let l = self.cogp_meta.levels.get(level)?;
+        let l = self.lod_meta.levels.get(level)?;
         let start = if level == 0 {
             0
         } else {
-            (self.cogp_meta.levels[level - 1].row_group_end + 1) as usize
+            (self.lod_meta.levels[level - 1].row_group_end + 1) as usize
         };
         let end = (l.row_group_end + 1) as usize;
         Some(start..end)
@@ -142,26 +217,25 @@ impl Reader {
     /// Clamps to the available level range; returns an empty range if there
     /// are no levels.
     pub fn row_groups_up_to_level(&self, level: usize) -> Range<usize> {
-        if self.cogp_meta.levels.is_empty() {
+        if self.lod_meta.levels.is_empty() {
             return 0..0;
         }
-        let i = level.min(self.cogp_meta.levels.len() - 1);
-        0..(self.cogp_meta.levels[i].row_group_end + 1) as usize
+        let i = level.min(self.lod_meta.levels.len() - 1);
+        0..(self.lod_meta.levels[i].row_group_end + 1) as usize
     }
 
-    /// Row groups for every level whose Resolution is `>= min_resolution` (coarser than the
-    /// target resolution in primary geometry CRS units). Targets coarser than
-    /// all levels clamp to the first prefix.
-    pub fn row_groups_up_to_resolution(&self, min_resolution: f64) -> Range<usize> {
+    /// Row groups for every level whose resolution is `>= target` (coarser than the
+    /// caller's target resolution). Use this when you have a target rendering
+    /// resolution in primary geometry CRS units and want every level that's
+    /// still useful at that scale, plus all coarser overviews.
+    pub fn row_groups_up_to_resolution(&self, target_resolution: f64) -> Range<usize> {
         let last = self
-            .cogp_meta
+            .lod_meta
             .levels
             .iter()
-            .rposition(|l| l.resolution >= min_resolution);
-        match last {
-            Some(i) => 0..(self.cogp_meta.levels[i].row_group_end + 1) as usize,
-            None => self.row_groups_up_to_level(0),
-        }
+            .rposition(|level| level.resolution >= target_resolution)
+            .unwrap_or(0);
+        0..(self.lod_meta.levels[last].row_group_end + 1) as usize
     }
 
     /// Row groups whose covering-bbox envelope intersects `[xmin, ymin, xmax, ymax]`.
@@ -231,6 +305,18 @@ impl Reader {
         out
     }
 
+    /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
+    /// reusing the cached footer metadata (no second footer parse).
+    pub fn sync_batch_reader<R: ChunkReader + 'static>(
+        &self,
+        reader: R,
+        row_groups: &[usize],
+    ) -> Result<ParquetRecordBatchReader> {
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone());
+        Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
+    }
+
     /// Build a sync reader with Row Group and Page-level bbox pruning.
     ///
     /// PageIndexes are fetched lazily for the four covering bbox leaves of the
@@ -262,18 +348,6 @@ impl Reader {
             None => builder,
         };
         Ok(builder.build()?)
-    }
-
-    /// Build a sync [`ParquetRecordBatchReader`] against a fresh `ChunkReader`,
-    /// reusing the cached footer metadata (no second footer parse).
-    pub fn sync_batch_reader<R: ChunkReader + 'static>(
-        &self,
-        reader: R,
-        row_groups: &[usize],
-    ) -> Result<ParquetRecordBatchReader> {
-        let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.arrow_meta.clone());
-        Ok(builder.with_row_groups(row_groups.to_vec()).build()?)
     }
 
     /// Build an async [`ParquetRecordBatchStream`] against a fresh
@@ -353,12 +427,12 @@ impl Reader {
         row_groups
             .iter()
             .copied()
-            .filter(|row_group| candidates.binary_search(row_group).is_ok())
+            .filter(|rg| candidates.binary_search(rg).is_ok())
             .collect()
     }
 }
 
-fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)> {
+fn parse_geo_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, LodMeta)> {
     let kv = metadata
         .file_metadata()
         .key_value_metadata()
@@ -371,22 +445,17 @@ fn parse_cogp_kv(metadata: &Arc<ParquetMetaData>) -> Result<(GeoMeta, CogpMeta)>
         .ok_or_else(|| anyhow!("missing `geo` key-value metadata (not a GeoParquet file)"))?;
     let geo_meta: GeoMeta = serde_json::from_str(geo_str)
         .map_err(|e| anyhow!("`geo` metadata is not valid JSON: {e}"))?;
-    let cogp_meta = geo_meta
+    let lod_meta = geo_meta
         .lod
         .clone()
         .ok_or_else(|| anyhow!("missing geo.lod metadata"))?;
-    cogp_meta.validate(metadata.num_row_groups())?;
-    anyhow::ensure!(
-        metadata.file_metadata().num_rows() > 0,
-        "empty files must omit geo.lod"
-    );
-    Ok((geo_meta, cogp_meta))
+    Ok((geo_meta, lod_meta))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::{BboxCovering, CogpMeta, Covering, GeoColumn, GeoMeta, GEOPARQUET_VERSION};
+    use crate::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, LodMeta, GEOPARQUET_VERSION};
     use arrow::array::{ArrayRef, Float64Array, RecordBatch, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
@@ -464,8 +533,11 @@ mod tests {
                 primary_column: "geometry".into(),
                 columns: cols,
             };
-            let cogp = CogpMeta { levels };
-            for _ in 0..cogp.levels.last().map(|l| l.row_group_end + 1).unwrap_or(0) {
+            let lod = LodMeta {
+                levels,
+                overviews: None,
+            };
+            for _ in 0..lod.levels.last().map(|l| l.row_group_end + 1).unwrap_or(0) {
                 let batch = RecordBatch::try_new(
                     schema.clone(),
                     vec![Arc::new(arrow_array::Int32Array::from(vec![1]))],
@@ -474,7 +546,7 @@ mod tests {
                 w.write(&batch).unwrap();
                 w.flush().unwrap();
             }
-            geo.lod = Some(cogp);
+            geo.lod = Some(lod);
             w.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
@@ -483,6 +555,28 @@ mod tests {
             w.close().unwrap();
         }
         Reader::try_new(bytes::Bytes::from(buf)).unwrap()
+    }
+
+    #[test]
+    fn zero_rows_are_rejected_even_with_row_groups() {
+        let reader = reader_with_levels(vec![level(0, 1.0)]);
+        let metadata = reader.parquet_metadata();
+        let original = metadata.file_metadata();
+        let file = parquet::file::metadata::FileMetaData::new(
+            original.version(),
+            0,
+            original.created_by().map(str::to_string),
+            original.key_value_metadata().cloned(),
+            original.schema_descr_ptr(),
+            None,
+        );
+        let metadata = Arc::new(ParquetMetaData::new(file, metadata.row_groups().to_vec()));
+        let arrow = ArrowReaderMetadata::try_new(metadata, Default::default()).unwrap();
+        assert!(Reader::from_arrow_metadata(arrow)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("empty files"));
     }
 
     #[test]
@@ -505,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "empty files")]
+    #[should_panic(expected = "empty")]
     fn row_groups_up_to_level_empty_when_no_levels() {
         let r = reader_with_levels(vec![]);
         assert!(r.row_groups_up_to_level(0).is_empty());
@@ -585,10 +679,11 @@ mod tests {
                 primary_column: "geometry".into(),
                 columns,
             };
-            let cogp = CogpMeta {
+            let lod = LodMeta {
                 levels: vec![level(0, 1.0)],
+                overviews: None,
             };
-            geo.lod = Some(cogp);
+            geo.lod = Some(lod);
             writer.append_key_value_metadata(KeyValue {
                 key: GEO_METADATA_KEY.into(),
                 value: Some(serde_json::to_string(&geo).unwrap()),
@@ -667,11 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_cogp_kv_rejects_missing_geo() {
-        let cogp = CogpMeta { levels: vec![] };
+    fn parse_geo_kv_rejects_missing_geo() {
+        let lod = LodMeta {
+            levels: vec![],
+            overviews: None,
+        };
         let err = try_open_with_kv(vec![KeyValue {
-            key: "cogp".into(),
-            value: Some(serde_json::to_string(&cogp).unwrap()),
+            key: "lod".into(),
+            value: Some(serde_json::to_string(&lod).unwrap()),
         }])
         .err()
         .expect("expected reader construction to fail");
@@ -679,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_cogp_kv_rejects_missing_cogp() {
+    fn parse_geo_kv_rejects_missing_lod() {
         let mut cols = BTreeMap::new();
         cols.insert(
             "geometry".to_string(),
@@ -707,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_cogp_kv_rejects_malformed_geo_json() {
+    fn parse_geo_kv_rejects_malformed_geo_json() {
         let err = try_open_with_kv(vec![KeyValue {
             key: GEO_METADATA_KEY.into(),
             value: Some("{not valid json".into()),

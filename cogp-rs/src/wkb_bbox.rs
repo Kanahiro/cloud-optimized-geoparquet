@@ -22,31 +22,74 @@ pub enum GeomKind {
 
 impl GeomKind {
     fn merge(self, other: Self) -> Self {
-        if (self as u8) >= (other as u8) { self } else { other }
+        if (self as u8) >= (other as u8) {
+            self
+        } else {
+            other
+        }
     }
 }
 
 impl Bbox {
     pub fn empty() -> Self {
-        Self { xmin: f64::INFINITY, ymin: f64::INFINITY, xmax: f64::NEG_INFINITY, ymax: f64::NEG_INFINITY }
+        Self {
+            xmin: f64::INFINITY,
+            ymin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymax: f64::NEG_INFINITY,
+        }
     }
     pub fn add(&mut self, x: f64, y: f64) {
-        if x < self.xmin { self.xmin = x; }
-        if y < self.ymin { self.ymin = y; }
-        if x > self.xmax { self.xmax = x; }
-        if y > self.ymax { self.ymax = y; }
+        if x < self.xmin {
+            self.xmin = x;
+        }
+        if y < self.ymin {
+            self.ymin = y;
+        }
+        if x > self.xmax {
+            self.xmax = x;
+        }
+        if y > self.ymax {
+            self.ymax = y;
+        }
     }
     pub fn merge(&mut self, other: &Bbox) {
-        if other.xmin < self.xmin { self.xmin = other.xmin; }
-        if other.ymin < self.ymin { self.ymin = other.ymin; }
-        if other.xmax > self.xmax { self.xmax = other.xmax; }
-        if other.ymax > self.ymax { self.ymax = other.ymax; }
+        if other.xmin < self.xmin {
+            self.xmin = other.xmin;
+        }
+        if other.ymin < self.ymin {
+            self.ymin = other.ymin;
+        }
+        if other.xmax > self.xmax {
+            self.xmax = other.xmax;
+        }
+        if other.ymax > self.ymax {
+            self.ymax = other.ymax;
+        }
     }
-    pub fn width(&self) -> f64 { self.xmax - self.xmin }
-    pub fn height(&self) -> f64 { self.ymax - self.ymin }
-    pub fn cx(&self) -> f64 { (self.xmin + self.xmax) * 0.5 }
-    pub fn cy(&self) -> f64 { (self.ymin + self.ymax) * 0.5 }
-    pub fn is_empty(&self) -> bool { self.xmin > self.xmax || self.ymin > self.ymax }
+    pub fn width(&self) -> f64 {
+        self.xmax - self.xmin
+    }
+    pub fn height(&self) -> f64 {
+        self.ymax - self.ymin
+    }
+    pub fn cx(&self) -> f64 {
+        (self.xmin + self.xmax) * 0.5
+    }
+    pub fn cy(&self) -> f64 {
+        (self.ymin + self.ymax) * 0.5
+    }
+    pub fn is_empty(&self) -> bool {
+        self.xmin > self.xmax || self.ymin > self.ymax
+    }
+}
+
+/// Decode ISO dimensional type offsets independently of EWKB flag bits.
+pub(crate) fn wkb_dimensions(raw_type: u32) -> usize {
+    let iso = (raw_type & 0x1fff_ffff) / 1000;
+    let z = raw_type & 0x8000_0000 != 0 || matches!(iso, 1 | 3);
+    let m = raw_type & 0x4000_0000 != 0 || matches!(iso, 2 | 3);
+    2 + usize::from(z) + usize::from(m)
 }
 
 /// Compute a 2D bounding box and topological kind from a WKB byte slice.
@@ -55,7 +98,7 @@ pub fn bbox_from_wkb(bytes: &[u8]) -> Result<(Bbox, GeomKind)> {
     let mut cur = Cursor::new(bytes);
     let mut bbox = Bbox::empty();
     let mut kind = GeomKind::Point;
-    read_geom(&mut cur, &mut bbox, &mut kind)?;
+    read_geom(&mut cur, &mut bbox, &mut kind, 0)?;
     Ok((bbox, kind))
 }
 
@@ -82,27 +125,35 @@ pub fn kind_from_wkb(bytes: &[u8]) -> Result<GeomKind> {
     }
 }
 
-fn read_geom<R: Read>(cur: &mut R, bbox: &mut Bbox, kind: &mut GeomKind) -> Result<()> {
+fn read_geom<R: Read>(
+    cur: &mut R,
+    bbox: &mut Bbox,
+    kind: &mut GeomKind,
+    depth: usize,
+) -> Result<()> {
+    anyhow::ensure!(depth < 64, "WKB nesting exceeds 64 levels");
     let order = cur.read_u8()?;
     let raw_type = match order {
         0 => cur.read_u32::<BigEndian>()?,
         1 => cur.read_u32::<LittleEndian>()?,
         b => bail!("invalid WKB byte order: {b}"),
     };
-    let has_z = (raw_type & 0x80000000) != 0 || ((raw_type / 1000) % 10 == 1) || ((raw_type / 1000) % 10 == 3);
-    let has_m = (raw_type & 0x40000000) != 0 || ((raw_type / 1000) % 10 == 2) || ((raw_type / 1000) % 10 == 3);
     let has_srid = (raw_type & 0x20000000) != 0;
     let geom_type = (raw_type & 0xFFFF) % 1000;
 
     if has_srid {
         match order {
-            0 => { cur.read_u32::<BigEndian>()?; }
-            1 => { cur.read_u32::<LittleEndian>()?; }
+            0 => {
+                cur.read_u32::<BigEndian>()?;
+            }
+            1 => {
+                cur.read_u32::<LittleEndian>()?;
+            }
             _ => unreachable!(),
         }
     }
 
-    let extra_per_pt = (has_z as usize) + (has_m as usize);
+    let extra_per_pt = wkb_dimensions(raw_type) - 2;
 
     let local_kind = match geom_type {
         1 | 4 => Some(GeomKind::Point),
@@ -122,7 +173,7 @@ fn read_geom<R: Read>(cur: &mut R, bbox: &mut Bbox, kind: &mut GeomKind) -> Resu
         4..=7 => {
             let n = read_u32(cur, order)?;
             for _ in 0..n {
-                read_geom(cur, bbox, kind)?;
+                read_geom(cur, bbox, kind, depth + 1)?;
             }
         }
         t => bail!("unsupported WKB geometry type: {t}"),
@@ -141,13 +192,20 @@ fn read_u32<R: Read>(cur: &mut R, order: u8) -> Result<u32> {
 fn read_point<R: Read>(cur: &mut R, order: u8, extra: usize, bbox: &mut Bbox) -> Result<()> {
     let (x, y) = match order {
         0 => (cur.read_f64::<BigEndian>()?, cur.read_f64::<BigEndian>()?),
-        1 => (cur.read_f64::<LittleEndian>()?, cur.read_f64::<LittleEndian>()?),
+        1 => (
+            cur.read_f64::<LittleEndian>()?,
+            cur.read_f64::<LittleEndian>()?,
+        ),
         _ => unreachable!(),
     };
     for _ in 0..extra {
         match order {
-            0 => { cur.read_f64::<BigEndian>()?; }
-            1 => { cur.read_f64::<LittleEndian>()?; }
+            0 => {
+                cur.read_f64::<BigEndian>()?;
+            }
+            1 => {
+                cur.read_f64::<LittleEndian>()?;
+            }
             _ => unreachable!(),
         }
     }
@@ -249,7 +307,12 @@ mod tests {
 
     #[test]
     fn linestring_kind_and_bbox() {
-        let bytes = Wkb::new(2).u32(3).xy(0.0, 0.0).xy(5.0, 1.0).xy(2.0, 4.0).done();
+        let bytes = Wkb::new(2)
+            .u32(3)
+            .xy(0.0, 0.0)
+            .xy(5.0, 1.0)
+            .xy(2.0, 4.0)
+            .done();
         let (b, k) = bbox_from_wkb(&bytes).unwrap();
         bbox_close(b, 0.0, 0.0, 5.0, 4.0);
         assert_eq!(k, GeomKind::Line);

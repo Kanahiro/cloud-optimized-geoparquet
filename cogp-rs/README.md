@@ -1,11 +1,11 @@
 # cogp
 
-Rust reference CLI for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
+Rust reference CLI and reader library for the [Cloud Optimized GeoParquet Profile (COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet).
 
 `convert` reorders the features of a GeoParquet file across row groups using
 point-grid density thinning, extent-based line/polygon visibility, and
 Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
-structural rules in SPEC.md.
+structural rules and any declared rendering overviews in [SPEC.md](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/SPEC.md).
 
 ## Install
 
@@ -30,7 +30,32 @@ The output COGP file itself is projection-agnostic — it can be consumed by
 any renderer regardless of projection. The defaults simply pick Resolutions tuned
 for a Web Mercator z0..=z16 tile pyramid (17 levels), since that's the most
 common viewer target. Pass `--resolution` to optimize for a different renderer.
-Works on any GeoParquet 1.x file with a WKB geometry column.
+Supports GeoParquet 1.x with WKB point, line, or polygon geometries, including Multi variants.
+
+## Rendering overviews
+
+The writer produces the optional [quantized rendering geometries](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/SPEC.md#geometry-representation).
+The base layout remains `geo.lod`, without an independent version. Eligible
+line/polygon tables receive nested `quantized_geoarrow` int32 XY overviews; the primary geometry
+and source attributes remain unchanged. Null or empty geometries receive empty
+overview values that render nothing. Mixed-family tables use the base layout.
+Existing `overviews` attributes are preserved; generated overviews use
+a distinct column name recorded in the metadata.
+
+The validator reads all overview values to check decoded coordinate finiteness,
+part boundaries, ring closure, geometry family, and polygon topology. It does
+not read primary WKB for these checks. Overviews in an encoding other than
+`quantized_geoarrow` do not make a file invalid: the validator still checks the
+level metadata and the overview column reference, then reports that the overview
+representation was not validated. The `Reader` opens such files, and
+`has_overviews()` returns `false` so callers render primary WKB.
+
+`--simplification-tolerance-factor` defaults to 0.25 and multiplies each CRS-unit
+resolution. Lower values retain more detail and use a finer quantization grid,
+at the cost of larger overviews. Line and polygon features are deferred until both their visibility
+threshold and overview viability are met. Later levels can refine geometry
+without adding rows. ZSTD 9, delta encoding of overview integers, and omission
+of primary WKB statistics are internal writer choices.
 
 ## convert
 
@@ -41,7 +66,7 @@ cogp convert <INPUT> <OUTPUT> [OPTIONS]
 Examples:
 
 ```
-# Narrow the zoom range and bump the row group size for a small dataset.
+# Narrow the zoom range and use smaller row groups for a small dataset.
 cogp convert input.parquet output.cogp.parquet \
     --webmerc-minzoom 4 --webmerc-maxzoom 12 --row-group-size 20000
 
@@ -66,11 +91,12 @@ readable by any renderer regardless of which path you pick.
   projection — not just non-Web-Mercator).
 - `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `16`) — derive
   Resolutions from a Web Mercator tile pyramid:
-  `resolution(z) = 40_075_016 / (webmerc_resolution · 2^z)` equatorial meters,
+  `resolution(z) = 40_075_016.68557849 / (webmerc_resolution · 2^z)` equatorial meters,
   converted to the primary CRS units (degrees use 111,320 m/degree). This is the default
   because Web Mercator is the most common viewer target, not because the
-  output is restricted to it. Empty levels (no features assigned) are
-  dropped automatically.
+  output is restricted to it. Levels that add no features are dropped, except
+  when overviews are written: those levels are kept because they refine the
+  geometry of existing features.
 - `--webmerc-resolution` (default `1024`) — units per tile side used in the
   Web Mercator Resolution formula above. `1024` is ~4× the typical 256-pixel tile
   resolution, so features collapsing within a few subpixels are deferred to
@@ -80,19 +106,31 @@ Other options:
 
 - `--min-root-features` (default `2048`) — minimum cumulative feature count for
   the root (coarsest output level), across the whole dataset. After assigning
-  features, the writer folds sparse leading levels into the first level whose
-  cumulative count meets the minimum. The omitted resolutions are not emitted
+  features (including overview viability checks when overviews are generated),
+  the writer folds sparse leading levels into the first level whose cumulative
+  count meets the minimum. The omitted resolutions are not emitted
   in `geo.lod`; a coarser reader request therefore falls back to the new root.
   If the entire dataset has fewer rows, all rows use the finest requested
   resolution. Applies to all geometry families and both resolution options;
-  later levels have no minimum. Set to `1` for the previous behavior.
+  later levels have no minimum. Set to `1` to disable folding.
   This counts stored features, not pixels or visible features in a viewport;
   it does not guarantee spatial coverage. Geometry and attributes are preserved.
 
-- `--row-group-size` (default `65536`) — max Parquet row group size in rows.
-- `--page-row-count` (default `2048`) — maximum top-level rows per data page.
+- `--row-group-size` (default `262144`) — max Parquet row group size in rows.
+- `--simplification-tolerance-factor` (default `0.25`) — overview simplification
+  tolerance and quantization grid, in multiples of each level's resolution.
+- `--page-row-count` (default `1024`) — maximum top-level rows per data page.
   Page Indexes and spatial page packing are always enabled. Row Groups never
   mix levels; the bbox leaves get ColumnIndexes and every leaf gets an OffsetIndex.
+
+The writer always disables dictionary encoding for all columns, including nested
+attributes, so selective reads do not need column-chunk-wide dictionaries. ZSTD
+compression and the delta encoding of overview coordinates remain enabled.
+All attribute leaves, including nested attributes, use `PLAIN` encoding followed
+by ZSTD compression. Physical-type-specific transforms can worsen the final
+compressed size, so only generated overview coordinates use explicit delta
+encoding. Topology is represented by nested lists. Logical types and attribute
+values are preserved.
 
 The primary geometry column comes from `geo.primary_column`. Auto-derived
 resolutions use its CRS horizontal units; absent CRS means CRS84. Null or
@@ -142,7 +180,8 @@ The output file:
 - trusts and preserves an existing `covering.bbox`, regardless of column name;
 - if no covering exists, appends one with a collision-free name (`bbox`, `bbox_`, ...);
 - emits one or more row groups per level, written in coarse-to-fine order;
-- writes `geo.lod` metadata listing the `row_group_end` and `resolution` of each level.
+- writes `geo.lod` metadata listing the `row_group_end` and `resolution` of each level,
+  plus `geo.lod.overviews` when rendering overviews are generated.
 
 ## Library use — reading COGP files
 
@@ -159,7 +198,7 @@ to convert into GeoJSON / WKT / `geo-types` / FlatGeobuf / etc.
 
 ```toml
 [dependencies]
-cogp = "0.1"
+cogp = "2.0"
 geozero = { version = "0.14", features = ["with-wkb"] }
 arrow-array = "56"
 ```
@@ -213,8 +252,8 @@ actually needs over HTTP range requests:
 
 ```toml
 [dependencies]
-cogp = { version = "0.1", features = ["object_store"] }
-object_store = "0.11"
+cogp = { version = "2.0", features = ["object_store"] }
+object_store = "0.12"
 geozero = { version = "0.14", features = ["with-wkb"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -281,7 +320,7 @@ Construction (parses and caches the footer):
 - `Reader::from_arrow_metadata(meta)` — bring your own cached
   `ArrowReaderMetadata`.
 
-Remote range coalescing (`feature = "async"):
+Remote range coalescing (`feature = "async"`):
 
 - `RangeCoalescingReader::new(reader)` — wrap a cloneable `AsyncFileReader`
   using the defaults: a 32 KiB maximum gap, 128 KiB cumulative extra bytes,
@@ -293,11 +332,15 @@ Remote range coalescing (`feature = "async"):
 
 Selectors (`&self`, no IO — they only consult the cached footer):
 
-- `levels()`, `cogp_meta()`, `geo_meta()`, `primary_column()`,
-  `num_row_groups()`, `parquet_metadata()`.
+- `levels()`, `lod_meta()`, `geo_meta()`, `primary_column()`,
+  `num_row_groups()`, `parquet_metadata()`, `arrow_metadata()`.
+- `has_overviews()` — whether the file declares overviews in an encoding this
+  crate can decode (`quantized_geoarrow`).
+- `lod_for_resolution(target_resolution)` — the overview LoD name for the level
+  selected by a target resolution, or `None` without overviews.
 - `row_groups_in_level(i)` — one level.
 - `row_groups_up_to_level(i)` — every level up to and including `i`.
-- `row_groups_up_to_resolution(min_resolution)` — the finest prefix whose resolution is `>= min_resolution`,
+- `row_groups_up_to_resolution(target_resolution)` — the finest prefix whose resolution is `>= target_resolution`,
   clamped to the first level for coarser targets. Values use primary CRS units.
 - `row_groups_intersecting_bbox([xmin, ymin, xmax, ymax])` — row groups whose
   covering-bbox envelope intersects the query, via Parquet column statistics.
@@ -322,15 +365,23 @@ per-feature bbox intersection checks.
 cogp validate <FILE>
 ```
 
-Checks the layout metadata constraints:
+Checks that the file is a COGP file: GeoParquet with `geo.lod` metadata. A file
+without `geo.lod` may be valid GeoParquet, but fails this check.
 
-- `geo` metadata and its primary column are present;
+- `geo` metadata has `version`, `primary_column`, and `columns`, each column
+  declaring `encoding` and `geometry_types`, and the primary column is present;
 - covering paths, when declared, refer to actual columns (missing statistics produce warnings);
 - `geo.lod` metadata is present with a non-empty `levels` array;
 - `row_group_end` values are non-decreasing and end at `num_row_groups - 1`;
-- `resolution` values are positive, finite, and strictly decreasing.
+- `resolution` values are positive, finite, and strictly decreasing;
+- when overviews are declared: the column exists and differs from the primary
+  geometry, and every level is assigned to exactly one LoD;
+- for `quantized_geoarrow` overviews: per-LoD metadata, the physical schema
+  (standard Parquet LISTs, no `geoarrow.*` extension names), non-null coverage
+  through each LoD's effective boundary, and every overview geometry.
 
-Exits non-zero on failure.
+Overviews in other encodings are reported as not validated without failing the
+file. Exits non-zero on failure.
 
 ## Benchmarks
 
@@ -349,7 +400,7 @@ Example comparing a `main` worktree binary with the current branch:
 
 ```
 cogp-rs/tools/bench_cogp.py \
-  --input /Users/kanahiro/Downloads/foss4ghkd/building.parquet \
+  --input building.parquet \
   --baseline-bin /tmp/cogp-rs-main-bench/target/release/cogp \
   --candidate-bin target/release/cogp \
   --baseline-label main \

@@ -1,28 +1,28 @@
-# [Proposal] Level of Detail (LoD) extension
+# Level of Detail (LoD) extension
 
-This document proposes an optional GeoParquet Level of Detail (LoD) extension for progressive feature access.
+This document proposes an optional GeoParquet Level of Detail (LoD) extension for progressive feature access and scale-dependent geometry rendering.
 
 ## Motivation
 
 Spatial ordering and bounding box statistics help readers find features within a viewport. They do not tell a reader how much of that viewport's data is useful at a given display scale. A world view may intersect almost every row group even though only a small subset of features can be distinguished on screen.
 
-This proposal adds a second selection dimension: rendering resolution. Features useful at coarse resolutions are stored in earlier row groups; later row groups add finer detail. Small metadata describes cumulative row group prefixes, allowing readers to fetch a coarse view first and progressively add features as needed.
+This extension adds a second selection dimension: rendering resolution. Features useful at coarse resolutions are stored in earlier row groups; later row groups add finer detail. Metadata associates each rendering resolution with a cumulative row group prefix and, when provided, a simplified geometry representation. Readers can fetch a coarse view first, then add features or refine their geometries as needed.
 
 ## Scope
 
-The extension describes the physical layout of one GeoParquet file with respect to its primary geometry column. It preserves the table's features, geometries, and attributes, while permitting their order to change. Each input row occurs exactly once in the output, including when the input itself contains duplicate-valued rows.
+The extension describes the physical layout of one GeoParquet file with respect to its primary geometry column. It preserves the table's features, primary geometries, and source attributes, while permitting their order to change. Optional overviews provide scale-appropriate rendering geometries in a column identified by metadata. Each input row occurs exactly once in the output, including when the input itself contains duplicate-valued rows.
 
-The extension does not define a new geometry encoding, tile matrix, spatial index, or query language. It does not require a per-row level column, sidecar index, or duplicated rows for each resolution.
+The primary geometry retains its GeoParquet encoding. The extension does not define a tile matrix, spatial index, or query language. It does not require a per-row level column, sidecar index, or duplicated rows for each resolution.
 
 The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this document are to be interpreted as described in [RFC 2119](https://www.ietf.org/rfc/rfc2119.txt).
 
 ## Physical layout
 
-A file using this extension MUST conform to the [GeoParquet specification](geoparquet.md).
+A file using this extension MUST conform to its declared [GeoParquet version](https://geoparquet.org/releases/).
 
 Features MUST be assigned to ordered detail levels, from coarse to fine. A level represents the features selected for display at a nominal rendering resolution. Earlier levels should provide a useful view of the dataset; later levels may add features that the producer has deferred at coarser resolutions.
 
-Each input row MUST be stored exactly once. Applying this layout MUST NOT simplify, aggregate, or otherwise change its geometry or attribute values. Derived rendering representations may be defined separately, but are not selected by this extension.
+Each input row MUST be stored exactly once. Applying this layout MUST NOT simplify, aggregate, or otherwise change its primary geometry or source attribute values. Derived rendering geometries are stored in the column referenced by `geo.lod.overviews.column`. The extension reserves no data column name.
 
 Rows introduced by each level MUST occupy consecutive whole Parquet row groups. A row group MUST NOT straddle a level boundary. Row groups MUST occur in coarse-to-fine order in the Parquet footer. Readers use the footer's column chunk offsets for access.
 
@@ -41,17 +41,58 @@ Fine selection:   [0, 1, 2, 3, 4, 5, 6, 7]
 
 Within each level's newly introduced rows, producers SHOULD spatially cluster features to improve spatial pruning. The clustering method is not prescribed: Hilbert ordering, quadtree ordering, and STR packing are possible choices. A global spatial sort that interleaves detail levels would invalidate the declared layout.
 
+### Geometry representation
+
+A producer that provides rendering overviews MUST declare `geo.lod.overviews`.
+Its `column` field MUST reference an existing top-level column distinct from the
+primary geometry column. The column name is producer-defined; a column named
+`overviews` has no special meaning unless referenced by this metadata. Adding
+overviews MUST NOT overwrite a source attribute.
+
+The `encoding` field identifies the rules for interpreting that column and its
+per-LoD metadata. This specification does not require a single overview encoding.
+An encoding definition MUST specify its physical schema, how each named LoD maps
+to a row's rendering geometry, and any decoding parameters, coordinate dimensions,
+and geometry-type constraints. Encoding identifiers MUST have stable meanings;
+incompatible changes require a distinct identifier. Encoding-specific fields
+MUST NOT change the level-selection or non-null coverage rules defined here.
+
+Every LoD declared in `overviews.lods` MUST identify a representation in the
+referenced column and MUST select at least one level through `level_indices`.
+Representations remain aligned with the source table: each row's overview represents that row's
+primary geometry. Files MAY omit overviews, in which case rendering readers use
+the lossless primary geometry.
+
+The following encoding identifiers have definitions:
+
+| Identifier | Definition |
+| --- | --- |
+| `quantized_geoarrow` | [Quantized GeoArrow](encodings/quantized-geoarrow.md): nested geometry lists with int32 XY coordinates. |
+
+Their physical schemas and coordinate transforms are specific to each encoding,
+not requirements for other encodings. Every additional encoding identifier MUST
+resolve to an unambiguous definition of the rules above; naming a serialization
+format alone is insufficient.
+
 ## Metadata
 
-The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet file metadata stored under the `geo` key. When present, this object MUST contain the fields below. Its levels apply to the primary geometry column identified by `geo.primary_column`.
+The extension adds an OPTIONAL `lod` (level of detail) object to the GeoParquet file metadata stored under the `geo` key. When present, this object MUST satisfy the field requirements below. Its levels apply to the primary geometry column identified by `geo.primary_column`.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `levels` | array of objects | **REQUIRED.** Non-empty list of levels, ordered from coarse to fine. |
 | `levels[].row_group_end` | integer | **REQUIRED.** Zero-based, inclusive end of the selected row group prefix. |
 | `levels[].resolution` | number | **REQUIRED.** Positive, finite nominal rendering resolution in the primary geometry column's CRS units. |
+| `overviews` | object | **OPTIONAL.** Declares rendering geometries. |
+| `overviews.column` | string | **REQUIRED** within `overviews`. Name of the top-level column containing the rendering geometries. |
+| `overviews.encoding` | string | **REQUIRED** within `overviews`. Identifier of the overview encoding. |
+| `overviews.lods` | object | **REQUIRED** within `overviews`. Non-empty mapping from physical LoD field names to their level assignments and encoding-specific metadata. |
+| `overviews.lods.<name>.level_indices` | array of integers | **REQUIRED** for each LoD. Non-empty list of zero-based indices into `levels` at which this rendering geometry is used. |
 
-Example of the `geo.lod` object for the eight-row-group file above:
+Example of the `geo.lod` object for the eight-row-group file above, using
+[`quantized_geoarrow`](encodings/quantized-geoarrow.md) for the rendering geometries.
+The `geometry_type`, `scale`, and `offset` fields belong to that encoding; the level-selection
+contract does not depend on them:
 
 ```json
 {
@@ -59,9 +100,30 @@ Example of the `geo.lod` object for the eight-row-group file above:
     { "row_group_end": 0, "resolution": 1000 },
     { "row_group_end": 2, "resolution": 100 },
     { "row_group_end": 7, "resolution": 10 }
-  ]
+  ],
+  "overviews": {
+    "column": "render_geometry",
+    "encoding": "quantized_geoarrow",
+    "lods": {
+      "l0": { "level_indices": [0], "geometry_type": "MultiPolygon", "scale": [512, 512], "offset": [0, 0] },
+      "l1": { "level_indices": [1], "geometry_type": "MultiPolygon", "scale": [64, 64], "offset": [0, 0] },
+      "l2": { "level_indices": [2], "geometry_type": "MultiPolygon", "scale": [8, 8], "offset": [0, 0] }
+    }
+  }
 }
 ```
+
+`levels` has the same structure with or without overviews. When `overviews` is
+present, every level index MUST occur exactly once across all `level_indices`
+arrays. Each index MUST be an integer in the range `0 <= index < levels.length`.
+Duplicate indices, including duplicates within one LoD, and unassigned levels
+are invalid. The order of LoD entries and of indices within an entry has no
+meaning. Inserting or removing a level requires updating these indices.
+
+Consecutive levels may select the same row-group prefix with different LoDs,
+refining geometry without adding features. One LoD may serve multiple prefixes
+by listing multiple indices, for example `"level_indices": [0, 1]`. Files without
+overviews omit `overviews`; their levels need no rendering-specific fields.
 
 ### Boundaries
 
@@ -74,9 +136,16 @@ For a file containing `N` row groups:
 
 Boundaries refer to this file's footer, not to row numbers, byte offsets, or row groups in another file. Partitioned datasets apply the extension independently to each file; this draft does not define a dataset-wide level index.
 
+For each LoD, its effective boundary is the maximum `row_group_end` among all
+levels identified by its `level_indices`. The representation of that LoD MUST be
+non-null for every row from row group `0` through that effective boundary,
+inclusive, and MUST be null in every
+later row group. Multiple levels MAY use the same LoD. This makes each
+selected prefix independently renderable without a per-row fallback.
+
 ### Resolution
 
-`resolution` is the nominal rendering resolution for which a feature prefix is intended to be rendered.
+`resolution` is the nominal rendering resolution for which a level's feature prefix and, when declared, its selected overview are intended to be rendered.
 
 `resolution` MUST be expressed in the horizontal coordinate units of the primary geometry column's CRS. For example, a CRS using meters expresses resolution in meters, while a geographic CRS using degrees expresses it in degrees. Values MUST strictly decrease from coarse to fine.
 
@@ -88,6 +157,8 @@ The target resolution is interpreted in the same CRS units as `resolution`. If t
 
 Readers that do not support this extension can ignore `lod` and read the file as ordinary GeoParquet. Extension-aware readers MUST validate the required fields and boundary constraints before using the levels to exclude row groups. If the metadata is invalid, readers MUST NOT use it for prefix selection and SHOULD report the problem. They MAY fall back to ordinary GeoParquet access.
 
+Readers that do not implement overviews, or do not support the declared encoding, read the lossless primary geometry. An unsupported encoding is not invalid LoD metadata: readers MAY still use valid level boundaries for feature selection. Readers MUST NOT decode an unsupported encoding as though it were a supported one.
+
 Readers MUST ignore unrecognized fields within `lod`. This proposal does not introduce an independent extension version field.
 
 ## Reader behavior
@@ -98,8 +169,17 @@ A typical rendering reader:
 2. Chooses a level for its target resolution or rendering budget.
 3. Applies row group spatial pruning within the selected prefix, from `0` through `row_group_end`.
 4. Can further prune pages within the retained row groups when page indexes are available.
-5. Fetches the required geometry and attribute data and evaluates the per-feature predicate.
-6. Fetches additional data when finer detail or a different viewport is requested, reusing cached data where possible.
+5. Selects the rendering geometry whose `level_indices` contains the selected level index when overviews are declared and their encoding is supported; otherwise selects the primary geometry.
+6. Fetches the selected geometry and required attribute data and evaluates the per-feature predicate.
+7. Fetches additional data when finer detail or a different viewport is requested, reusing cached data where possible.
+
+A rendering reader using declared overviews MUST NOT fall back to the primary WKB column when an overview value is absent. The non-null coverage requirement ensures that each selected prefix is independently renderable.
+
+Decoded overview coordinates use the primary geometry's CRS, XY axis order,
+and coordinate units. Spatial selection MUST evaluate the primary geometry's
+covering bbox, independent of the selected LoD. Overviews represent the
+selected features for rendering; their bounds MUST NOT replace or expand the
+primary bbox predicate.
 
 One possible level-selection policy is to choose the finest level whose `resolution` is greater than or equal to the target. Clamp to the first level when the target is coarser than every level, and to the last when it is finer than every level. With the example above, a target of 250 CRS units selects the level with `resolution: 1000`; a target of 100 CRS units selects the level with `resolution: 100`. Applications may choose a finer level when visual completeness matters more than transfer cost.
 
@@ -117,7 +197,11 @@ Producers SHOULD keep early row groups small enough for responsive initial acces
 
 No compression codec, row group size, page size, thinning algorithm, or spatial ordering algorithm is required. These choices depend on the dataset and expected access pattern. Coarse-to-fine ordering can reduce locality across levels compared with a single global spatial sort, so producers should measure both progressive rendering and full-resolution spatial queries.
 
-This layout reduces the number of features fetched at coarse scales. It does not reduce the vertex count of a selected feature: a large detailed polygon can still dominate transfer and decoding cost. Geometry overviews are complementary and should be specified separately.
+Feature selection reduces the number of features fetched at coarse scales. Without overviews, a large detailed polygon can still dominate transfer and decoding cost. Scale-appropriate simplified rendering geometries address this per-feature cost. Line- and Polygon-family producers SHOULD provide them.
+
+Producers MUST derive every LoD directly from the lossless primary geometry or from an
+equivalent progressive hierarchy; error MUST NOT accumulate by repeatedly
+simplifying the previous LoD. The primary geometry remains unchanged.
 
 Any operation that changes row order, row group boundaries, feature membership, or the primary geometry MUST remove or regenerate the extension metadata. Copying it unchanged through a generic rewrite can silently produce incomplete rendering results.
 
@@ -126,3 +210,16 @@ Any operation that changes row order, row group boundaries, feature membership, 
 A structural validator can check the metadata types, non-empty levels, positive finite and strictly decreasing resolutions, and non-decreasing row group boundaries. It can verify that each boundary is within the footer's row group count and that the final boundary includes the last row group. It can also validate the underlying GeoParquet file.
 
 Structural validation confirms only that the metadata is consistent with the file's row groups. It does not verify that every source row was preserved, nor that early levels form a useful coarse view; both require comparison with the source data or dataset-specific evaluation.
+
+When overviews are declared, also validate the column reference and level-to-LoD
+references. For a supported encoding, validate its metadata, physical schema
+and each LoD's non-null coverage through its effective boundary. A validator
+that does not support the encoding MUST report that it could not validate the
+overview representation; it MUST NOT claim full validation of those overviews.
+
+Compression, page sizing, and primary WKB statistics are implementation choices,
+not additional conformance requirements.
+
+## License
+
+This document is licensed under [CC BY 4.0](LICENSE-SPEC).
