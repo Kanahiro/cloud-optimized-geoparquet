@@ -93,25 +93,33 @@ map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
 const COGP_INTERACTIVE_LAYERS = ['cogp-fill', 'cogp-line', 'cogp-point'];
 
-map.on('click', (e) => {
-  const features = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS });
-  const feature = features[0];
-  if (!feature) return;
-  propertyPopup?.remove();
-  propertyPopup = new maplibregl.Popup({ maxWidth: '320px' })
+/** Show the attributes of the feature under the pointer; taps do the same on touch screens. */
+function showPropertyPopup(e: maplibregl.MapMouseEvent): void {
+  const feature = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS })[0];
+  if (!feature) {
+    hidePropertyPopup();
+    return;
+  }
+  const html = renderPropertiesHtml(feature.properties);
+  if (propertyPopup) {
+    propertyPopup.setLngLat(e.lngLat).setHTML(html);
+    return;
+  }
+  propertyPopup = new maplibregl.Popup({ maxWidth: '320px', closeButton: false, closeOnClick: false })
     .setLngLat(e.lngLat)
-    .setHTML(renderPropertiesHtml(feature.properties))
+    .setHTML(html)
     .addTo(map);
-});
-
-for (const layerId of COGP_INTERACTIVE_LAYERS) {
-  map.on('mouseenter', layerId, () => {
-    map.getCanvas().style.cursor = 'pointer';
-  });
-  map.on('mouseleave', layerId, () => {
-    map.getCanvas().style.cursor = '';
-  });
 }
+
+function hidePropertyPopup(): void {
+  propertyPopup?.remove();
+  propertyPopup = null;
+}
+
+map.on('mousemove', showPropertyPopup);
+map.on('click', showPropertyPopup);
+map.on('mouseout', hidePropertyPopup);
+map.on('dragstart', hidePropertyPopup);
 
 function renderPropertiesHtml(properties: Record<string, unknown> | null | undefined): string {
   if (!fetchPropertiesInput.checked) {
@@ -294,8 +302,7 @@ let datasetLoadController: AbortController | null = null;
 let propertyPopup: maplibregl.Popup | null = null;
 
 fetchPropertiesInput.addEventListener('change', () => {
-  propertyPopup?.remove();
-  propertyPopup = null;
+  hidePropertyPopup();
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
   // A new URL revision prevents reuse of tiles containing the previous attributes.
@@ -330,8 +337,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   }
   loadBtn.disabled = true;
   setStatus(`Opening ${datasetName(url)}…`);
-  propertyPopup?.remove();
-  propertyPopup = null;
+  hidePropertyPopup();
   datasetLoadController?.abort();
   const controller = new AbortController();
   datasetLoadController = controller;
