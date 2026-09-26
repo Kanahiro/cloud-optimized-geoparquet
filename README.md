@@ -139,13 +139,16 @@ separately, each with its own tag prefix:
 |---|---|---|
 | Specification | `spec-v<version>` | GitHub Releases |
 | `cogp-rs` | `cogp-rs-v<version>` | GitHub Releases (binaries), crates.io (`cogp`) |
-| `@cogp/reader` (`js/packages/reader`) | `cogp-js-v<version>` | npm (`@cogp/reader`), GitHub Pages (demo) |
+| `@cogp/reader` (`js/packages/reader`) | `cogp-js-v<version>` | npm (`@cogp/reader`) |
 
 Each implementation README states the specification version it implements.
 To release an implementation, bump the version in its `Cargo.toml` or
 `package.json`, merge, then publish a GitHub Release whose tag matches that
 version. Tags `v0.1.0`–`v2.0.1` predate this split and covered the whole
 repository.
+
+The demo is not released: it deploys to GitHub Pages from `main` whenever
+`js/**` changes.
 
 ## Writer implementation
 
