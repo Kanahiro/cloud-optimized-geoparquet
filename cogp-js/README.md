@@ -1,11 +1,15 @@
 # COGP JavaScript reader
 
+```sh
+npm install @cogp/reader
+```
+
 Implements spec `spec-v2.0.0`. Reads `geo.lod`, which a file must declare to be opened, and the optional
 [quantized rendering geometries](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/spec-v2.0.0/SPEC.md#geometry-representation). Rendering
 resolutions are in the primary geometry CRS units, including degrees for geographic data.
 
 ```ts
-import { CogpReader, toGeoJSON, toMvt } from 'cogp';
+import { CogpReader, toGeoJSON, toMvt } from '@cogp/reader';
 
 const reader = await CogpReader.open(url);
 const level = reader.selectLevel(0.01); // degrees for CRS84
@@ -81,8 +85,8 @@ request intersecting primary WKB chunks, so WKB cannot be fetched by accident.
 ## Development
 
 ```sh
-pnpm --filter cogp build
-pnpm --filter cogp test
+pnpm --filter @cogp/reader build
+pnpm --filter @cogp/reader test
 pnpm --filter cogp-demo build
 pnpm --filter cogp-demo dev
 ```

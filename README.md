@@ -65,17 +65,11 @@ from JavaScript.
 ### 1. Get the tools
 
 Download a `cogp` binary for your platform from the
-[GitHub releases](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases).
-The JavaScript reader is not published to npm yet, so build and pack it from
-this repository (this also builds the CLI if you prefer building from source):
+[GitHub releases](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases),
+and install the JavaScript reader from npm:
 
 ```sh
-git clone https://github.com/Kanahiro/cloud-optimized-geoparquet.git
-cd cloud-optimized-geoparquet
-pnpm install --frozen-lockfile
-pnpm --filter cogp build
-(cd cogp-js && pnpm pack)        # -> cogp-js/cogp-2.0.0.tgz
-cargo build --release -p cogp    # optional: target/release/cogp
+npm install @cogp/reader
 ```
 
 ### 2. Convert your data to GeoParquet
@@ -102,17 +96,11 @@ thinning, and row group size.
 
 ### 4. Read it from JavaScript
 
-Install the packed reader into your project:
-
-```sh
-npm install /path/to/cloud-optimized-geoparquet/cogp-js/cogp-2.0.0.tgz
-```
-
 Read the features in a bbox at a given resolution, then convert the batch to
 GeoJSON or encode it as a Mapbox Vector Tile:
 
 ```js
-import { CogpReader, toGeoJSON, toMvt } from 'cogp';
+import { CogpReader, toGeoJSON, toMvt } from '@cogp/reader';
 
 const reader = await CogpReader.open('https://my-host.com/my-data.cogp.parquet');
 const batch = await reader.read({
@@ -155,7 +143,7 @@ separately, each with its own tag prefix:
 |---|---|---|
 | Specification | `spec-v<version>` | GitHub Releases |
 | `cogp-rs` | `cogp-rs-v<version>` | GitHub Releases (binaries), crates.io (`cogp`) |
-| `cogp-js` | `cogp-js-v<version>` | npm (`cogp`), GitHub Pages (demo) |
+| `cogp-js` | `cogp-js-v<version>` | npm (`@cogp/reader`), GitHub Pages (demo) |
 
 Each implementation README states the specification version it implements.
 To release an implementation, bump the version in its `Cargo.toml` or

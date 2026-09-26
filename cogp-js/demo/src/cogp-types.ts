@@ -1,7 +1,7 @@
 export const MVT_LAYER_NAME = 'cogp';
 
 export interface OpenResult {
-  geo: import('cogp').CogpReader['geo'];
+  geo: import('@cogp/reader').CogpReader['geo'];
   numRowGroups: number;
   byteLength: number;
   dataBbox: [[number, number], [number, number]] | null;
