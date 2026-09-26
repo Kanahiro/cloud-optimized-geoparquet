@@ -1,4 +1,4 @@
-# Cloud Optimized GeoParquet Profile (COGP)
+# Cloud Optimized GeoParquet (COGP)
 
 A GeoParquet extension for progressive map rendering and partial access over HTTP range requests or object storage.
 
