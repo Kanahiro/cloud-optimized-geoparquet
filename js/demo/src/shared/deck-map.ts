@@ -39,6 +39,8 @@ export interface DeckMap {
   viewState(): MapViewState;
   /** The visible bounds in degrees; views crossing the antimeridian read every longitude. */
   viewportBbox(): ViewportBbox;
+  /** Longitude and latitude at a pixel of the map canvas. */
+  unproject(pixel: [number, number]): [number, number];
 }
 
 /**
@@ -123,6 +125,7 @@ export function createDeckMap(options: {
       setView({ longitude: fitted.longitude, latitude: fitted.latitude, zoom: fitted.zoom }, transitionDuration);
     },
     viewState: () => viewState,
+    unproject: (pixel) => currentViewport().unproject(pixel) as [number, number],
     viewportBbox: () => {
       const [west, south, east, north] = currentViewport().getBounds();
       const wraps = west < -180 || east > 180;

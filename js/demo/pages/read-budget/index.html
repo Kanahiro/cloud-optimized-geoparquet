@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Read budget · COGP Demo</title>
+    <link rel="stylesheet" href="../../src/shared/base.css" />
+    <link rel="stylesheet" href="../../src/shared/panel.css" />
+    <style>
+      .attribution {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        z-index: 1;
+        padding: 2px 6px;
+        font-size: 11px;
+        background: rgba(255, 255, 255, 0.8);
+      }
+      .attribution a {
+        color: inherit;
+      }
+      /* The area of interest: a fixed size on screen at the map center; outside is dimmed. */
+      .aoi {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        z-index: 1;
+        width: min(480px, calc(100% - 48px));
+        height: min(360px, calc(100% - 48px));
+        border: 2px solid #1f2430;
+        box-shadow: 0 0 0 100vmax rgba(31, 36, 48, 0.35);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+      .budget-header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+      }
+      .budget-header output {
+        font-size: 13px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      input[type='range'] {
+        width: 100%;
+        margin: 4px 0 0;
+        accent-color: var(--accent);
+      }
+      .range-scale {
+        display: flex;
+        justify-content: space-between;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .levels {
+        margin: 0 0 12px;
+      }
+      .levels h2 {
+        margin: 0 0 6px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+      .levels ol {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 3px 8px;
+        align-items: center;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      .levels li {
+        display: contents;
+      }
+      .levels .name {
+        color: var(--muted);
+      }
+      .levels .track {
+        height: 10px;
+      }
+      .levels .bar {
+        display: block;
+        height: 100%;
+        min-width: 2px;
+        border-radius: 0 4px 4px 0;
+      }
+      .levels li.empty .bar {
+        display: none;
+      }
+      .levels li.empty .count {
+        color: var(--muted);
+      }
+      .levels li.excluded .name {
+        text-decoration: line-through;
+      }
+      .levels .count {
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <aside id="panel" class="panel">
+      <header class="panel-header">
+        <div>
+          <h1>Read budget</h1>
+          <p class="subtitle">An area, a level and row budget, and what they read</p>
+        </div>
+        <button
+          id="panel-toggle"
+          class="icon-button"
+          type="button"
+          aria-controls="panel-body"
+          aria-expanded="true"
+          aria-label="Collapse panel"
+        >
+          <span aria-hidden="true">▾</span>
+        </button>
+      </header>
+      <div id="panel-body" class="panel-body">
+        <p class="hint">
+          The box at the map center is read with
+          <code>read({ bbox, maxLevel, maxRows })</code>. The box keeps its size on
+          screen, so pan to read another place and zoom to cover more or less ground.
+          The level budget, unlimited by default, excludes finer levels outright. Within it, rows come in
+          source order, coarse levels first, so a small row budget stops at an
+          overview and a larger one fills in finer levels. Only the pages holding
+          the kept rows are fetched.
+          <a href="../../">Other demos</a> ·
+          <a
+            href="https://github.com/Kanahiro/cloud-optimized-geoparquet"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Spec &amp; source</a
+          >
+        </p>
+
+        <section class="field">
+          <label for="preset">Dataset</label>
+          <select id="preset">
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet" selected>
+              Buildings (Overture Maps)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet">
+              Road segments (Overture Maps)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet">
+              POIs (OSM)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet">
+              Administrative boundaries
+            </option>
+          </select>
+        </section>
+
+        <section class="field">
+          <label for="max-level">Level budget</label>
+          <select id="max-level">
+            <option value="all" selected>Unlimited · all levels</option>
+            <option value="auto">Auto · level for the zoom</option>
+          </select>
+        </section>
+
+        <section class="field">
+          <div class="budget-header">
+            <label for="budget">Row budget</label>
+            <output id="budget-value" for="budget">–</output>
+          </div>
+          <input id="budget" type="range" min="0" max="12" step="1" value="6" />
+          <div class="range-scale" aria-hidden="true">
+            <span>100</span>
+            <span>1,000,000</span>
+          </div>
+        </section>
+
+        <section class="options">
+          <button id="fly" class="secondary" type="button">Back to Tokyo</button>
+        </section>
+
+        <p id="status" class="status" role="status">Opening dataset…</p>
+
+        <dl id="stats" class="stats" hidden>
+          <dt>Read</dt>
+          <dd id="stat-features">–</dd>
+          <dt>Level budget</dt>
+          <dd id="stat-level">–</dd>
+          <dt>Deepest read</dt>
+          <dd id="stat-deepest">–</dd>
+          <dt>Fetched</dt>
+          <dd id="stat-fetched">–</dd>
+          <dt>Read time</dt>
+          <dd id="stat-time">–</dd>
+        </dl>
+
+        <section id="levels" class="levels" hidden>
+          <h2>Rows by level</h2>
+          <ol id="level-list"></ol>
+        </section>
+      </div>
+    </aside>
+    <div id="map"></div>
+    <div id="aoi" class="aoi" aria-hidden="true"></div>
+    <div class="attribution">
+      &copy;
+      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer"
+        >OpenStreetMap</a
+      >
+      contributors
+    </div>
+    <script type="module" src="../../src/pages/read-budget/main.ts"></script>
+  </body>
+</html>
