@@ -93,9 +93,14 @@ map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
 const COGP_INTERACTIVE_LAYERS = ['cogp-fill', 'cogp-line', 'cogp-point'];
 
-/** Show the attributes of the feature under the pointer; taps do the same on touch screens. */
-function showPropertyPopup(e: maplibregl.MapMouseEvent): void {
-  const feature = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS })[0];
+function featureAt(e: maplibregl.MapMouseEvent): maplibregl.MapGeoJSONFeature | undefined {
+  return map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS })[0];
+}
+
+/** Preview the attributes of the feature under the pointer, unless a popup is pinned. */
+function previewPropertyPopup(e: maplibregl.MapMouseEvent): void {
+  if (propertyPopupPinned) return;
+  const feature = featureAt(e);
   if (!feature) {
     hidePropertyPopup();
     return;
@@ -111,15 +116,39 @@ function showPropertyPopup(e: maplibregl.MapMouseEvent): void {
     .addTo(map);
 }
 
-function hidePropertyPopup(): void {
-  propertyPopup?.remove();
-  propertyPopup = null;
+/** Pin the popup on click, so a long attribute list can be scrolled; clicking elsewhere closes it. */
+function pinPropertyPopup(e: maplibregl.MapMouseEvent): void {
+  hidePropertyPopup();
+  const feature = featureAt(e);
+  if (!feature) return;
+  const popup = new maplibregl.Popup({ maxWidth: '320px', closeOnClick: false })
+    .setLngLat(e.lngLat)
+    .setHTML(renderPropertiesHtml(feature.properties))
+    .addTo(map);
+  popup.on('close', () => {
+    if (propertyPopup !== popup) return;
+    propertyPopup = null;
+    propertyPopupPinned = false;
+  });
+  propertyPopup = popup;
+  propertyPopupPinned = true;
 }
 
-map.on('mousemove', showPropertyPopup);
-map.on('click', showPropertyPopup);
-map.on('mouseout', hidePropertyPopup);
-map.on('dragstart', hidePropertyPopup);
+function hidePropertyPopup(): void {
+  const popup = propertyPopup;
+  propertyPopup = null;
+  propertyPopupPinned = false;
+  popup?.remove();
+}
+
+function hidePreviewPropertyPopup(): void {
+  if (!propertyPopupPinned) hidePropertyPopup();
+}
+
+map.on('mousemove', previewPropertyPopup);
+map.on('click', pinPropertyPopup);
+map.on('mouseout', hidePreviewPropertyPopup);
+map.on('dragstart', hidePreviewPropertyPopup);
 
 function renderPropertiesHtml(properties: Record<string, unknown> | null | undefined): string {
   if (!fetchPropertiesInput.checked) {
@@ -300,6 +329,7 @@ let active: ActiveDataset | null = null;
 let latestUrl = '';
 let datasetLoadController: AbortController | null = null;
 let propertyPopup: maplibregl.Popup | null = null;
+let propertyPopupPinned = false;
 
 fetchPropertiesInput.addEventListener('change', () => {
   hidePropertyPopup();
