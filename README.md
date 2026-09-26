@@ -93,10 +93,10 @@ npm install @cogp/reader
 ```
 
 Read the features in a bbox at a given resolution, then convert the batch to
-GeoJSON or encode it as a Mapbox Vector Tile:
+GeoJSON, encode it as a Mapbox Vector Tile, or encode it as a GeoArrow IPC stream:
 
 ```js
-import { CogpReader, toGeoJSON, toMvt } from '@cogp/reader';
+import { CogpReader, toGeoArrow, toGeoJSON, toMvt } from '@cogp/reader';
 
 const reader = await CogpReader.open('https://my-host.com/my-data.cogp.parquet');
 const batch = await reader.read({
@@ -107,12 +107,16 @@ const batch = await reader.read({
 
 const geojson = toGeoJSON(batch); // FeatureCollection; feature IDs are source row indexes
 const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer, source layer `cogp`
+const arrow = toGeoArrow(batch, { crs: 'OGC:CRS84' }); // ArrayBuffer, Arrow IPC stream
 ```
 
 `read()` returns every attribute plus the primary geometry by default; pass
 `columns` to fetch fewer. `toMvt` assumes longitude/latitude and is meant for
-a tile-sized `bbox`. See the [JavaScript reader README](./js/packages/reader/README.md)
-for the full API and the [demo](./js/demo) for rendering with MapLibre.
+a tile-sized `bbox`. `toGeoArrow` writes one record batch that
+`tableFromIPC` from `apache-arrow` (or pyarrow) can read, with the geometry as a
+GeoArrow multi type (`geoarrow.multipolygon`, `geoarrow.multilinestring` or
+`geoarrow.multipoint`). See the [JavaScript reader README](./js/packages/reader/README.md)
+for the full API and the [demo](./js/demo) for rendering with MapLibre or deck.gl.
 
 ## Specification
 
