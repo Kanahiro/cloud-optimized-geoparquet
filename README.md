@@ -8,9 +8,9 @@ Created by [Kanahiro Iguchi](https://github.com/Kanahiro).
 
 A COGP file is a valid [GeoParquet](https://geoparquet.org/) file whose row groups are arranged in coarse-to-fine detail levels. File-level `geo.lod` metadata records the cumulative row-group prefix available at each level. That metadata is optional in the [LoD extension](./SPEC.md), but required for a file to be treated as COGP.
 
-The producer assigns each input row to one level, but readers select **whole row-group prefixes**, not individual features. Every input row appears once, and its primary geometry and source attributes are preserved. Optional rendering overviews can contain simplified geometries in a separate column.
+The producer assigns each input row to one level. Level selection works on **whole row-group prefixes**, not individual features; within the selected prefix, area-of-interest reads can still skip row groups and pages using bbox statistics and Page Indexes. Every input row appears once, and its primary geometry and source attributes are preserved. Optional rendering overviews can contain simplified geometries in a separate column.
 
-A COGP-aware reader can select the row-group prefix and, when available, the geometry overview for its target rendering resolution. A reader that does not understand the profile can ignore `geo.lod` and read the complete file as ordinary GeoParquet, but cannot use the metadata to select a coarse level.
+A COGP-aware reader can select the row-group prefix and, when available, the geometry overview for its target rendering resolution, then prune that prefix spatially to the viewport. A reader that does not understand the profile can ignore `geo.lod` and read the complete file as ordinary GeoParquet, but cannot use the metadata to select a coarse level.
 
 ## Design influences
 
@@ -20,7 +20,7 @@ COGP is informed by several existing cloud-optimized and progressive rendering p
 - Cloud Optimized Point Cloud: remaining a valid LAZ file while adding thinning and multi-resolution level concepts;
 - tippecanoe: design choice to avoid rendering every feature literally at low zoom levels.
 
-COGP applies these ideas at the GeoParquet row-group level. Its primary geometries remain unchanged; optional rendering overviews can provide simplified geometries without replacing them. Each input row belongs to one level.
+COGP expresses these levels as GeoParquet row-group boundaries, so they combine with ordinary row-group and page-level spatial pruning. Its primary geometries remain unchanged; optional rendering overviews can provide simplified geometries without replacing them. Each input row belongs to one level.
 
 ## Why
 
@@ -30,7 +30,7 @@ GeoParquet is well suited for analytics and cloud storage, but ordinary GeoParqu
 
 - **Progressive rendering for COGP-aware software.** A reader can use `geo.lod` to select a cumulative row-group prefix for its target resolution, then add later groups as finer detail is needed. Optional geometry overviews can reduce the cost of rendering large lines and polygons.
 - **Ordinary GeoParquet compatibility.** Readers that ignore `geo.lod` can read every row and its unchanged primary geometry. A reader that happens to process row groups in order and render incrementally may display coarse features first, but that behavior depends on the reader and does not provide level selection.
-- **Spatial pruning when supported.** The file can retain GeoParquet bounding-box statistics and page indexes for area-of-interest queries, including in readers unaware of COGP. Query efficiency depends on the data, packing, and reader; ordering by detail can be less effective than a global spatial sort for some full-resolution queries.
+- **Spatial pruning within a level.** The file retains GeoParquet bounding-box statistics and Page Indexes, so area-of-interest queries can skip row groups and individual pages, including in readers unaware of COGP. A COGP-aware reader applies this inside the selected prefix: a viewport read at a coarse level touches only the intersecting pages of the leading row groups. Query efficiency depends on the data, packing, and reader; ordering by detail can be less effective than a global spatial sort for some full-resolution queries.
 
 ### Example: loading OvertureMaps buildings on QGIS 4.0
 
@@ -122,7 +122,7 @@ See each implementation's README for its public API and focused workflows.
 ## Roadmap
 
 - [x] Producer implementation: a tool/library that converts existing GeoParquet 1.1 files into the COGP layout. 
-- [x] Reader implementation: a client that interprets the `geo.lod` metadata and fetches only the leading row groups required for the target resolution via HTTP range requests.
+- [x] Reader implementation: a client that interprets the `geo.lod` metadata and fetches only the leading row groups required for the target resolution, and within them only the pages intersecting the viewport, via HTTP range requests.
 - [x] Propose the level-of-detail layout as a GeoParquet extension.
 - [x] Add geometry overviews for scale-dependent rendering while preserving the lossless primary geometry.
 
