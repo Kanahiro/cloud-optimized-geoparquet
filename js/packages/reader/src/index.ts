@@ -29,3 +29,5 @@ export { MVT_BUFFER, MVT_EXTENT, toMvt, type MvtTileOptions } from './mvt.js';
 export type { PageIndexCacheOptions } from './page-index-cache.js';
 
 export type { RangeCacheOptions } from './range-cache.js';
+
+export { toGeoArrow, type GeoArrowOptions } from './geoarrow.js';
