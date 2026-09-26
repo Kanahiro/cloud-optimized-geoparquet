@@ -1,12 +1,14 @@
 /// <reference lib="webworker" />
-import { CogpReader, toMvt } from '@cogp/reader';
+import { CogpReader, toGeoArrow, toMvt } from '@cogp/reader';
 import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import {
   MVT_LAYER_NAME,
+  type ArrowResult,
   type NetworkStats,
   type OpenResult,
   type TileResult,
+  type ViewRequest,
   type WorkerMessage,
   type WorkerResponse,
 } from './cogp-types';
@@ -92,6 +94,28 @@ async function readTile(
   return { data, ms: performance.now() - startedAt, network: { ...network } };
 }
 
+/** Read the rows intersecting a view at the level selected for its resolution, as GeoArrow. */
+async function readArrow(request: ViewRequest, signal: AbortSignal): Promise<ArrowResult> {
+  const ds = active;
+  if (!ds || ds.url !== request.url) {
+    throw new Error('Dataset is no longer active');
+  }
+  const level = ds.reader.selectLevel(request.resolution);
+  const geomColumn = ds.reader.primaryGeometryColumn;
+  const startedAt = performance.now();
+  const batch = await ds.reader.read({
+    bbox: request.bbox,
+    columns: [geomColumn, ...(request.fetchProperties ? ds.propertyColumns : [])],
+    maxLevel: level,
+    useOverview: true,
+    maxRows: request.maxRows,
+    signal,
+  });
+  signal.throwIfAborted();
+  const data = toGeoArrow(batch, { crs: ds.reader.geo.columns[geomColumn]?.crs });
+  return { data, rows: batch.length, level, ms: performance.now() - startedAt, network: { ...network } };
+}
+
 function propertyColumnNames(reader: CogpReader): string[] {
   const excluded = new Set<string>(Object.keys(reader.geo.columns));
   if (reader.geo.lod.overviews) excluded.add(reader.geo.lod.overviews.column);
@@ -148,6 +172,10 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         payload.fetchProperties,
         controller.signal,
       );
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response, { transfer: [result.data] });
+    } else if (payload.type === 'readArrow') {
+      const result: ArrowResult = await readArrow(payload, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response, { transfer: [result.data] });
     }

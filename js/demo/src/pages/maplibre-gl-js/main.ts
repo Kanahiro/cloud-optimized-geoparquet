@@ -8,6 +8,7 @@ import {
   type OpenResult,
 } from '../../shared/dataset-service';
 import { MVT_LAYER_NAME, type NetworkStats } from '../../shared/cogp-types';
+import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
 
 // MapLibre v6 derives its worker URL from import.meta.url, which breaks once
@@ -124,15 +125,6 @@ function renderPropertiesHtml(properties: Record<string, unknown> | null | undef
     .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(String(v ?? ''))}</td></tr>`)
     .join('');
   return `<div class="cogp-popup"><table>${rows}</table></div>`;
-}
-
-function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 map.on('load', () => {
@@ -257,24 +249,6 @@ function renderStats(): void {
   }
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${bytes} B`;
-}
-
-function formatPercent(ratio: number): string {
-  const percent = ratio * 100;
-  return `${percent < 0.1 ? percent.toFixed(3) : percent.toFixed(1)}%`;
-}
-
-function formatDistance(meters: number): string {
-  if (meters >= 1000) return `${(meters / 1000).toFixed(meters >= 10_000 ? 0 : 1)} km`;
-  if (meters >= 1) return `${meters.toFixed(meters >= 10 ? 0 : 1)} m`;
-  return `${(meters * 100).toFixed(0)} cm`;
-}
-
 const urlInput = document.getElementById('url') as HTMLInputElement;
 const presetSelect = document.getElementById('preset') as HTMLSelectElement;
 const loadBtn = document.getElementById('load') as HTMLButtonElement;
@@ -395,14 +369,6 @@ async function loadDataset(url: string): Promise<void> {
   } finally {
     if (datasetLoadController === controller) datasetLoadController = null;
     if (latestUrl === url) loadBtn.disabled = false;
-  }
-}
-
-function datasetName(url: string): string {
-  try {
-    return decodeURIComponent(new URL(url).pathname.split('/').pop() || url);
-  } catch {
-    return url;
   }
 }
 

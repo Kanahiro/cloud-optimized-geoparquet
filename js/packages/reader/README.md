@@ -105,7 +105,7 @@ pnpm --filter cogp-demo build
 pnpm --filter cogp-demo dev
 ```
 
-The demo targets geographic longitude/latitude data, maps its screen resolution
+The **MapLibre GL JS** page (`/pages/maplibre-gl-js/`) targets geographic longitude/latitude data, maps its screen resolution
 to degrees, renders MVT tiles with popup attributes, and displays clicked feature properties
 without additional requests. Attribute reads share the tile bbox/Page Index
 pruning and Page Index cache. Prefetching attributes can increase initial tile
@@ -113,7 +113,16 @@ transfer compared with geometry-only rendering; files without page indexes may
 require full column chunks. Popup values are stored as display strings in MVT.
 The metadata panel displays the file's GeoParquet metadata directly.
 
-**Fetch attributes** is off by default, so tiles carry geometry only. Turning it
+The **deck.gl + GeoArrow** page (`/pages/deckgl-geoarrow/`) reads the whole
+view instead of tiles: each time the view settles, the worker reads its bbox at the
+level for the current zoom (at most 200,000 rows), encodes it with `toGeoArrow`,
+and transfers the Arrow IPC bytes to the page, which passes the record batch
+straight to `@geoarrow/deck.gl-geoarrow` polygon, path or scatterplot layers.
+It uses deck.gl alone, drawing OpenStreetMap raster tiles with a `TileLayer`
+instead of a base map library.
+Hovering a feature shows its attributes when **Fetch attributes** is on.
+
+On the MapLibre GL JS page, **Fetch attributes** is off by default, so tiles carry geometry only. Turning it
 on adds attribute columns to tile reads and shows them in a popup on click;
 switching reloads the map tiles while preserving the current view. The reader and
 its caches are retained; reload the dataset with **Load** for a fresh reader.
