@@ -88,10 +88,7 @@ async function readTile(
   });
   signal.throwIfAborted();
   // Attribute lifetime follows MapLibre's tile cache; clicks need no I/O.
-  const data = toMvt(
-    { geometry: batch.geometry!, ids: batch.rowIndex, properties: batch.columns },
-    { z, x, y, layer: MVT_LAYER_NAME, signal },
-  );
+  const data = toMvt(batch, { z, x, y, layer: MVT_LAYER_NAME, signal });
   return { data, ms: performance.now() - startedAt, network: { ...network } };
 }
 

@@ -222,7 +222,7 @@ test('toMvt encodes WKB and quantized overview columns identically from columns'
   const overview = columnFromGeoJSON([line, null], { int32: true, scale: [0.5, 0.5], offset: [0, 0] });
   assert.deepEqual(decodeGeometry(wkb, 0), decodeGeometry(overview, 0));
   const decode = data => new VectorTile(new Pbf(new Uint8Array(data)));
-  const source = geometry => ({ geometry, ids: [3, 4], properties: { name: ['a', 'b'] } });
+  const source = geometry => ({ geometry, rowIndex: [3, 4], columns: { name: ['a', 'b'] } });
   const a = decode(toMvt(source(wkb), { z: 0, x: 0, y: 0 }));
   const b = decode(toMvt(source(overview), { z: 0, x: 0, y: 0 }));
   // Null geometries are skipped.

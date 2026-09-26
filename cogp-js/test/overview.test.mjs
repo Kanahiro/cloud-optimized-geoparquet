@@ -131,7 +131,7 @@ test('geometryColumnFromWkb maps every supported WKB type onto the shared layout
 test('toGeoJSON converts every row into one FeatureCollection', () => {
   const line = { type: 'LineString', coordinates: [[0, 0], [1, 1]] };
   const geometry = geometryColumnFromWkb([encodeWkb(line), null]);
-  assert.deepEqual(toGeoJSON({ geometry, ids: [7, 8], properties: { name: ['a', null], n: new Int32Array([1, 2]) } }), {
+  assert.deepEqual(toGeoJSON({ geometry, rowIndex: [7, 8], columns: { name: ['a', null], n: new Int32Array([1, 2]) } }), {
     type: 'FeatureCollection',
     features: [
       { type: 'Feature', id: 7, geometry: line, properties: { name: 'a', n: 1 } },

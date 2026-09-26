@@ -57,6 +57,79 @@ https://github.com/user-attachments/assets/0b3e666a-5663-4f10-97f6-887442242d14
 - [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet) (OvertureMaps)
 - [admin.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet) (administrative boundaries, https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N03-2025.html)
 
+## Getting started
+
+This walks through converting your own vector data into COGP and reading it
+from JavaScript.
+
+### 1. Get the tools
+
+Download a `cogp` binary for your platform from the
+[GitHub releases](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases).
+The JavaScript reader is not published to npm yet, so build and pack it from
+this repository (this also builds the CLI if you prefer building from source):
+
+```sh
+git clone https://github.com/Kanahiro/cloud-optimized-geoparquet.git
+cd cloud-optimized-geoparquet
+pnpm install --frozen-lockfile
+pnpm --filter cogp build
+(cd cogp-js && pnpm pack)        # -> cogp-js/cogp-2.0.0.tgz
+cargo build --release -p cogp    # optional: target/release/cogp
+```
+
+### 2. Convert your data to GeoParquet
+
+`cogp convert` takes GeoParquet 1.x with WKB geometries. Any GDAL-readable
+source (Shapefile, GeoJSON, GeoPackage, ...) can be converted with GDAL 3.9 or
+later, which writes a bbox covering by default. `toMvt` in the JavaScript
+reader assumes longitude/latitude, so reproject to EPSG:4326 when making tiles:
+
+```sh
+ogr2ogr -f Parquet -t_srs EPSG:4326 my-data.parquet my-data.shp
+```
+
+### 3. Convert GeoParquet to COGP
+
+```sh
+cogp convert my-data.parquet my-data.cogp.parquet
+cogp validate my-data.cogp.parquet
+```
+
+The defaults target a Web Mercator z0–z16 pyramid. See the
+[CLI reference](./cogp-rs/README.md#convert) for tuning levels, point
+thinning, and row group size.
+
+### 4. Read it from JavaScript
+
+Install the packed reader into your project:
+
+```sh
+npm install /path/to/cloud-optimized-geoparquet/cogp-js/cogp-2.0.0.tgz
+```
+
+Read the features in a bbox at a given resolution, then convert the batch to
+GeoJSON or encode it as a Mapbox Vector Tile:
+
+```js
+import { CogpReader, toGeoJSON, toMvt } from 'cogp';
+
+const reader = await CogpReader.open('https://my-host.com/my-data.cogp.parquet');
+const batch = await reader.read({
+  maxLevel: reader.selectLevel(0.001), // CRS units per pixel (degrees here)
+  bbox: [139.4, 35.4, 139.6, 35.6],
+  useOverview: true, // simplified overviews when the file has them
+});
+
+const geojson = toGeoJSON(batch); // FeatureCollection; feature IDs are source row indexes
+const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer, source layer `cogp`
+```
+
+`read()` returns every attribute plus the primary geometry by default; pass
+`columns` to fetch fewer. `toMvt` assumes longitude/latitude and is meant for
+a tile-sized `bbox`. See the [JavaScript reader README](./cogp-js/README.md)
+for the full API and the [demo](./cogp-js/demo) for rendering with MapLibre.
+
 ## Specification
 
 See [`SPEC.md`](./SPEC.md) for the LoD extension, including optional [quantized geometry overviews](./SPEC.md#geometry-representation).
