@@ -26,7 +26,11 @@ worker.addEventListener('message', (e: MessageEvent<WorkerResponse>) => {
   pending.delete(msg.id);
   p.cleanup();
   if (msg.ok) p.resolve(msg.result);
-  else p.reject(new Error(msg.error));
+  else {
+    const error = new Error(msg.error);
+    error.name = msg.name;
+    p.reject(error);
+  }
 });
 
 function call<T>(payload: WorkerEnvelope['payload'], signal?: AbortSignal): Promise<T> {

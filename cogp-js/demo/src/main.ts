@@ -39,7 +39,9 @@ maplibregl.addProtocol(COGP_PROTOCOL, async (params, abortController) => {
   const address = parseTileAddress(params.url);
   const ds = active;
   if (!ds || address.revision !== datasetRevision) {
-    throw new Error('Stale COGP tile request');
+    // AbortError keeps MapLibre from marking the tile errored; a reload
+    // waiting on this tile would otherwise never start.
+    throw new DOMException('Stale COGP tile request', 'AbortError');
   }
 
   const result = await readTile(
