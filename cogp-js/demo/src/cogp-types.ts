@@ -45,4 +45,4 @@ export type WorkerMessage = WorkerEnvelope | WorkerCancel;
 
 export type WorkerResponse =
   | { id: number; ok: true; result: OpenResult | TileResult }
-  | { id: number; ok: false; error: string };
+  | { id: number; ok: false; error: string; name: string };

@@ -155,7 +155,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       self.postMessage(response, { transfer: [result.data] });
     }
   } catch (err) {
-    const response: WorkerResponse = { id, ok: false, error: (err as Error).message };
+    const response: WorkerResponse = { id, ok: false, error: (err as Error).message, name: (err as Error).name };
     self.postMessage(response);
   } finally {
     requestControllers.delete(id);

@@ -1,6 +1,6 @@
 import { byteLengthFromUrl } from '../vendor/hyparquet/src/index.js';
 
-import { throwIfAborted } from './abort.js';
+import { abortReason, throwIfAborted } from './abort.js';
 import type { AsyncBufferLike } from './coalescing-buffer.js';
 
 export interface HttpBufferOptions {
@@ -36,7 +36,7 @@ export async function abortableAsyncBufferFromUrl(
 
       const headers = new Headers(requestInit.headers);
       headers.set('Range', `bytes=${start}-${end - 1}`);
-      const response = await fetchFn(url, { ...requestInit, headers, signal });
+      const response = await fetchWithRetry(fetchFn, url, { ...requestInit, headers, signal }, signal);
       if (!response.ok || !response.body) throw new Error(`fetch failed ${response.status}`);
       if (response.status !== 200 && response.status !== 206) {
         throw new Error(`fetch received unexpected status code ${response.status}`);
@@ -49,4 +49,46 @@ export async function abortableAsyncBufferFromUrl(
       return bytes;
     },
   };
+}
+
+const RETRY_DELAYS_MS = [200, 800];
+const RETRY_STATUSES = new Set([429, 502, 503, 504]);
+
+/** Retry transient network errors and overload responses. A tile renderer
+ * never re-requests a failed tile, so one dropped Range request would
+ * otherwise leave a permanent hole. */
+async function fetchWithRetry(
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit,
+  signal?: AbortSignal,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    let response: Response | undefined;
+    try {
+      response = await fetchFn(url, init);
+    } catch (error) {
+      throwIfAborted(signal);
+      // fetch rejects with TypeError for network and CORS failures.
+      if (!(error instanceof TypeError) || attempt >= RETRY_DELAYS_MS.length) throw error;
+    }
+    if (response && (!RETRY_STATUSES.has(response.status) || attempt >= RETRY_DELAYS_MS.length)) {
+      return response;
+    }
+    await delay(RETRY_DELAYS_MS[attempt]!, signal);
+  }
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
