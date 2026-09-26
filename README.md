@@ -46,6 +46,10 @@ https://github.com/user-attachments/assets/fd15605a-7d66-41a3-884d-c735e3467708
 
 https://github.com/user-attachments/assets/7daf178e-28b0-4440-845d-ee8f74fa5062
 
+### Example: render administrative polygon with overviews
+
+https://github.com/user-attachments/assets/0b3e666a-5663-4f10-97f6-887442242d14
+
 ## Sample data
 
 - [pois.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet) (OpenStreetMap)
