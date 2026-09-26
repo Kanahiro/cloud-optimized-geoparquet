@@ -1,0 +1,50 @@
+name: Release cogp-js
+
+# Runs for GitHub Releases tagged `cogp-js-v<version>`. The spec and cogp-rs
+# are released under their own tag prefixes.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (cogp-js-v<version>)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'cogp-js-v')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Check version
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          manifest=$(node -p "require('./cogp-js/package.json').version")
+          if [ "${tag#cogp-js-v}" != "$manifest" ]; then
+            echo "::error::tag $tag does not match cogp-js/package.json version $manifest"
+            exit 1
+          fi
+      # Trusted Publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter cogp test
+      # Trusted Publishing: npm exchanges this workflow's OIDC token for a
+      # short-lived publish credential and attaches provenance automatically.
+      - run: npm publish
+        working-directory: cogp-js

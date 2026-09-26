@@ -3,7 +3,11 @@
   "version": "2.0.0",
   "description": "Cloud Optimized GeoParquet Profile (COGP) reader for the web.",
   "license": "MIT",
-  "repository": "https://github.com/Kanahiro/cloud-optimized-geoparquet",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kanahiro/cloud-optimized-geoparquet.git",
+    "directory": "cogp-js"
+  },
   "homepage": "https://github.com/Kanahiro/cloud-optimized-geoparquet",
   "type": "module",
   "exports": {

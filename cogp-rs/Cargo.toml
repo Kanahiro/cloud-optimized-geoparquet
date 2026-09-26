@@ -6,7 +6,6 @@ description = "Reference CLI and reader library for the Cloud Optimized GeoParqu
 license = "MIT"
 repository = "https://github.com/Kanahiro/cloud-optimized-geoparquet"
 homepage = "https://github.com/Kanahiro/cloud-optimized-geoparquet"
-documentation = "https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/cogp-rs/README.md"
 
 [[bin]]
 name = "cogp"
