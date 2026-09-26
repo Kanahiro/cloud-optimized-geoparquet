@@ -5,12 +5,14 @@ Rust reference CLI and reader library for the [Cloud Optimized GeoParquet Profil
 `convert` reorders the features of a GeoParquet file across row groups using
 point-grid density thinning, extent-based line/polygon visibility, and
 Sort-Tile-Recursive (STR) bbox packing inside each level. `validate` checks the
-structural rules and any declared rendering overviews in [SPEC.md](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/SPEC.md).
+structural rules and any declared rendering overviews in [SPEC.md](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/spec-v2.0.0/SPEC.md).
+
+Implements spec `spec-v2.0.0`.
 
 ## Install
 
 Pre-built binaries for Linux / macOS / Windows are attached to each
-[GitHub release](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases).
+`cogp-rs-v*` [GitHub release](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases).
 
 Or build from source:
 
@@ -34,7 +36,7 @@ Supports GeoParquet 1.x with WKB point, line, or polygon geometries, including M
 
 ## Rendering overviews
 
-The writer produces the optional [quantized rendering geometries](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/v2.0.0/SPEC.md#geometry-representation).
+The writer produces the optional [quantized rendering geometries](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/spec-v2.0.0/SPEC.md#geometry-representation).
 The base layout remains `geo.lod`, without an independent version. Eligible
 line/polygon tables receive nested `quantized_geoarrow` int32 XY overviews; the primary geometry
 and source attributes remain unchanged. Null or empty geometries receive empty

@@ -1,5 +1,6 @@
 name: Deploy demo to GitHub Pages
 
+# The demo is part of cogp-js, so it deploys with `cogp-js-v<version>` releases.
 on:
   release:
     types: [published]
@@ -16,6 +17,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'cogp-js-v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

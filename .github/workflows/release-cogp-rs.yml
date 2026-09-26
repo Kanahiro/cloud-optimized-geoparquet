@@ -1,21 +1,49 @@
-name: Release cogp-rs binaries
+name: Release cogp-rs
 
+# Runs for GitHub Releases tagged `cogp-rs-v<version>`. The spec and cogp-js
+# are released under their own tag prefixes.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to upload assets to
+        description: Release tag to build and publish (cogp-rs-v<version>)
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  version:
+    name: Check version
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'cogp-rs-v')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - id: check
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          version="${tag#cogp-rs-v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cogp") | .version')
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $tag does not match cogp-rs/Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: version
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +58,8 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -38,18 +68,36 @@ jobs:
       - name: Rename binary (unix)
         if: runner.os != 'Windows'
         run: |
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/cogp" "dist/cogp-${tag}-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/cogp" "dist/cogp-v${{ needs.version.outputs.version }}-${{ matrix.target }}"
       - name: Rename binary (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = if ("${{ github.event.release.tag_name }}") { "${{ github.event.release.tag_name }}" } else { "${{ inputs.tag }}" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/cogp.exe" "dist/cogp-$tag-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/cogp.exe" "dist/cogp-v${{ needs.version.outputs.version }}-${{ matrix.target }}.exe"
       - name: Upload assets to release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
           files: dist/*
+
+  publish:
+    name: Publish to crates.io
+    needs: version
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      # Trusted Publishing: crates.io exchanges this workflow's OIDC token for
+      # a short-lived publish token, so no API token is stored in the repo.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --package cogp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
