@@ -1,5 +1,9 @@
 # COGP JavaScript reader
 
+```sh
+npm install @cogp/reader
+```
+
 Implements spec `spec-v2.0.0`. Reads `geo.lod`, which a file must declare to be opened, and the optional
 [quantized rendering geometries](https://github.com/Kanahiro/cloud-optimized-geoparquet/blob/spec-v2.0.0/SPEC.md#geometry-representation). Rendering
 resolutions are in the primary geometry CRS units, including degrees for geographic data.
