@@ -9,7 +9,7 @@ Implements spec `spec-v2.0.0`. Reads `geo.lod`, which a file must declare to be 
 resolutions are in the primary geometry CRS units, including degrees for geographic data.
 
 ```ts
-import { CogpReader, toGeoJSON, toMvt } from '@cogp/reader';
+import { CogpReader, toGeoArrow, toGeoJSON, toMvt } from '@cogp/reader';
 
 const reader = await CogpReader.open(url);
 const level = reader.selectLevel(0.01); // degrees for CRS84
@@ -23,6 +23,7 @@ console.log(reader.geo); // includes lod.levels and optional rendering metadata
 batch.length; batch.rowIndex; batch.columns.name; // aligned per-row arrays
 const geojson = toGeoJSON(batch); // FeatureCollection of every row
 const tile = toMvt(batch, { z: 10, x: 909, y: 403 });
+const arrow = toGeoArrow(batch, { crs: 'OGC:CRS84' }); // Arrow IPC stream bytes
 const detail = await reader.readRow(batch.rowIndex[0]!, { columns: ['id'] }); // a one-row batch
 ```
 
@@ -46,6 +47,19 @@ Both accept any `{ geometry, rowIndex?, columns? }`, so other IDs or a
 the columns in place, assumes longitude/latitude input, projects to Web Mercator,
 clips to a 64-unit buffer around a 4096 extent (`MVT_BUFFER`, `MVT_EXTENT`),
 skips null or off-tile rows and writes properties as display strings.
+`toGeoArrow(batch, { geometryColumn, idColumn, crs })` returns an Arrow IPC
+stream (one record batch, readable with `tableFromIPC` from `apache-arrow` or
+pyarrow) without adding a dependency. Geometry is written as the GeoArrow multi
+type of its family (`geoarrow.multipoint`, `geoarrow.multilinestring` or
+`geoarrow.multipolygon`) with interleaved float64 coordinates: single geometries
+become one-part multi geometries, quantized overviews are dequantized, Z is kept,
+null geometries stay null, and mixing families (e.g. points and polygons) throws.
+An all-null column is written as `geoarrow.multipolygon`. `rowIndex` becomes an
+int64 `rowIndex` column (rename with `idColumn`). Typed-array attributes keep
+their numeric type; plain arrays of numbers, bigints, booleans, strings, bytes or
+Dates become float64, int64, bool, utf8, binary or UTC millisecond timestamps,
+and other or mixed values are written as display strings. `crs` is only written
+to the extension metadata when given, e.g. from `reader.geo.columns`.
 
 With `bbox`, `read` prunes row groups and pages within a cumulative prefix by
 primary covering statistics, then reads the (small) covering values of the
@@ -91,7 +105,7 @@ pnpm --filter cogp-demo build
 pnpm --filter cogp-demo dev
 ```
 
-The demo targets geographic longitude/latitude data, maps its screen resolution
+The **MapLibre GL JS** page (`/pages/maplibre-gl-js/`) targets geographic longitude/latitude data, maps its screen resolution
 to degrees, renders MVT tiles with popup attributes, and displays clicked feature properties
 without additional requests. Attribute reads share the tile bbox/Page Index
 pruning and Page Index cache. Prefetching attributes can increase initial tile
@@ -99,7 +113,16 @@ transfer compared with geometry-only rendering; files without page indexes may
 require full column chunks. Popup values are stored as display strings in MVT.
 The metadata panel displays the file's GeoParquet metadata directly.
 
-**Fetch attributes** is off by default, so tiles carry geometry only. Turning it
+The **deck.gl + GeoArrow** page (`/pages/deckgl-geoarrow/`) reads the whole
+view instead of tiles: each time the view settles, the worker reads its bbox at the
+level for the current zoom (at most 200,000 rows), encodes it with `toGeoArrow`,
+and transfers the Arrow IPC bytes to the page, which passes the record batch
+straight to `@geoarrow/deck.gl-geoarrow` polygon, path or scatterplot layers.
+It uses deck.gl alone, drawing OpenStreetMap raster tiles with a `TileLayer`
+instead of a base map library.
+Hovering a feature shows its attributes when **Fetch attributes** is on.
+
+On the MapLibre GL JS page, **Fetch attributes** is off by default, so tiles carry geometry only. Turning it
 on adds attribute columns to tile reads and shows them in a popup on click;
 switching reloads the map tiles while preserving the current view. The reader and
 its caches are retained; reload the dataset with **Load** for a fresh reader.

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>deck.gl + GeoArrow · COGP Demo</title>
+    <link rel="stylesheet" href="../../src/shared/base.css" />
+    <link rel="stylesheet" href="../../src/shared/panel.css" />
+    <style>
+      .attribution {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        z-index: 1;
+        padding: 2px 6px;
+        font-size: 11px;
+        background: rgba(255, 255, 255, 0.8);
+      }
+      .attribution a {
+        color: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <aside id="panel" class="panel">
+      <header class="panel-header">
+        <div>
+          <h1>deck.gl + GeoArrow</h1>
+          <p class="subtitle">COGP read straight into deck.gl, no base map library</p>
+        </div>
+        <button
+          id="panel-toggle"
+          class="icon-button"
+          type="button"
+          aria-controls="panel-body"
+          aria-expanded="true"
+          aria-label="Collapse panel"
+        >
+          <span aria-hidden="true">▾</span>
+        </button>
+      </header>
+      <div id="panel-body" class="panel-body">
+        <p class="hint">
+          Each view is read from one Parquet file with HTTP range requests,
+          encoded as GeoArrow in a worker with <code>toGeoArrow</code>, and
+          handed to deck.gl GeoArrow layers without GeoJSON or MVT.
+          <a href="../../">Other demos</a> ·
+          <a
+            href="https://github.com/Kanahiro/cloud-optimized-geoparquet"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Spec &amp; source</a
+          >
+        </p>
+
+        <section class="field">
+          <label for="preset">Dataset</label>
+          <select id="preset">
+            <option value="">Choose a sample…</option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet">
+              POIs (OSM)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet">
+              Road segments (Overture Maps)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet">
+              Buildings (Overture Maps)
+            </option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet">
+              Administrative boundaries
+            </option>
+          </select>
+        </section>
+
+        <section class="field">
+          <label for="url">Or a COGP file URL</label>
+          <div class="input-row">
+            <input
+              id="url"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="https://example.com/data.cogp.parquet"
+            />
+            <button id="load" type="button">Load</button>
+          </div>
+        </section>
+
+        <section class="options">
+          <label class="checkbox">
+            <input id="fetch-properties" type="checkbox" />
+            <span>
+              Fetch attributes
+              <small>Adds attribute columns to each read; hover a feature to see them.</small>
+            </span>
+          </label>
+          <button id="fly" class="secondary" type="button" disabled>Fit to data</button>
+        </section>
+
+        <p id="status" class="status" role="status">Choose a dataset to start.</p>
+
+        <dl id="stats" class="stats" hidden>
+          <dt>Level</dt>
+          <dd id="stat-level">–</dd>
+          <dt>In view</dt>
+          <dd id="stat-features">–</dd>
+          <dt>GeoArrow</dt>
+          <dd id="stat-arrow">–</dd>
+          <dt>Fetched</dt>
+          <dd id="stat-fetched">–</dd>
+          <dt>Read time</dt>
+          <dd id="stat-time">–</dd>
+        </dl>
+
+        <details class="metadata">
+          <summary>GeoParquet metadata</summary>
+          <pre id="meta"></pre>
+        </details>
+      </div>
+    </aside>
+    <div id="map"></div>
+    <div class="attribution">
+      &copy;
+      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer"
+        >OpenStreetMap</a
+      >
+      contributors
+    </div>
+    <script type="module" src="../../src/pages/deckgl-geoarrow/main.ts"></script>
+  </body>
+</html>
