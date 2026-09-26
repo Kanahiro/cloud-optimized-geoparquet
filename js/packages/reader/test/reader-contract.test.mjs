@@ -7,7 +7,7 @@ import { decodeGeometry } from '../dist/geometry.js';
 import { readRecord, readRecords } from './helpers.mjs';
 
 async function openFixture(name) {
-  const bytes = await readFile(new URL(`../../test-data/${name}.parquet`, import.meta.url));
+  const bytes = await readFile(new URL(`../../../../test-data/${name}.parquet`, import.meta.url));
   const requests = [];
   const file = {
     byteLength: bytes.length,

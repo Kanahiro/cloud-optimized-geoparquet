@@ -35,9 +35,9 @@ jobs:
       - name: Check version
         run: |
           tag="${{ github.event.release.tag_name || inputs.tag }}"
-          manifest=$(node -p "require('./cogp-js/package.json').version")
+          manifest=$(node -p "require('./js/packages/reader/package.json').version")
           if [ "${tag#cogp-js-v}" != "$manifest" ]; then
-            echo "::error::tag $tag does not match cogp-js/package.json version $manifest"
+            echo "::error::tag $tag does not match js/packages/reader/package.json version $manifest"
             exit 1
           fi
       # Trusted Publishing needs npm 11.5.1 or later.
@@ -47,4 +47,4 @@ jobs:
       # Trusted Publishing: npm exchanges this workflow's OIDC token for a
       # short-lived publish credential and attaches provenance automatically.
       - run: npm publish
-        working-directory: cogp-js
+        working-directory: js/packages/reader

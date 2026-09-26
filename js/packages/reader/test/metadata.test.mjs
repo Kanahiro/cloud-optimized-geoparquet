@@ -105,7 +105,7 @@ test('Line and Polygon metadata may omit overviews and level LoDs', () => {
   }
 });
 
-const specExample = JSON.parse(readFileSync(new URL('../../cogp-rs/tests/fixtures/metadata-overviews.json', import.meta.url), 'utf8'));
+const specExample = JSON.parse(readFileSync(new URL('../../../../cogp-rs/tests/fixtures/metadata-overviews.json', import.meta.url), 'utf8'));
 
 test('rendering extension selects a new LoD on the same prefix and shares LoDs across prefixes', () => {
   const metadata = parseLodMeta(JSON.stringify(specExample));

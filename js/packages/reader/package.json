@@ -6,7 +6,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kanahiro/cloud-optimized-geoparquet.git",
-    "directory": "cogp-js"
+    "directory": "js/packages/reader"
   },
   "homepage": "https://github.com/Kanahiro/cloud-optimized-geoparquet",
   "type": "module",

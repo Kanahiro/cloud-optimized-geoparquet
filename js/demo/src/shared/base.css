@@ -1,0 +1,27 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --accent: #3b5bdb;
+  --accent-hover: #3049b8;
+  --text: #1f2430;
+  --muted: #5f6675;
+  --border: #dde1e8;
+  --surface: #f5f7fa;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  color: var(--text);
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+}

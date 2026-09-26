@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>COGP Demo</title>
+    <link rel="stylesheet" href="./src/shared/base.css" />
+    <style>
+      main {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 48px 24px;
+        line-height: 1.5;
+      }
+      .subtitle {
+        color: var(--muted);
+      }
+      a {
+        color: var(--accent);
+      }
+      a:hover {
+        color: var(--accent-hover);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>COGP Demo</h1>
+      <p class="subtitle">
+        Cloud Optimized GeoParquet in the browser.
+        <a
+          href="https://github.com/Kanahiro/cloud-optimized-geoparquet"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Spec &amp; source</a
+        >
+      </p>
+      <ul>
+        <li>
+          <a href="./pages/viewer/">Viewer</a>: render a COGP file on MapLibre
+          with HTTP range requests and MVT encoding in a worker.
+        </li>
+      </ul>
+    </main>
+  </body>
+</html>

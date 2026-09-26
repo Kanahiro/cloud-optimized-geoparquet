@@ -1,9 +1,15 @@
 name: Deploy demo to GitHub Pages
 
-# The demo is part of cogp-js, so it deploys with `cogp-js-v<version>` releases.
+# The demo builds from main and deploys whenever the JS workspace changes, so
+# it can run ahead of the released @cogp/reader.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - js/**
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .github/workflows/deploy-demo.yml
   workflow_dispatch:
 
 permissions:
@@ -17,7 +23,6 @@ concurrency:
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'cogp-js-v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -31,7 +36,7 @@ jobs:
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: cogp-js/demo/dist
+          path: js/demo/dist
 
   deploy:
     needs: build
