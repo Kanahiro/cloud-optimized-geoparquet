@@ -111,8 +111,8 @@ const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer, source l
 
 `read()` returns every attribute plus the primary geometry by default; pass
 `columns` to fetch fewer. `toMvt` assumes longitude/latitude and is meant for
-a tile-sized `bbox`. See the [JavaScript reader README](./cogp-js/README.md)
-for the full API and the [demo](./cogp-js/demo) for rendering with MapLibre.
+a tile-sized `bbox`. See the [JavaScript reader README](./js/packages/reader/README.md)
+for the full API and the [demo](./js/demo) for rendering with MapLibre.
 
 ## Specification
 
@@ -124,7 +124,7 @@ This repository is the source of truth for the specification and its reference
 implementations:
 
 - [`cogp-rs`](./cogp-rs): Rust producer, validator, CLI, and reader library.
-- [`cogp-js`](./cogp-js): TypeScript reader and browser demo.
+- [`js`](./js): TypeScript packages ([`@cogp/reader`](./js/packages/reader)) and the browser demo ([`js/demo`](./js/demo)).
 
 The implementations remain independently publishable. The repository root owns
 shared dependency locks, CI, releases, and development commands so changes to the
@@ -139,7 +139,7 @@ separately, each with its own tag prefix:
 |---|---|---|
 | Specification | `spec-v<version>` | GitHub Releases |
 | `cogp-rs` | `cogp-rs-v<version>` | GitHub Releases (binaries), crates.io (`cogp`) |
-| `cogp-js` | `cogp-js-v<version>` | npm (`@cogp/reader`), GitHub Pages (demo) |
+| `@cogp/reader` (`js/packages/reader`) | `cogp-js-v<version>` | npm (`@cogp/reader`), GitHub Pages (demo) |
 
 Each implementation README states the specification version it implements.
 To release an implementation, bump the version in its `Cargo.toml` or

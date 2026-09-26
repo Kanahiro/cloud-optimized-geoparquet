@@ -8,7 +8,29 @@ importers:
 
   .: {}
 
-  cogp-js:
+  js/demo:
+    dependencies:
+      '@cogp/reader':
+        specifier: workspace:*
+        version: link:../packages/reader
+      '@hpcc-js/wasm-zstd':
+        specifier: 1.15.0
+        version: 1.15.0
+      maplibre-gl:
+        specifier: ^6.11.2
+        version: 6.11.2
+    devDependencies:
+      '@types/node':
+        specifier: ^24.13.6
+        version: 24.13.6
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
+      vite:
+        specifier: ^5.4.0
+        version: 5.4.21(@types/node@24.13.6)
+
+  js/packages/reader:
     dependencies:
       hyparquet-compressors:
         specifier: ^1.1.1
@@ -26,25 +48,6 @@ importers:
       typescript:
         specifier: ^5.6.0
         version: 5.9.3
-
-  cogp-js/demo:
-    dependencies:
-      '@cogp/reader':
-        specifier: workspace:*
-        version: link:..
-      '@hpcc-js/wasm-zstd':
-        specifier: 1.15.0
-        version: 1.15.0
-      maplibre-gl:
-        specifier: ^6.11.2
-        version: 6.11.2
-    devDependencies:
-      typescript:
-        specifier: ^5.6.0
-        version: 5.9.3
-      vite:
-        specifier: ^5.4.0
-        version: 5.4.21
 
 packages:
 
@@ -368,6 +371,9 @@ packages:
   '@types/geojson@7946.0.16':
     resolution: {integrity: sha512-6C8nqWur3j98U6+lXDfTUWIfgvZU+EumvpHKcYjujKH7woYyLj2sUmff0tRhrqM7BohUw7Pz3ZB1jj2gW9Fvmg==}
 
+  '@types/node@24.13.6':
+    resolution: {integrity: sha512-SGrw/h3KPFshy3OE6ZL53LMBG5vGQQ8/gIpiqz/kRZhPJ7HgwCEs8LBuNtWLa8dvGZVpSF7+Bf+c11HUrCb/yg==}
+
   bidi-js@1.1.0:
     resolution: {integrity: sha512-fX1Onk0tdVPC7obPWB5EbJ1z7NVhLq4m2xZLq2YXBkxzMXIGRpNMU88n0EPgWseKl12J7zXs7qrDxPK4sRs2fg==}
 
@@ -470,6 +476,9 @@ packages:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
     engines: {node: '>=14.17'}
     hasBin: true
+
+  undici-types@7.18.2:
+    resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
 
   vite@5.4.21:
     resolution: {integrity: sha512-o5a9xKjbtuhY6Bi5S3+HvbRERmouabWbyUcpXXUA1u+GNUKoROi9byOJ8M0nHbHYHkYICiMlqxkg1KkYmm25Sw==}
@@ -697,6 +706,10 @@ snapshots:
 
   '@types/geojson@7946.0.16': {}
 
+  '@types/node@24.13.6':
+    dependencies:
+      undici-types: 7.18.2
+
   bidi-js@1.1.0:
     dependencies:
       require-from-string: 2.0.2
@@ -844,10 +857,13 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  vite@5.4.21:
+  undici-types@7.18.2: {}
+
+  vite@5.4.21(@types/node@24.13.6):
     dependencies:
       esbuild: 0.21.5
       postcss: 8.5.25
       rollup: 4.62.3
     optionalDependencies:
+      '@types/node': 24.13.6
       fsevents: 2.3.3

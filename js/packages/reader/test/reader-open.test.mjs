@@ -44,7 +44,7 @@ test('package exposes the reader and stable row identity as runtime APIs', async
 
 test('HTTP readRow can read primary WKB with overview protection enabled', async () => {
   const {readFile} = await import('node:fs/promises');
-  const bytes = await readFile(new URL('../../test-data/quantized-geoarrow-polygon.parquet', import.meta.url));
+  const bytes = await readFile(new URL('../../../../test-data/quantized-geoarrow-polygon.parquet', import.meta.url));
   const file = {byteLength:bytes.length,slice(a,b=bytes.length){return bytes.buffer.slice(bytes.byteOffset+a,bytes.byteOffset+b);}};
   const fetch = async (_url, init) => {
     if (init?.method === 'HEAD') return new Response(null,{headers:{'Content-Length':String(bytes.length)}});

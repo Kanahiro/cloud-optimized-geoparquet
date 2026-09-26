@@ -6,9 +6,9 @@ import {
   openDataset as openCogpDataset,
   readTile,
   type OpenResult,
-} from './dataset-service';
-import { MVT_LAYER_NAME, type NetworkStats } from './cogp-types';
-import { latitudeResolution } from './tiles';
+} from '../../shared/dataset-service';
+import { MVT_LAYER_NAME, type NetworkStats } from '../../shared/cogp-types';
+import { latitudeResolution } from '../../shared/tiles';
 
 // MapLibre v6 derives its worker URL from import.meta.url, which breaks once
 // Vite bundles the library; hand it the Vite-built worker instead.

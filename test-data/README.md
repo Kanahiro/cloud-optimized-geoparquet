@@ -51,5 +51,5 @@ coordinates test the decoding transform and do not match the primary geometry.
 Regenerate them with pyarrow installed:
 
 ```sh
-python3 cogp-js/test/fixtures/generate-quantized-geoarrow.py
+python3 js/packages/reader/test/fixtures/generate-quantized-geoarrow.py
 ```

@@ -6,7 +6,7 @@ import { CogpReader } from '../dist/index.js';
 import { ROW, readRecords } from './helpers.mjs';
 
 async function gatedReader(pageIndexCache = false) {
-  const bytes = await readFile(new URL('../../test-data/shared.parquet', import.meta.url));
+  const bytes = await readFile(new URL('../../../../test-data/shared.parquet', import.meta.url));
   let armed = false;
   const pending = [];
   const reader = await CogpReader.fromAsyncBuffer({

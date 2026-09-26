@@ -17,7 +17,7 @@ const transform = (v, scale, shift = 0) => typeof v[0] === 'number'
   ? [(v[0] + shift) * scale + 10, v[1] * scale + 20]
   : v.map(child => transform(child, scale, shift));
 async function open(name) {
-  const data = await readFile(new URL(`../../test-data/${name}.parquet`, import.meta.url));
+  const data = await readFile(new URL(`../../../../test-data/${name}.parquet`, import.meta.url));
   const requests = [];
   const reader = await CogpReader.fromAsyncBuffer({ byteLength: data.length, slice(a,b=data.length) {
     requests.push([a,b]);

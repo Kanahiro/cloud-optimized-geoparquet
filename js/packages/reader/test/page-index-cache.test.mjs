@@ -78,7 +78,7 @@ test('last cancellation aborts sources, failed loads retry, and retention respec
 });
 test('reader cache preserves attributes, geometry, projection, LoD and caller ownership',async()=>{
  for(const name of ['attribute-encodings','quantized-geoarrow-multipolygon','quantized-geoarrow-linestring','shared']){
-  const b=await readFile(new URL(`../../test-data/${name}.parquet`,import.meta.url));
+  const b=await readFile(new URL(`../../../../test-data/${name}.parquet`,import.meta.url));
   const file={byteLength:b.length,slice:(a,e=b.length)=>b.buffer.slice(b.byteOffset+a,b.byteOffset+e)};
   const plain=await CogpReader.fromAsyncBuffer(file,name,{pageIndexCache:false}),cached=await CogpReader.fromAsyncBuffer(file,name,{pageIndexCache:{}});
   for(const useOverview of [false,true])for(const maxLevel of [cached.levels.length-1,0]){
