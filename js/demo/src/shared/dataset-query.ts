@@ -1,5 +1,3 @@
-import { datasetName } from './format';
-
 /** Query parameter holding the COGP file URL, so a link reopens the same dataset. */
 const DATASET_PARAM = 'url';
 
@@ -14,9 +12,8 @@ export function writeDatasetQuery(url: string): void {
   history.replaceState(null, '', next);
 }
 
-/** Show `url` in a preset select, adding an option for a file that is not a preset. */
-export function selectPreset(select: HTMLSelectElement, url: string, addMissing = false): void {
+/** Select the preset for `url`, or the placeholder when it is not a preset. */
+export function selectPreset(select: HTMLSelectElement, url: string): void {
   const known = Array.from(select.options).some((option) => option.value === url);
-  if (!known && addMissing) select.add(new Option(datasetName(url), url));
-  select.value = known || addMissing ? url : '';
+  select.value = known ? url : '';
 }
