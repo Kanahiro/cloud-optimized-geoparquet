@@ -1,36 +1,53 @@
 /// <reference lib="webworker" />
-import { CogpReader } from 'cogp';
-import type { Feature, Geometry } from 'geojson';
+import { CogpReader, toMvt } from 'cogp';
+import { Zstd } from '@hpcc-js/wasm-zstd';
 
-import type {
-  OpenResult,
-  ViewportBbox,
-  ViewportResult,
-  WorkerEnvelope,
-  WorkerResponse,
+import {
+  MVT_LAYER_NAME,
+  type NetworkStats,
+  type OpenResult,
+  type TileResult,
+  type WorkerMessage,
+  type WorkerResponse,
 } from './cogp-types';
+import { tileBounds, tileResolution } from './tiles';
 
-const VIEWPORT_MAX_ROWS = 50_000;
-const VIEWPORT_MAX_GEOMETRY_BYTES = 20_000_000;
+
 
 interface ActiveDataset {
   url: string;
   reader: CogpReader;
   dataBbox: [[number, number], [number, number]] | null;
-  bboxStructTop: string | null;
-  servedViewports: number;
+  propertyColumns: string[];
 }
 
 let active: ActiveDataset | null = null;
-let latestUrl = '';
+// Counts what actually crosses the network; reader caches never reach fetch.
+let network: NetworkStats = { requests: 0, bytes: 0 };
 
-async function openDataset(url: string): Promise<OpenResult> {
-  latestUrl = url;
-  const reader = await CogpReader.open(url);
-  const crs = reader.geo.columns[reader.primaryGeometryColumn]?.crs as { type?: string } | null | undefined;
-  if (crs !== undefined && (!crs || crs.type !== 'GeographicCRS')) {
-    throw new Error('This demo requires longitude/latitude geometry in degrees.');
+const countingFetch: typeof fetch = async (input, init) => {
+  const response = await fetch(input, init);
+  if (new Headers(init?.headers).has('Range')) {
+    network.requests += 1;
+    network.bytes += Number(response.headers.get('Content-Length') ?? 0);
   }
+  return response;
+};
+let latestUrl = '';
+const zstdDecoder = Zstd.load();
+const requestControllers = new Map<number, AbortController>();
+
+async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult> {
+  latestUrl = url;
+  const zstd = await zstdDecoder;
+  signal.throwIfAborted();
+  network = { requests: 0, bytes: 0 };
+  const reader = await CogpReader.open(url, {
+    fetch: countingFetch,
+    compressors: { ZSTD: (input) => zstd.decompress(input) },
+    signal,
+  });
+  signal.throwIfAborted();
   if (latestUrl !== url) throw new Error('Dataset open was superseded');
 
   const dataBbox = computeDataBbox(reader);
@@ -38,54 +55,58 @@ async function openDataset(url: string): Promise<OpenResult> {
     url,
     reader,
     dataBbox,
-    bboxStructTop: bboxStructTopColumn(reader),
-    servedViewports: 0,
+    propertyColumns: propertyColumnNames(reader),
   };
 
-  return { geo: reader.geo, numRowGroups: reader.numRowGroups, dataBbox };
+  return { geo: reader.geo, numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
 }
 
-async function readViewport(
+async function readTile(
   url: string,
-  bbox: ViewportBbox,
-  targetResolution: number,
-): Promise<ViewportResult> {
+  z: number,
+  x: number,
+  y: number,
+  fetchProperties: boolean,
+  signal: AbortSignal,
+): Promise<TileResult> {
   const ds = active;
   if (!ds || ds.url !== url) {
-    return { data: { type: 'FeatureCollection', features: [] }, status: '' };
+    throw new Error('Dataset is no longer active');
   }
+  const targetResolution = tileResolution(z, y);
   const geomColumn = ds.reader.primaryGeometryColumn;
   const maxLevel = ds.reader.selectLevel(targetResolution);
-  const rows = await ds.reader.readRows({
-    bbox,
+  const propertyColumns = fetchProperties ? ds.propertyColumns : [];
+  const startedAt = performance.now();
+  const batch = await ds.reader.read({
+    bbox: tileBounds(z, x, y),
+    columns: [geomColumn, ...propertyColumns],
     maxLevel,
-    maxRows: VIEWPORT_MAX_ROWS,
-    maxGeometryBytes: VIEWPORT_MAX_GEOMETRY_BYTES,
+    // Quantized overviews go straight to toMvt without a GeoJSON tree.
+    useOverview: true,
+    signal,
   });
-
-  const features: Feature[] = [];
-  const skip = new Set<string>([geomColumn]);
-  if (ds.bboxStructTop) skip.add(ds.bboxStructTop);
-  for (const row of rows) {
-    const geometry = row[geomColumn] as Geometry | null | undefined;
-    if (!geometry) continue;
-    const properties: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(row)) {
-      if (skip.has(key)) continue;
-      properties[key] = coerceForGeoJson(value);
-    }
-    features.push({ type: 'Feature', geometry, properties });
-  }
-  ds.servedViewports += 1;
-  return {
-    data: { type: 'FeatureCollection', features },
-    status: `Loaded ${features.length} features at ${formatResolution(targetResolution)}/px (level <= ${maxLevel}). Updates: ${ds.servedViewports}.`,
-  };
+  signal.throwIfAborted();
+  // Attribute lifetime follows MapLibre's tile cache; clicks need no I/O.
+  const data = toMvt(
+    { geometry: batch.geometry!, ids: batch.rowIndex, properties: batch.columns },
+    { z, x, y, layer: MVT_LAYER_NAME, signal },
+  );
+  return { data, ms: performance.now() - startedAt, network: { ...network } };
 }
 
-function bboxStructTopColumn(reader: CogpReader): string | null {
-  const path = reader.geo.columns[reader.primaryGeometryColumn]?.covering?.bbox?.xmin;
-  return path?.[0] ?? null;
+function propertyColumnNames(reader: CogpReader): string[] {
+  const excluded = new Set<string>(Object.keys(reader.geo.columns));
+  if (reader.geo.lod.overviews) excluded.add(reader.geo.lod.overviews.column);
+  for (const column of Object.values(reader.geo.columns)) {
+    const covering = column.covering?.bbox;
+    for (const path of covering
+      ? [covering.xmin, covering.ymin, covering.xmax, covering.ymax]
+      : []) {
+      if (path[0]) excluded.add(path[0]);
+    }
+  }
+  return reader.columnNames.filter((name) => !excluded.has(name) && !name.startsWith('__'));
 }
 
 function computeDataBbox(reader: CogpReader): [[number, number], [number, number]] | null {
@@ -108,35 +129,35 @@ function computeDataBbox(reader: CogpReader): [[number, number], [number, number
   ];
 }
 
-// MapLibre serializes GeoJSON properties through JSON.stringify when shipping
-// data to its worker, which can't handle bigint or Uint8Array. Coerce both
-// here so the GeoJSON source accepts the FeatureCollection.
-function coerceForGeoJson(value: unknown): unknown {
-  if (typeof value === 'bigint') {
-    const n = Number(value);
-    return Number.isSafeInteger(n) ? n : value.toString();
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
+  if ('type' in e.data) {
+    requestControllers.get(e.data.id)?.abort();
+    return;
   }
-  if (value instanceof Uint8Array) return `<bytes:${value.byteLength}>`;
-  return value;
-}
-
-function formatResolution(resolution: number): string {
-  return `${resolution.toPrecision(3)}°`;
-}
-
-self.onmessage = async (e: MessageEvent<WorkerEnvelope>) => {
   const { id, payload } = e.data;
+  const controller = new AbortController();
+  requestControllers.set(id, controller);
   try {
-    let result: OpenResult | ViewportResult;
     if (payload.type === 'open') {
-      result = await openDataset(payload.url);
-    } else {
-      result = await readViewport(payload.url, payload.bbox, payload.targetResolution);
+      const result: OpenResult = await openDataset(payload.url, controller.signal);
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response);
+    } else if (payload.type === 'readTile') {
+      const result: TileResult = await readTile(
+        payload.url,
+        payload.z,
+        payload.x,
+        payload.y,
+        payload.fetchProperties,
+        controller.signal,
+      );
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response, { transfer: [result.data] });
     }
-    const response: WorkerResponse = { id, ok: true, result };
-    self.postMessage(response);
   } catch (err) {
     const response: WorkerResponse = { id, ok: false, error: (err as Error).message };
     self.postMessage(response);
+  } finally {
+    requestControllers.delete(id);
   }
 };
