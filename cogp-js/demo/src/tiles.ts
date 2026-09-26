@@ -1,4 +1,4 @@
-import { MVT_BUFFER, MVT_EXTENT } from 'cogp';
+import { MVT_BUFFER, MVT_EXTENT } from '@cogp/reader';
 
 import type { ViewportBbox } from './cogp-types';
 

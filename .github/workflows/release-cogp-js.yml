@@ -43,7 +43,7 @@ jobs:
       # Trusted Publishing needs npm 11.5.1 or later.
       - run: npm install -g npm@latest
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter cogp test
+      - run: pnpm --filter @cogp/reader test
       # Trusted Publishing: npm exchanges this workflow's OIDC token for a
       # short-lived publish credential and attaches provenance automatically.
       - run: npm publish

@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@hpcc-js/wasm-zstd": "1.15.0",
-    "cogp": "workspace:*",
+    "@cogp/reader": "workspace:*",
     "maplibre-gl": "^6.11.2"
   },
   "devDependencies": {

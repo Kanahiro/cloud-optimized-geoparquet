@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { CogpReader, toMvt } from 'cogp';
+import { CogpReader, toMvt } from '@cogp/reader';
 import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import {

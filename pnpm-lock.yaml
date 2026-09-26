@@ -29,12 +29,12 @@ importers:
 
   cogp-js/demo:
     dependencies:
+      '@cogp/reader':
+        specifier: workspace:*
+        version: link:..
       '@hpcc-js/wasm-zstd':
         specifier: 1.15.0
         version: 1.15.0
-      cogp:
-        specifier: workspace:*
-        version: link:..
       maplibre-gl:
         specifier: ^6.11.2
         version: 6.11.2

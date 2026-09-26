@@ -5,7 +5,7 @@
   "packageManager": "pnpm@11.18.0",
   "scripts": {
     "build": "pnpm -r --if-present run build",
-    "typecheck": "pnpm --filter cogp typecheck",
+    "typecheck": "pnpm --filter @cogp/reader typecheck",
     "test:rust": "cargo test --workspace --all-features",
     "lint:rust": "cargo clippy --workspace --all-features --all-targets -- -D warnings"
   }
