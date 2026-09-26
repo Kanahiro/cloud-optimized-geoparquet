@@ -270,7 +270,6 @@ const maxLevelSelect = document.getElementById('max-level') as HTMLSelectElement
 const allOption = maxLevelSelect.options[0]!;
 const autoOption = maxLevelSelect.options[1]!;
 const budgetValue = document.getElementById('budget-value') as HTMLOutputElement;
-const flyBtn = document.getElementById('fly') as HTMLButtonElement;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const panel = document.getElementById('panel') as HTMLElement;
 const panelToggle = document.getElementById('panel-toggle') as HTMLButtonElement;
@@ -334,8 +333,6 @@ function renderLevelOptions(levels: OpenResult['geo']['lod']['levels']): void {
   const kept = previous === ALL_LEVELS || previous === AUTO_LEVEL || Number(previous) < levels.length;
   maxLevelSelect.value = kept ? previous : ALL_LEVELS;
 }
-
-flyBtn.addEventListener('click', () => mapView.fitBounds(START_BOUNDS, 1000));
 
 async function loadDataset(url: string): Promise<void> {
   if (!url) {
