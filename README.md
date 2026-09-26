@@ -62,17 +62,7 @@ https://github.com/user-attachments/assets/0b3e666a-5663-4f10-97f6-887442242d14
 This walks through converting your own vector data into COGP and reading it
 from JavaScript.
 
-### 1. Get the tools
-
-Download a `cogp` binary for your platform from the
-[GitHub releases](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases),
-and install the JavaScript reader from npm:
-
-```sh
-npm install @cogp/reader
-```
-
-### 2. Convert your data to GeoParquet
+### 1. Convert your data to GeoParquet
 
 `cogp convert` takes GeoParquet 1.x with WKB geometries. Any GDAL-readable
 source (Shapefile, GeoJSON, GeoPackage, ...) can be converted with GDAL 3.9 or
@@ -83,7 +73,10 @@ reader assumes longitude/latitude, so reproject to EPSG:4326 when making tiles:
 ogr2ogr -f Parquet -t_srs EPSG:4326 my-data.parquet my-data.shp
 ```
 
-### 3. Convert GeoParquet to COGP
+### 2. Convert GeoParquet to COGP
+
+Download a prebuilt `cogp` binary for your platform from the
+[GitHub releases](https://github.com/Kanahiro/cloud-optimized-geoparquet/releases), then:
 
 ```sh
 cogp convert my-data.parquet my-data.cogp.parquet
@@ -94,7 +87,13 @@ The defaults target a Web Mercator z0–z16 pyramid. See the
 [CLI reference](./cogp-rs/README.md#convert) for tuning levels, point
 thinning, and row group size.
 
-### 4. Read it from JavaScript
+### 3. Read it from JavaScript
+
+Install the reader from npm:
+
+```sh
+npm install @cogp/reader
+```
 
 Read the features in a bbox at a given resolution, then convert the batch to
 GeoJSON or encode it as a Mapbox Vector Tile:
