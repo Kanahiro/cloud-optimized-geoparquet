@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { coalescingAsyncBuffer } from '../dist/coalescing-buffer.js';
+import { coalescingAsyncBuffer, protectedAsyncBuffer } from '../dist/coalescing-buffer.js';
 
 function sourceFixture(size = 256) {
   const bytes = Uint8Array.from({ length: size }, (_, i) => i & 0xff);
@@ -53,4 +53,76 @@ test('supports an omitted end and rejects invalid bounds', async () => {
   assert.deepEqual([...new Uint8Array(tail)], [28, 29, 30, 31]);
   await assert.rejects(file.slice(-1, 2), /outside buffer/);
   await assert.rejects(file.slice(0, 33), /outside buffer/);
+});
+
+test('passes through an exact run without copying its buffer', async () => {
+  const sourceBuffer = new ArrayBuffer(10);
+  const file = coalescingAsyncBuffer({
+    byteLength: 10,
+    slice() {
+      return sourceBuffer;
+    },
+  });
+
+  assert.equal(await file.slice(0, 10), sourceBuffer);
+});
+
+test('never requests or merges across protected ranges', async () => {
+  const { source, calls } = sourceFixture();
+  const file = protectedAsyncBuffer(coalescingAsyncBuffer(source), [{ start: 20, end: 30 }]);
+
+  await Promise.all([file.slice(10, 20), file.slice(30, 40)]);
+  assert.deepEqual(calls, [[10, 20], [30, 40]]);
+  await assert.rejects(file.slice(19, 21), /protected range/);
+  assert.deepEqual(calls, [[10, 20], [30, 40]]);
+});
+
+test('keeps a coalesced fetch alive until every slice is aborted', async () => {
+  const bytes = Uint8Array.from({ length: 64 }, (_, i) => i);
+  let complete;
+  let sourceAborted = false;
+  const source = {
+    byteLength: bytes.byteLength,
+    slice(start, end, signal) {
+      signal.addEventListener('abort', () => { sourceAborted = true; }, { once: true });
+      return new Promise(resolve => {
+        complete = () => resolve(bytes.slice(start, end).buffer);
+      });
+    },
+  };
+  const file = coalescingAsyncBuffer(source);
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const first = file.slice(10, 20, firstController.signal);
+  const second = file.slice(20, 30, secondController.signal);
+  await Promise.resolve(); // Allow the coalesced source request to start.
+
+  firstController.abort();
+  await assert.rejects(first, error => error.name === 'AbortError');
+  assert.equal(sourceAborted, false);
+  complete();
+  assert.deepEqual([...new Uint8Array(await second)], [...Array(10)].map((_, i) => i + 20));
+});
+
+test('aborts a coalesced fetch when every slice is aborted', async () => {
+  let sourceAborted = false;
+  const source = {
+    byteLength: 64,
+    slice(_start, _end, signal) {
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          sourceAborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+  };
+  const file = coalescingAsyncBuffer(source);
+  const controller = new AbortController();
+  const read = file.slice(10, 20, controller.signal);
+  await Promise.resolve();
+
+  controller.abort();
+  await assert.rejects(read, error => error.name === 'AbortError');
+  assert.equal(sourceAborted, true);
 });

@@ -1,140 +1,48 @@
+import { throwIfAborted } from './abort.js';
+import { SharedLru } from './shared-lru.js';
 import type { AsyncBufferLike } from './coalescing-buffer.js';
 
 export interface RangeCacheOptions {
-  /** Maximum compressed bytes retained by one reader. Defaults to 64 MiB. */
+  /** Retained compressed data budget, excluding in-flight reads and returned copies. Default: 32 MiB. */
   maxBytes?: number;
 }
+interface Range { start: number; end: number; buffer: ArrayBuffer }
 
-interface CacheEntry {
-  start: number;
-  end: number;
-  bytes: number;
-  settled: boolean;
-  promise: Promise<ArrayBuffer>;
-}
-
-const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
-
-/**
- * Cache successful byte ranges for the lifetime of one AsyncBuffer.
- *
- * Entries are containment-aware: a cached range can satisfy any smaller
- * slice inside it. Promise values are inserted immediately so duplicate
- * in-flight reads share the same request. Settled entries follow LRU order;
- * in-flight entries may temporarily exceed the budget but are never evicted.
+/** Reader-local LRU of immutable byte ranges. Keep this outside the coalescer
+ * so stable page requests are cached even when neighboring requests are merged.
+ * Every caller gets its own copy; decoders cannot modify retained bytes.
  */
-export function rangeCachedAsyncBuffer(
-  source: AsyncBufferLike,
-  options: RangeCacheOptions = {},
-): AsyncBufferLike {
-  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
-    throw new Error(`maxBytes must be a non-negative safe integer, got ${maxBytes}`);
-  }
-
-  // Set insertion order is the LRU list: hits are removed and re-added.
-  const entries = new Set<CacheEntry>();
-  let cachedBytes = 0;
-
-  const remove = (entry: CacheEntry): void => {
-    if (!entries.delete(entry)) return;
-    cachedBytes -= entry.bytes;
-  };
-
-  const touch = (entry: CacheEntry): void => {
-    entries.delete(entry);
-    entries.add(entry);
-  };
-
-  const evict = (): void => {
-    if (cachedBytes <= maxBytes) return;
-    for (const entry of entries.values()) {
-      if (!entry.settled) continue;
-      remove(entry);
-      if (cachedBytes <= maxBytes) return;
-    }
-  };
-
-  const findContainer = (start: number, end: number): CacheEntry | undefined => {
-    let best: CacheEntry | undefined;
-    for (const entry of entries.values()) {
-      if (entry.start > start || end > entry.end) continue;
-      if (!best || entry.bytes < best.bytes) best = entry;
-    }
-    if (best) touch(best);
-    return best;
-  };
-
-  const fetchWithoutCaching = (start: number, end: number): Promise<ArrayBuffer> => {
-    try {
-      return Promise.resolve(source.slice(start, end));
-    } catch (error) {
-      return Promise.reject(error);
-    }
-  };
-
+export function cachedRangeBuffer(source: AsyncBufferLike, options: RangeCacheOptions | false = {}): AsyncBufferLike {
+  if (options === false) return source;
+  const maxBytes = options.maxBytes ?? 32 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('range cache maxBytes must be a non-negative safe integer');
+  if (maxBytes === 0) return source;
+  const cache = new SharedLru<Range>(maxBytes, 4096);
   return {
     byteLength: source.byteLength,
-    slice(start: number, end = source.byteLength): Promise<ArrayBuffer> {
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
-        return Promise.reject(new Error(`slice bounds must be safe integers, got [${start}, ${end})`));
+    async slice(start, end = source.byteLength, signal) {
+      throwIfAborted(signal);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > source.byteLength) {
+        throw new Error('invalid cached byte range');
       }
-      if (start < 0 || end < start || end > source.byteLength) {
-        return Promise.reject(
-          new Error(`slice [${start}, ${end}) is outside buffer length ${source.byteLength}`),
-        );
-      }
-      if (start === end) return Promise.resolve(new ArrayBuffer(0));
-
-      const container = findContainer(start, end);
-      if (container) {
-        return container.promise.then(buffer =>
-          buffer.slice(start - container.start, end - container.start),
-        );
-      }
-
-      const bytes = end - start;
-      if (maxBytes === 0 || bytes > maxBytes) return fetchWithoutCaching(start, end);
-
-      let fetched: Promise<ArrayBuffer>;
-      try {
-        fetched = Promise.resolve(source.slice(start, end));
-      } catch (error) {
-        return Promise.reject(error);
-      }
-
-      let entry!: CacheEntry;
-      const promise = fetched.then(buffer => {
-        if (buffer.byteLength < bytes) {
-          throw new Error(
-            `source returned ${buffer.byteLength} bytes for [${start}, ${end}), expected ${bytes}`,
-          );
-        }
-        entry.settled = true;
-        // A newly completed superset makes older contained entries redundant.
-        for (const other of entries.values()) {
-          if (
-            other !== entry &&
-            other.settled &&
-            start <= other.start &&
-            other.end <= end
-          ) {
-            remove(other);
+      if (start === end) return new ArrayBuffer(0);
+      const key = `${start}:${end}`;
+      let cached = cache.get(key);
+      if (!cached) {
+        for (const [candidateKey, { value }] of cache.entries) {
+          if (value.start <= start && end <= value.end) {
+            cached = cache.get(candidateKey);
+            break;
           }
         }
-        evict();
-        return buffer.byteLength === bytes ? buffer : buffer.slice(0, bytes);
-      }).catch(error => {
-        remove(entry);
-        throw error;
-      });
-      entry = { start, end, bytes, settled: false, promise };
-      entries.add(entry);
-      cachedBytes += bytes;
-      evict();
-
-      // Never expose the cached ArrayBuffer itself to mutable callers.
-      return promise.then(buffer => buffer.slice(0));
+      }
+      if (cached) return cached.buffer.slice(start - cached.start, end - cached.start);
+      const range = await cache.load(key, async controllerSignal => {
+        const buffer = await source.slice(start, end, controllerSignal);
+        if (buffer.byteLength !== end - start) throw new Error('short cached range read');
+        return { value: { start, end, buffer }, bytes: buffer.byteLength };
+      }, signal);
+      return range.buffer.slice(0);
     },
   };
 }
