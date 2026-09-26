@@ -1,91 +1,132 @@
-# cogp-js
+# COGP JavaScript reader
 
-TypeScript reader for the [Cloud Optimized GeoParquet Profile
-(COGP)](https://github.com/Kanahiro/cloud-optimized-geoparquet). It reads COGP
-metadata and fetches only the Parquet ranges needed for a requested geographic
-area and rendering resolution in primary geometry CRS units. Bbox reads use covering-column statistics to
-prune row groups, then lazily fetch Parquet PageIndexes to prune pages inside
-the surviving groups. Files without PageIndexes fall back safely to Row Group
-reads. Bbox predicates are used only for statistics-based pruning: returned rows
-are candidates and may lie outside the requested bbox. Callers apply geometry
-filtering or clipping when exact spatial results are needed. Covering data
-columns are not fetched implicitly for bbox queries; explicit `columns`
-projections can still request them.
-
-Remote reads coalesce overlapping or adjacent concurrent byte ranges by default.
-Gaps are never fetched just to combine requests. PageIndexes are prefetched in
-bounded 16-RowGroup planning windows. Page-pruned bbox decode batches run with
-concurrency 4 so adjacent RowGroups do not serialize their HTTP requests;
-unfiltered reads remain serial to bound memory. Disable coalescing when opening:
+Reads `geo.lod`, which a file must declare to be opened, and the optional
+[quantized rendering geometries](../SPEC.md#geometry-representation). Rendering
+resolutions are in the primary geometry CRS units, including degrees for geographic data.
 
 ```ts
-await CogpReader.open(url, { rangeCoalescing: false });
+import { CogpReader, toGeoJSON, toMvt } from 'cogp';
+
+const reader = await CogpReader.open(url);
+const level = reader.selectLevel(0.01); // degrees for CRS84
+const batch = await reader.read({
+  maxLevel: level,
+  bbox: [139, 35, 140, 36],
+  columns: ['geometry', 'name'],
+  useOverview: true, // quantized overview if declared, otherwise primary WKB
+});
+console.log(reader.geo); // includes lod.levels and optional rendering metadata
+batch.length; batch.rowIndex; batch.columns.name; // aligned per-row arrays
+const features = { geometry: batch.geometry!, ids: batch.rowIndex, properties: batch.columns };
+const geojson = toGeoJSON(features); // FeatureCollection of every row
+const tile = toMvt(features, { z: 10, x: 909, y: 403 });
+const detail = await reader.readRow(batch.rowIndex[0]!, { columns: ['id'] }); // a one-row batch
 ```
 
-`rangeCoalescing` is now a boolean; the `RangeCoalescingOptions` type and
-`maxGapBytes`, `maxExtraBytes`, and `maxRequestBytes` settings have been removed.
-Omit the option or use `true` to enable contiguous-range coalescing.
+`read()` returns a columnar `CogpBatch` and creates no per-row objects: `rowIndex`
+holds each result row's source row, `columns` holds the requested attributes as
+decoded by hyparquet (typed arrays where the Parquet type allows), and `geometry`
+holds every row's geometry in one `GeometryColumn`. That column uses the GeoArrow
+MultiPolygon layout for all geometry types: `geometryOffsets`, `polygonOffsets`
+and `ringOffsets` (each with a leading 0) index flat `x`/`y` arrays, `types` holds
+the per-row type (0 for null), and coordinates are `offset + scale * [x, y]`.
+With `useOverview: true` and a supported overview, `x`/`y` are the selected level's
+quantized `Int32Array`s; otherwise primary WKB is parsed into `Float64Array`s with
+scale `[1, 1]` and offset `[0, 0]` (Z is kept as `z`, M is dropped,
+GeometryCollection is rejected). `geometryColumnFromWkb` exposes the same parsing
+for other WKB, and other WKB columns are returned as bytes. Convert explicitly
+with `toGeoJSON({ geometry, ids, properties })`, which returns a FeatureCollection
+of every row (null geometries stay as `geometry: null`, property values as decoded),
+or encode a tile with `toMvt` from the same source and `{ z, x, y, layer, signal }`. `toMvt` reads
+the columns in place, assumes longitude/latitude input, projects to Web Mercator,
+clips to a 64-unit buffer around a 4096 extent (`MVT_BUFFER`, `MVT_EXTENT`),
+skips null or off-tile rows and writes properties as display strings.
 
-`CogpReader.open()` forces Fetch's cache mode to `no-store`, including footer
-and byte-range requests. Other standard Fetch options can be supplied through
-`requestInit`; the cache mode cannot be overridden.
+With `bbox`, `read` prunes row groups and pages within a cumulative prefix by
+primary covering statistics, then reads the (small) covering values of the
+remaining pages and keeps only rows whose covering intersects the bbox.
+Geometry and attribute pages are fetched for those rows alone: on tile-sized
+bboxes this cut transfer 2.5–3.5x at z14 and above compared with statistics
+alone, and removed over 99% of returned false positives, at the cost of one
+dependent covering read. This is bbox intersection, not exact geometry
+intersection; rows with missing or invalid bounds are kept. Missing bbox
+statistics retain candidate groups, and missing covering disables bbox pruning.
+The default projection is every attribute plus the primary geometry; other
+geometry columns, the overview column and covering are only read when named.
+With `useOverview: true` and `quantized_geoarrow` overviews, the requested geometry
+comes from the selected LoD in the column named by `geo.lod.overviews.column`, and
+primary WKB is excluded from the read. The overview column's physical schema is
+validated when the reader opens. Missing declared overview values are errors.
+Files that declare another encoding still open and keep level selection, but
+`hasOverviews` is `false` and `read({ useOverview: true })` throws; read them
+without `useOverview` to get primary WKB. Without overviews, `useOverview` falls
+back to primary WKB. `readRow` always reads the requested source columns,
+including primary WKB.
+Coarse reads are partial feature selections, not complete analytical results.
 
-Each reader keeps a containment-aware LRU of successful compressed ranges in
-memory. The default limit is 64 MiB; duplicate in-flight reads share one
-request, failed reads are retryable, and a cached larger range can satisfy a
-smaller slice. Configure or disable it when opening:
+Readers never build rows or decode geometry implicitly, and covering refinement
+always applies to bbox reads. Every run is planned concurrently (Page Indexes and covering values), which gives
+each run's selected rows before any geometry or attribute I/O. `maxRows` then keeps
+the first rows in source order, coarse levels first, so a finite cap can omit later
+matches and is not a spatially uniform sample; only the pages holding the kept rows
+are fetched, and all needed runs are fetched concurrently. Results are in source
+order; peak memory grows with the selected data. `signal` cancels requests.
 
-```ts
-await CogpReader.open(url, { rangeCache: { maxBytes: 32 * 1024 * 1024 } });
-await CogpReader.open(url, { rangeCache: false });
-```
+`rowIndex` identifies source rows for lazy property reads. `fromAsyncBuffer` supports custom transports. HTTP requests use no-store,
+with bounded in-memory caching. Concurrent ranges are merged only when they
+overlap or touch; gaps are never fetched just to combine requests. Overview reads reject any
+request intersecting primary WKB chunks, so WKB cannot be fetched by accident.
 
 ## Development
 
-Run commands from the repository root so the shared lockfile is used:
-
 ```sh
-pnpm install --frozen-lockfile
-pnpm --filter cogp typecheck
 pnpm --filter cogp build
-```
-
-Build the browser demo with:
-
-```sh
+pnpm --filter cogp test
 pnpm --filter cogp-demo build
+pnpm --filter cogp-demo dev
 ```
 
-The public entry point exports `CogpReader` and its associated configuration and
-metadata types. Metadata parsing, level-selection helpers, and cache construction
-remain internal. Read levels through `reader.geo.lod.levels`.
-Files must provide `geo.lod.levels`; there is no fallback to `geo.coarse_to_fine`.
-`CogpReader.fromAsyncBuffer(file)` accepts a custom byte source without a URL.
+The demo targets geographic longitude/latitude data, maps its screen resolution
+to degrees, renders MVT tiles with popup attributes, and displays clicked feature properties
+without additional requests. Attribute reads share the tile bbox/Page Index
+pruning and Page Index cache. Prefetching attributes can increase initial tile
+transfer compared with geometry-only rendering; files without page indexes may
+require full column chunks. Popup values are stored as display strings in MVT.
+The metadata panel displays the file's GeoParquet metadata directly.
 
-```ts
-const reader = await CogpReader.open(url);
-const rows = await reader.readRows({
-  maxLevel: reader.selectLevel(targetResolution), // primary geometry CRS units
-  bbox: [xmin, ymin, xmax, ymax],
-  columns: [reader.primaryGeometryColumn],
-  maxRows: 10_000,
-  maxGeometryBytes: 8 * 1024 * 1024,
-});
-```
+**Fetch attributes** is off by default, so tiles carry geometry only. Turning it
+on adds attribute columns to tile reads and shows them in a popup on click;
+switching reloads the map tiles while preserving the current view. The reader and
+its caches are retained; reload the dataset with **Load** for a fresh reader.
 
-`maxGeometryBytes` limits cumulative raw WKB bytes across returned geometry
-columns, not bytes per row or HTTP transfer size. Both caps count returned
-candidates, including spatial false positives; a finite cap can omit later
-candidates that intersect the bbox. A row exceeding the remaining
-budget stops the read before decoding that row. Both output caps are optional.
+The statistics panel shows the level selected at the map center (with its nominal
+resolution), the number of distinct features rendered in the view, the bytes and
+Range requests sent to the COGP file since it was opened (and their share of the
+file), and the median and 90th-percentile time to read and encode recent tiles.
+On narrow screens the panel collapses once a dataset loads.
 
-Readers validate all level boundaries against the footer before selecting a prefix.
-Missing or invalid extension metadata is rejected; legacy `cogp` metadata must be
-regenerated with the current converter. Bbox covering and PageIndexes are optional.
-Without covering, bbox queries decode primary WKB and filter its envelope.
-With covering but no usable statistics, bbox queries conservatively retain
-candidates. With a bbox and no explicit projection, covering top-level columns
-are omitted; other attributes (even one named `bbox`) remain available. Reads
-without a bbox retain the default all-column projection.
-The demo expects longitude/latitude coordinates and passes degrees per pixel.
-Display prefixes are partial selections, not complete analytical query results.
+Each reader uses a **64 MiB parsed Page Index cache by default**. Configure it with
+`CogpReader.open(url, { pageIndexCache: { maxBytes: 64 * 1024 * 1024 } })`, or disable
+retention with `{ pageIndexCache: false }`. The same options apply to `fromAsyncBuffer`.
+ColumnIndex and OffsetIndex results are shared across tiles, projections and LoDs.
+Concurrent requests share index fetching and parsing; cancelling one query does not
+cancel an index still needed by another. Failed loads are retried on the next request.
+A least-recently-used policy limits estimated retained parsed-index memory, not peak heap.
+
+Decoded geometry and attribute rows are not retained. Each query decodes the data pages
+it needs; the demo's completed MVT tiles retain their own geometry and attributes.
+
+A separate **32 MiB compressed byte-range cache** reuses exact or contained ranges
+across queries. Configure `rangeCache: { maxBytes: 32 * 1024 * 1024 }`, or disable
+it with `rangeCache: false` (also supported by `fromAsyncBuffer`). This LRU budget
+bounds retained bytes, excluding pending reads and decoder copies; it is additional
+to the parsed-index budget. Concurrent identical reads share a fetch, with independent
+cancellation. Failed or cancelled fetches are not retained. Data must remain immutable
+for the reader's lifetime; create a new reader after changing a file.
+Concurrent adjacent/overlapping Range requests can still be coalesced.
+
+Hyparquet is bundled under [vendor/hyparquet](vendor/hyparquet/README.md), with
+its license and upstream commit recorded. The package requires no Git dependency
+or install-time compilation. This snapshot supplies the page planning interfaces
+and INT32 decoding optimization used by the reader; upgrade the source and types
+together and run the reader and package smoke tests.
