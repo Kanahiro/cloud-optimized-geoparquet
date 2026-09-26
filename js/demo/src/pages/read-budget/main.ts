@@ -12,6 +12,7 @@ import {
   readBudget,
   type OpenResult,
 } from '../../shared/dataset-service';
+import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { attributeTooltip, createDeckMap, type Tooltip } from '../../shared/deck-map';
 import { datasetName, escapeHtml, formatBytes, formatDistance } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
@@ -261,13 +262,14 @@ function levelColors(count: number): [number, number, number][] {
   });
 }
 
+const urlInput = document.getElementById('url') as HTMLInputElement;
 const presetSelect = document.getElementById('preset') as HTMLSelectElement;
+const loadBtn = document.getElementById('load') as HTMLButtonElement;
 const budgetInput = document.getElementById('budget') as HTMLInputElement;
 const maxLevelSelect = document.getElementById('max-level') as HTMLSelectElement;
 const allOption = maxLevelSelect.options[0]!;
 const autoOption = maxLevelSelect.options[1]!;
 const budgetValue = document.getElementById('budget-value') as HTMLOutputElement;
-const flyBtn = document.getElementById('fly') as HTMLButtonElement;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const panel = document.getElementById('panel') as HTMLElement;
 const panelToggle = document.getElementById('panel-toggle') as HTMLButtonElement;
@@ -307,7 +309,16 @@ budgetInput.addEventListener('input', () => {
 
 maxLevelSelect.addEventListener('change', () => void readArea());
 
-presetSelect.addEventListener('change', () => void loadDataset(presetSelect.value));
+loadBtn.addEventListener('click', () => {
+  void loadDataset(urlInput.value.trim());
+});
+
+presetSelect.addEventListener('change', () => {
+  const url = presetSelect.value;
+  if (!url) return;
+  urlInput.value = url;
+  void loadDataset(url);
+});
 
 /** One option per level of the dataset, after Unlimited and Auto; a fixed choice is kept when it still exists. */
 function renderLevelOptions(levels: OpenResult['geo']['lod']['levels']): void {
@@ -323,9 +334,12 @@ function renderLevelOptions(levels: OpenResult['geo']['lod']['levels']): void {
   maxLevelSelect.value = kept ? previous : ALL_LEVELS;
 }
 
-flyBtn.addEventListener('click', () => mapView.fitBounds(START_BOUNDS, 1000));
-
 async function loadDataset(url: string): Promise<void> {
+  if (!url) {
+    setStatus('Enter a URL first.');
+    return;
+  }
+  loadBtn.disabled = true;
   setStatus(`Opening ${datasetName(url)}…`);
   datasetLoadController?.abort();
   readController?.abort();
@@ -342,6 +356,7 @@ async function loadDataset(url: string): Promise<void> {
       colors: levelColors(geo.lod.levels.length),
       revision: ++datasetRevision,
     };
+    writeDatasetQuery(url);
     setDataLayer(null);
     renderLevelOptions(geo.lod.levels);
     statsEl.hidden = false;
@@ -359,6 +374,7 @@ async function loadDataset(url: string): Promise<void> {
     setDataLayer(null);
   } finally {
     if (datasetLoadController === controller) datasetLoadController = null;
+    if (latestUrl === url) loadBtn.disabled = false;
   }
 }
 
@@ -370,4 +386,8 @@ showBudget();
 // Keep a shared view from the URL; otherwise frame the area in central Tokyo.
 if (!location.hash) mapView.fitBounds(START_BOUNDS);
 setDataLayer(null);
-void loadDataset(presetSelect.value);
+// Reopen the dataset of a shared link; otherwise start with the selected sample.
+const initialUrl = datasetFromQuery() ?? presetSelect.value;
+urlInput.value = initialUrl;
+selectPreset(presetSelect, initialUrl);
+void loadDataset(initialUrl);

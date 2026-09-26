@@ -143,6 +143,7 @@
         <section class="field">
           <label for="preset">Dataset</label>
           <select id="preset">
+            <option value="">Choose a sample…</option>
             <option value="https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet" selected>
               Buildings (Overture Maps)
             </option>
@@ -156,6 +157,21 @@
               Administrative boundaries
             </option>
           </select>
+        </section>
+
+        <section class="field">
+          <label for="url">Or a COGP file URL</label>
+          <div class="input-row">
+            <input
+              id="url"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="https://example.com/data.cogp.parquet"
+            />
+            <button id="load" type="button">Load</button>
+          </div>
         </section>
 
         <section class="field">
@@ -176,10 +192,6 @@
             <span>100</span>
             <span>1,000,000</span>
           </div>
-        </section>
-
-        <section class="options">
-          <button id="fly" class="secondary" type="button">Back to Tokyo</button>
         </section>
 
         <p id="status" class="status" role="status">Opening dataset…</p>

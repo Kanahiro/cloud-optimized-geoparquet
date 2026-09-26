@@ -8,6 +8,7 @@ import {
   type OpenResult,
 } from '../../shared/dataset-service';
 import { MVT_LAYER_NAME, type NetworkStats } from '../../shared/cogp-types';
+import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
 
@@ -92,25 +93,62 @@ map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
 const COGP_INTERACTIVE_LAYERS = ['cogp-fill', 'cogp-line', 'cogp-point'];
 
-map.on('click', (e) => {
-  const features = map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS });
-  const feature = features[0];
+function featureAt(e: maplibregl.MapMouseEvent): maplibregl.MapGeoJSONFeature | undefined {
+  return map.queryRenderedFeatures(e.point, { layers: COGP_INTERACTIVE_LAYERS })[0];
+}
+
+/** Preview the attributes of the feature under the pointer, unless a popup is pinned. */
+function previewPropertyPopup(e: maplibregl.MapMouseEvent): void {
+  if (propertyPopupPinned) return;
+  const feature = featureAt(e);
+  if (!feature) {
+    hidePropertyPopup();
+    return;
+  }
+  const html = renderPropertiesHtml(feature.properties);
+  if (propertyPopup) {
+    propertyPopup.setLngLat(e.lngLat).setHTML(html);
+    return;
+  }
+  propertyPopup = new maplibregl.Popup({ maxWidth: '320px', closeButton: false, closeOnClick: false })
+    .setLngLat(e.lngLat)
+    .setHTML(html)
+    .addTo(map);
+}
+
+/** Pin the popup on click, so a long attribute list can be scrolled; clicking elsewhere closes it. */
+function pinPropertyPopup(e: maplibregl.MapMouseEvent): void {
+  hidePropertyPopup();
+  const feature = featureAt(e);
   if (!feature) return;
-  propertyPopup?.remove();
-  propertyPopup = new maplibregl.Popup({ maxWidth: '320px' })
+  const popup = new maplibregl.Popup({ maxWidth: '320px', closeOnClick: false })
     .setLngLat(e.lngLat)
     .setHTML(renderPropertiesHtml(feature.properties))
     .addTo(map);
-});
-
-for (const layerId of COGP_INTERACTIVE_LAYERS) {
-  map.on('mouseenter', layerId, () => {
-    map.getCanvas().style.cursor = 'pointer';
+  popup.on('close', () => {
+    if (propertyPopup !== popup) return;
+    propertyPopup = null;
+    propertyPopupPinned = false;
   });
-  map.on('mouseleave', layerId, () => {
-    map.getCanvas().style.cursor = '';
-  });
+  propertyPopup = popup;
+  propertyPopupPinned = true;
 }
+
+function hidePropertyPopup(): void {
+  const popup = propertyPopup;
+  propertyPopup = null;
+  propertyPopupPinned = false;
+  popup?.remove();
+}
+
+function hidePreviewPropertyPopup(): void {
+  if (!propertyPopupPinned) hidePropertyPopup();
+}
+
+map.on('mousemove', previewPropertyPopup);
+map.on('click', pinPropertyPopup);
+map.on('mouseout', hidePreviewPropertyPopup);
+map.on('dragstart', hidePreviewPropertyPopup);
 
 function renderPropertiesHtml(properties: Record<string, unknown> | null | undefined): string {
   if (!fetchPropertiesInput.checked) {
@@ -291,10 +329,10 @@ let active: ActiveDataset | null = null;
 let latestUrl = '';
 let datasetLoadController: AbortController | null = null;
 let propertyPopup: maplibregl.Popup | null = null;
+let propertyPopupPinned = false;
 
 fetchPropertiesInput.addEventListener('change', () => {
-  propertyPopup?.remove();
-  propertyPopup = null;
+  hidePropertyPopup();
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
   // A new URL revision prevents reuse of tiles containing the previous attributes.
@@ -321,15 +359,15 @@ flyBtn.addEventListener('click', () => {
   map.fitBounds(active.dataBbox, { padding: 40, maxZoom: 14 });
 });
 
-async function loadDataset(url: string): Promise<void> {
+/** `keepView` leaves the map where it is instead of fitting it to the data. */
+async function loadDataset(url: string, keepView = false): Promise<void> {
   if (!url) {
     setStatus('Enter a URL first.');
     return;
   }
   loadBtn.disabled = true;
   setStatus(`Opening ${datasetName(url)}…`);
-  propertyPopup?.remove();
-  propertyPopup = null;
+  hidePropertyPopup();
   datasetLoadController?.abort();
   const controller = new AbortController();
   datasetLoadController = controller;
@@ -343,8 +381,9 @@ async function loadDataset(url: string): Promise<void> {
       dataBbox,
       summary: geo,
     };
+    writeDatasetQuery(url);
     renderMetadata(geo);
-    if (dataBbox) {
+    if (dataBbox && !keepView) {
       map.fitBounds(dataBbox, { padding: 40, maxZoom: 14, animate: false });
     }
     flyBtn.disabled = !dataBbox;
@@ -374,4 +413,12 @@ async function loadDataset(url: string): Promise<void> {
 
 function renderMetadata(summary: OpenResult['geo']): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
+}
+
+// Reopen the dataset of a shared link, keeping its view when it has one.
+const initialUrl = datasetFromQuery();
+if (initialUrl) {
+  urlInput.value = initialUrl;
+  selectPreset(presetSelect, initialUrl);
+  void loadDataset(initialUrl, Boolean(location.hash));
 }

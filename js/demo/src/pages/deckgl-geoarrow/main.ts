@@ -11,6 +11,7 @@ import {
   readArrow,
   type OpenResult,
 } from '../../shared/dataset-service';
+import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { attributeTooltip, createDeckMap, FILL, LINE, type Tooltip } from '../../shared/deck-map';
 import { datasetName, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
@@ -197,7 +198,8 @@ flyBtn.addEventListener('click', () => {
   map.fitBounds(active.dataBbox, 1000);
 });
 
-async function loadDataset(url: string): Promise<void> {
+/** `keepView` leaves the map where it is instead of fitting it to the data. */
+async function loadDataset(url: string, keepView = false): Promise<void> {
   if (!url) {
     setStatus('Enter a URL first.');
     return;
@@ -213,12 +215,13 @@ async function loadDataset(url: string): Promise<void> {
     const { geo, byteLength, dataBbox } = await openCogpDataset(url, controller.signal);
     if (latestUrl !== url) return;
     active = { url, byteLength, dataBbox, summary: geo, revision: ++datasetRevision };
+    writeDatasetQuery(url);
     map.setLayers([]);
     metaEl.textContent = JSON.stringify(geo, null, 2);
     flyBtn.disabled = !dataBbox;
     statsEl.hidden = false;
     for (const stat of [statLevel, statFeatures, statArrow, statFetched, statTime]) stat.textContent = '–';
-    if (dataBbox) map.fitBounds(dataBbox);
+    if (dataBbox && !keepView) map.fitBounds(dataBbox);
     else void readView();
     // Give the map the screen on phones once there is something to look at.
     if (smallScreen.matches) setPanelCollapsed(true);
@@ -239,4 +242,12 @@ async function loadDataset(url: string): Promise<void> {
 
 function datasetStatus(ds: ActiveDataset): string {
   return `${datasetName(ds.url)} · ${formatBytes(ds.byteLength)} · ${ds.summary.lod.levels.length} levels`;
+}
+
+// Reopen the dataset of a shared link, keeping its view when it has one.
+const initialUrl = datasetFromQuery();
+if (initialUrl) {
+  urlInput.value = initialUrl;
+  selectPreset(presetSelect, initialUrl);
+  void loadDataset(initialUrl, Boolean(location.hash));
 }
