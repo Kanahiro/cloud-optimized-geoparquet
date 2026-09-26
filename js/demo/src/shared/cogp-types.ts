@@ -49,10 +49,40 @@ export interface ViewRequest {
   fetchProperties: boolean;
 }
 
+/**
+ * A read within `bbox` bounded by a level and a row count: rows from levels up
+ * to `maxLevel`, stopped after `maxRows` rows.
+ */
+export interface BudgetRequest {
+  url: string;
+  bbox: ViewportBbox;
+  /** Zero-based finest level to read; omitted to select it for `resolution`. */
+  maxLevel?: number;
+  /** Target resolution in primary geometry CRS units per pixel, used without `maxLevel`. */
+  resolution: number;
+  maxRows: number;
+}
+
+/** A budgeted read encoded by `toGeoArrow`, with a `level` column per row. */
+export interface BudgetResult {
+  /** Arrow IPC stream with one record batch. */
+  data: ArrayBuffer;
+  rows: number;
+  /** Zero-based finest level that was read. */
+  maxLevel: number;
+  /** Rows returned from each LoD level, coarse first. */
+  levelRows: number[];
+  /** Wall time to read and encode. */
+  ms: number;
+  /** Bytes and requests sent for this read alone. */
+  network: NetworkStats;
+}
+
 export type WorkerRequest =
   | { type: 'open'; url: string }
   | { type: 'readTile'; url: string; z: number; x: number; y: number; fetchProperties: boolean }
-  | ({ type: 'readArrow' } & ViewRequest);
+  | ({ type: 'readArrow' } & ViewRequest)
+  | ({ type: 'readBudget' } & BudgetRequest);
 
 export interface WorkerEnvelope {
   id: number;
@@ -67,5 +97,5 @@ export interface WorkerCancel {
 export type WorkerMessage = WorkerEnvelope | WorkerCancel;
 
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | TileResult | ArrowResult }
+  | { id: number; ok: true; result: OpenResult | TileResult | ArrowResult | BudgetResult }
   | { id: number; ok: false; error: string; name: string };

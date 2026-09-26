@@ -5,6 +5,8 @@ import { Zstd } from '@hpcc-js/wasm-zstd';
 import {
   MVT_LAYER_NAME,
   type ArrowResult,
+  type BudgetRequest,
+  type BudgetResult,
   type NetworkStats,
   type OpenResult,
   type TileResult,
@@ -116,6 +118,57 @@ async function readArrow(request: ViewRequest, signal: AbortSignal): Promise<Arr
   return { data, rows: batch.length, level, ms: performance.now() - startedAt, network: { ...network } };
 }
 
+/**
+ * Read levels up to `maxLevel` within the bbox, keeping the first `maxRows` rows
+ * in source order. Coarse levels come first, so a small row budget stops at an
+ * overview and a larger one fills in finer levels up to the level budget.
+ */
+async function readBudget(request: BudgetRequest, signal: AbortSignal): Promise<BudgetResult> {
+  const ds = active;
+  if (!ds || ds.url !== request.url) {
+    throw new Error('Dataset is no longer active');
+  }
+  const { reader } = ds;
+  const maxLevel = request.maxLevel ?? reader.selectLevel(request.resolution);
+  const before = { ...network };
+  const startedAt = performance.now();
+  const batch = await reader.read({
+    bbox: request.bbox,
+    columns: [reader.primaryGeometryColumn],
+    maxLevel,
+    useOverview: true,
+    maxRows: request.maxRows,
+    signal,
+  });
+  signal.throwIfAborted();
+
+  // Rows before the end of each level's row group prefix; row_group_end is inclusive.
+  const rowGroupRows = reader.metadata.row_groups.map((rg) => Number(rg.num_rows ?? 0));
+  const levelRowEnds = reader.levels.map((level) =>
+    rowGroupRows.slice(0, level.row_group_end + 1).reduce((sum, rows) => sum + rows, 0));
+  const level = new Uint8Array(batch.length);
+  const levelRows = new Array<number>(levelRowEnds.length).fill(0);
+  let current = 0;
+  for (let i = 0; i < batch.length; i++) {
+    // Rows are in source order, so the level never decreases.
+    while (batch.rowIndex[i]! >= levelRowEnds[current]!) current++;
+    level[i] = current;
+    levelRows[current]! += 1;
+  }
+  const data = toGeoArrow(
+    { geometry: batch.geometry!, rowIndex: batch.rowIndex, columns: { level } },
+    { crs: reader.geo.columns[reader.primaryGeometryColumn]?.crs },
+  );
+  return {
+    data,
+    rows: batch.length,
+    maxLevel,
+    levelRows,
+    ms: performance.now() - startedAt,
+    network: { requests: network.requests - before.requests, bytes: network.bytes - before.bytes },
+  };
+}
+
 function propertyColumnNames(reader: CogpReader): string[] {
   const excluded = new Set<string>(Object.keys(reader.geo.columns));
   if (reader.geo.lod.overviews) excluded.add(reader.geo.lod.overviews.column);
@@ -176,6 +229,10 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       self.postMessage(response, { transfer: [result.data] });
     } else if (payload.type === 'readArrow') {
       const result: ArrowResult = await readArrow(payload, controller.signal);
+      const response: WorkerResponse = { id, ok: true, result };
+      self.postMessage(response, { transfer: [result.data] });
+    } else if (payload.type === 'readBudget') {
+      const result: BudgetResult = await readBudget(payload, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response, { transfer: [result.data] });
     }

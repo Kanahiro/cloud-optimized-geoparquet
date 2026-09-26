@@ -1,5 +1,7 @@
 import type {
   ArrowResult,
+  BudgetRequest,
+  BudgetResult,
   OpenResult,
   TileResult,
   ViewRequest,
@@ -7,7 +9,7 @@ import type {
   WorkerResponse,
 } from './cogp-types';
 
-export type { ArrowResult, OpenResult, TileResult } from './cogp-types';
+export type { ArrowResult, BudgetResult, OpenResult, TileResult } from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 
@@ -76,4 +78,9 @@ export function readTile(
 /** Read the rows intersecting a view at the level for its resolution, as GeoArrow IPC. */
 export function readArrow(request: ViewRequest, signal?: AbortSignal): Promise<ArrowResult> {
   return call<ArrowResult>({ type: 'readArrow', ...request }, signal);
+}
+
+/** Read every level within a bbox up to a row budget, as GeoArrow IPC. */
+export function readBudget(request: BudgetRequest, signal?: AbortSignal): Promise<BudgetResult> {
+  return call<BudgetResult>({ type: 'readBudget', ...request }, signal);
 }
