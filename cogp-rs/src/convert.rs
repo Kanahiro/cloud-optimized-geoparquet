@@ -484,12 +484,21 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             }
         }
     }
+    // Keep each feature's rendering entry level: root consolidation changes
+    // physical placement, but not when its geometry becomes displayable.
+    let overview_entry_levels = if with_overviews {
+        assignment.clone()
+    } else {
+        Vec::new()
+    };
     // Count only after overview viability has deferred collapsed geometries;
     // otherwise the selected root can fall below the requested minimum.
     consolidate_sparse_root(&mut assignment, resolutions.len(), args.min_root_features);
     let occupied = occupied_level_candidates(&assignment, resolutions.len())?;
+    let first_occupied_level = occupied[0];
     let selected = if with_overviews {
-        (occupied[0]..resolutions.len()).collect()
+        // An empty feature tier can still refine the shared row-group prefix.
+        (0..resolutions.len()).collect()
     } else {
         occupied
     };
@@ -649,6 +658,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_append_bbox = append_bbox;
     let producer_geom_col = geom_col_idx;
     let producer_overview_plan = overview_plan.clone();
+    let producer_overview_entry_levels = overview_entry_levels;
     let producer_per_level = per_level;
     let producer_row_group_size = args.row_group_size;
     let producer = thread::spawn(move || -> Result<()> {
@@ -674,8 +684,13 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                             output_schema: &producer_schema,
                             append_bbox: producer_append_bbox,
                             geometry_col: producer_geom_col,
-                            feature_level: *level_i,
+                            first_covered_level: if *level_i == first_occupied_level {
+                                0
+                            } else {
+                                *level_i
+                            },
                             overview_plan: &producer_overview_plan,
+                            overview_entry_levels: &producer_overview_entry_levels,
                         },
                     )?;
                     Ok((*level_i, batches))
@@ -699,7 +714,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             if prev != level_i {
                 writer.flush()?;
                 let boundary = flushed_row_group_end(&writer)?;
-                for &resolution in resolutions.iter().take(level_i).skip(prev) {
+                for &resolution in resolutions.iter().take(level_i).skip(levels_meta.len()) {
                     levels_meta.push(Level {
                         row_group_end: boundary,
                         resolution,
@@ -710,10 +725,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         write_with_row_group_limit(&mut writer, &batch, args.row_group_size)?;
         last_level = Some(level_i);
     }
-    if let Some(prev) = last_level {
+    if last_level.is_some() {
         writer.flush()?;
         let boundary = flushed_row_group_end(&writer)?;
-        for &resolution in resolutions.iter().skip(prev) {
+        for &resolution in resolutions.iter().skip(levels_meta.len()) {
             levels_meta.push(Level {
                 row_group_end: boundary,
                 resolution,
@@ -1272,8 +1287,9 @@ struct GatherLayout<'a> {
     output_schema: &'a Arc<Schema>,
     append_bbox: bool,
     geometry_col: usize,
-    feature_level: usize,
+    first_covered_level: usize,
     overview_plan: &'a [OverviewPlan],
+    overview_entry_levels: &'a [u16],
 }
 
 fn gather_chunk(
@@ -1365,9 +1381,10 @@ fn gather_chunk(
             let raw_geometry = cols[layout.geometry_col].clone();
             cols.push(Arc::new(build_overviews_array(
                 raw_geometry.as_ref(),
-                layout.feature_level,
+                layout.first_covered_level,
                 layout.overview_plan,
                 &chunk[seg_start..seg_end],
+                layout.overview_entry_levels,
             )?));
         }
         out.push(RecordBatch::try_new(layout.output_schema.clone(), cols)?);
@@ -1413,9 +1430,10 @@ fn remap_levels(assignment: &[u16], selected_candidates: &[usize]) -> Result<Vec
 
 fn build_overviews_array(
     array: &dyn Array,
-    feature_level: usize,
+    first_covered_level: usize,
     plan: &[OverviewPlan],
     source_rows: &[u32],
+    entry_levels: &[u16],
 ) -> Result<StructArray> {
     if source_rows.len() != array.len() {
         bail!("internal: overview source-row mapping length mismatch");
@@ -1432,22 +1450,28 @@ fn build_overviews_array(
     if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
         bail!("primary geometry is not a WKB Binary/LargeBinary column");
     }
-    let fallback_tolerance = plan
-        .get(feature_level)
-        .ok_or_else(|| anyhow!("internal: feature level has no overview plan"))?
-        .tolerance;
-
     let mut lod_arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len());
     for overview in plan {
         let values: Vec<Option<QuantizedOverview>> = (0..array.len())
             .into_par_iter()
             .map(|index| {
-                if feature_level > overview.level {
+                if first_covered_level > overview.level {
                     return Ok(None);
+                }
+                let entry_level = *entry_levels
+                    .get(source_rows[index] as usize)
+                    .ok_or_else(|| anyhow!("internal: missing overview entry level"))?
+                    as usize;
+                if entry_level > overview.level {
+                    return Ok(Some(QuantizedOverview::empty(overview.polygon)));
                 }
                 let Some(bytes) = bytes_at(index) else {
                     return Ok(Some(QuantizedOverview::empty(overview.polygon)));
                 };
+                let fallback_tolerance = plan
+                    .get(entry_level)
+                    .ok_or_else(|| anyhow!("internal: overview entry level out of range"))?
+                    .tolerance;
                 let value = quantized_overview_with_fallback(
                     bytes,
                     overview.tolerance,
@@ -1456,8 +1480,8 @@ fn build_overviews_array(
                 )
                 .with_context(|| {
                     format!(
-                        "building {} overview for input row {} (feature level {})",
-                        overview.id, source_rows[index], feature_level
+                        "building {} overview for input row {} (entry level {})",
+                        overview.id, source_rows[index], entry_level
                     )
                 })?;
                 // Null and empty sources stay covered without a primary fallback.

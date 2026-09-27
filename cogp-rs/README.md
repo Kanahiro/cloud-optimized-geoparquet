@@ -110,11 +110,12 @@ Other options:
   the root (coarsest output level), across the whole dataset. After assigning
   features (including overview viability checks when overviews are generated),
   the writer folds sparse leading levels into the first level whose cumulative
-  count meets the minimum. The omitted resolutions are not emitted
-  in `geo.lod`; a coarser reader request therefore falls back to the new root.
-  If the entire dataset has fewer rows, all rows use the finest requested
-  resolution. Applies to all geometry families and both resolution options;
-  later levels have no minimum. Set to `1` to disable folding.
+  count meets the minimum. With rendering overviews, every requested resolution
+  remains in `geo.lod` and gets an overview; leading levels share the root's
+  row-group prefix. Without overviews, omitted resolutions are not emitted.
+  If the entire dataset has fewer rows, all rows are stored in the finest
+  requested tier. Applies to all geometry families and both resolution options;
+  later tiers have no minimum. Set to `1` to disable folding.
   This counts stored features, not pixels or visible features in a viewport;
   it does not guarantee spatial coverage. Geometry and attributes are preserved.
 
