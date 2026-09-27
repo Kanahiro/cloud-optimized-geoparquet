@@ -150,14 +150,10 @@ fn interiors_disjoint(polygons: &[Polygon<f64>]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn ring(points: &[(f64, f64)]) -> LineString<f64> {
-        LineString::from(points.to_vec())
-    }
-
     #[test]
     fn indexed_checks_reject_crossings_spikes_and_invalid_holes() {
+        use super::*;
+        let ring = |points: &[(f64, f64)]| LineString::from(points.to_vec());
         let square = ring(&[(0., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
         let hole = ring(&[(2., 2.), (4., 2.), (4., 4.), (2., 4.), (2., 2.)]);
         assert!(polygon_valid(&Polygon::new(square.clone(), vec![hole])));
@@ -186,6 +182,8 @@ mod tests {
 
     #[test]
     fn overlapping_envelopes_prefilter_preserves_boundary_rules() {
+        use super::*;
+        let ring = |points: &[(f64, f64)]| LineString::from(points.to_vec());
         let c_shape = Polygon::new(
             ring(&[
                 (0., 0.),
