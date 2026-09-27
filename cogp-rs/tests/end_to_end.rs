@@ -278,26 +278,40 @@ fn convert_reader_validate_pipeline() {
 }
 
 #[test]
-fn root_minimum_preserves_rows_and_uses_the_first_sufficient_resolution() {
+fn root_minimum_preserves_rows_and_all_overviews() {
     let tmp = TempDir::new("root-minimum");
     let input = tmp.path().join("input.parquet");
     write_input(&input);
     // 26 large polygons enter at 0.1; 14 small ones enter at 0.01.
-    for (minimum, root_resolution, root_rows, level_count) in [
-        (1, 0.1, 26, 3),
-        (26, 0.1, 26, 3),
-        (27, 0.01, 40, 2),
-        (2048, 0.001, 40, 1),
-    ] {
+    // Root folding changes the row-group prefix, while all rendering
+    // resolutions and their overviews remain available.
+    let resolutions = [0.1, 0.01, 0.001, 0.0001];
+    for (minimum, root_rows) in [(1, 26), (26, 26), (27, 40), (2048, 40)] {
         let output = tmp.path().join(format!("root-{minimum}.parquet"));
         let mut args = convert_args(&input, &output);
-        args.resolution = vec![1.0, 0.1, 0.01, 0.001];
+        args.resolution = resolutions.to_vec();
         args.min_root_features = minimum;
+        args.row_group_size = 64;
         cogp::convert::run(args).unwrap();
         cogp::validate::run(&output).unwrap();
         let reader = Reader::open(&output).unwrap();
-        assert_eq!(reader.levels().len(), level_count);
-        assert_eq!(reader.levels()[0].resolution, root_resolution);
+        assert_eq!(
+            reader
+                .levels()
+                .iter()
+                .map(|level| level.resolution)
+                .collect::<Vec<_>>(),
+            resolutions
+        );
+        let lod = reader.lod_meta();
+        assert_eq!(
+            lod.overviews.as_ref().unwrap().lods.len(),
+            resolutions.len()
+        );
+        if minimum == 2048 {
+            assert_eq!(reader.num_row_groups(), 1);
+            assert!(reader.levels().iter().all(|level| level.row_group_end == 0));
+        }
         let coarse_groups = reader.row_groups_up_to_resolution(1000.0);
         let count: i64 = coarse_groups
             .map(|i| reader.parquet_metadata().row_group(i).num_rows())
@@ -305,6 +319,7 @@ fn root_minimum_preserves_rows_and_uses_the_first_sufficient_resolution() {
         assert_eq!(count, root_rows);
         let groups: Vec<_> = (0..reader.num_row_groups()).collect();
         let mut ids_seen = std::collections::BTreeSet::new();
+        let mut coarse_overview_has_geometry = false;
         for batch in reader
             .sync_batch_reader(File::open(&output).unwrap(), &groups)
             .unwrap()
@@ -328,6 +343,23 @@ fn root_minimum_preserves_rows_and_uses_the_first_sufficient_resolution() {
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .unwrap();
+            if minimum == 2048 {
+                let overviews = batch
+                    .column_by_name("overviews")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let coarse = overviews
+                    .column_by_name("l0")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                assert_eq!(coarse.null_count(), 0);
+                coarse_overview_has_geometry |=
+                    (0..coarse.len()).any(|row| !coarse.value(row).is_empty());
+            }
             for row in 0..batch.num_rows() {
                 let id = ids.value(row);
                 assert!(ids_seen.insert(id));
@@ -348,6 +380,9 @@ fn root_minimum_preserves_rows_and_uses_the_first_sufficient_resolution() {
             }
         }
         assert_eq!(ids_seen, (0..40).collect());
+        if minimum == 2048 {
+            assert!(coarse_overview_has_geometry);
+        }
     }
 }
 
@@ -679,13 +714,15 @@ fn preserves_null_empty_duplicate_rows_and_crs_metadata() {
             .unwrap();
         for i in 0..batch.num_rows() {
             let source_empty = geom.is_null(i) || geom.value(i) == empty.as_slice();
-            for lod in overviews.columns() {
+            for (level, lod) in overviews.columns().iter().enumerate() {
                 let lod = lod
                     .as_any()
                     .downcast_ref::<arrow::array::ListArray>()
                     .unwrap();
                 if !lod.is_null(i) {
-                    assert_eq!(lod.value(i).is_empty(), source_empty);
+                    if source_empty || level == overviews.columns().len() - 1 {
+                        assert_eq!(lod.value(i).is_empty(), source_empty);
+                    }
                     empty_overviews += usize::from(source_empty);
                 }
             }
@@ -774,9 +811,12 @@ fn cli_defaults_write_page_indexes() {
     );
     let reader = Reader::open(&output).unwrap();
     assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
-    assert_eq!(reader.levels().len(), 1);
+    assert_eq!(reader.levels().len(), 17);
+    assert_eq!(reader.lod_meta().overviews.as_ref().unwrap().lods.len(), 17);
+    assert_eq!(reader.num_row_groups(), 1);
+    assert!(reader.levels().iter().all(|level| level.row_group_end == 0));
     assert!(
-        (reader.levels()[0].resolution - 40_075_016.685_578_49 / (1024.0 * 65536.0 * 111_320.0))
+        (reader.levels()[16].resolution - 40_075_016.685_578_49 / (1024.0 * 65536.0 * 111_320.0))
             .abs()
             < 1e-12
     );
@@ -886,7 +926,7 @@ fn root_minimum_is_applied_after_overview_viability() {
             .iter()
             .map(|level| level.resolution)
             .collect::<Vec<_>>(),
-        vec![1.0, 0.25]
+        vec![16.0, 4.0, 1.0, 0.25]
     );
     assert_eq!(reader.row_groups_up_to_resolution(1000.0), 0..1);
     assert_eq!(reader.parquet_metadata().row_group(0).num_rows(), 2);
@@ -902,8 +942,9 @@ fn root_minimum_is_applied_after_overview_viability() {
         .as_any()
         .downcast_ref::<StructArray>()
         .unwrap();
-    // The root contains both usable overviews and retains the finer refinement.
-    for lod in ["l0", "l1"] {
+    // The first two resolutions remain declared even though no geometry enters
+    // until the third; the latter two contain usable renderings.
+    for lod in ["l2", "l3"] {
         let lod = overviews
             .column_by_name(lod)
             .unwrap()
@@ -938,10 +979,10 @@ fn convert_preserves_refinement_without_new_features() {
             .iter()
             .map(|level| level.resolution)
             .collect::<Vec<_>>(),
-        vec![8.0, 4.0, 1.0, 0.5]
+        vec![256.0, 8.0, 4.0, 1.0, 0.5]
     );
     assert_eq!(reader.num_row_groups(), 1);
-    for index in 0..4 {
+    for index in 0..5 {
         assert_eq!(reader.row_groups_up_to_level(index), 0..1);
         assert_eq!(
             reader.row_groups_in_level(index),
@@ -973,8 +1014,8 @@ fn convert_preserves_refinement_without_new_features() {
             .unwrap()
             .value_length(0)
     };
-    assert_eq!(coordinate_count("l0"), 2);
-    assert_eq!(coordinate_count("l3"), 3);
+    assert_eq!(coordinate_count("l1"), 2);
+    assert_eq!(coordinate_count("l4"), 3);
 }
 
 #[test]

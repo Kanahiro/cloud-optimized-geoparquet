@@ -4,7 +4,8 @@ use geo::{
     coordinate_position::CoordPos,
     dimensions::Dimensions,
     line_intersection::{line_intersection, LineIntersection},
-    BoundingRect, Line, LineString, Polygon, PreparedGeometry, Relate,
+    BoundingRect, Intersects, Line, LineString, MonotoneChainPolygon, Polygon, PreparedGeometry,
+    Relate,
 };
 use rstar::{RTree, RTreeObject, AABB};
 
@@ -113,13 +114,29 @@ fn interiors_disjoint(polygons: &[Polygon<f64>]) -> bool {
         })
         .collect();
     let tree = RTree::bulk_load(envelopes);
-    let prepared: Vec<_> = polygons.iter().map(PreparedGeometry::from).collect();
+    // Envelope overlap is common among irregular islands that never meet.
+    // A monotone-chain intersection check can prove those pairs disjoint
+    // without constructing their full DE-9IM relation graph.
+    let chains: Vec<_> = polygons.iter().map(MonotoneChainPolygon::from).collect();
+    let mut prepared: Vec<_> = (0..polygons.len()).map(|_| None).collect();
     for item in &tree {
         for other in tree.locate_in_envelope_intersecting(&item.envelope()) {
             if other.data <= item.data {
                 continue;
             }
-            let relation = prepared[item.data].relate(&prepared[other.data]);
+            if !chains[item.data].intersects(&chains[other.data]) {
+                continue;
+            }
+            if prepared[item.data].is_none() {
+                prepared[item.data] = Some(PreparedGeometry::from(&polygons[item.data]));
+            }
+            if prepared[other.data].is_none() {
+                prepared[other.data] = Some(PreparedGeometry::from(&polygons[other.data]));
+            }
+            let relation = prepared[item.data]
+                .as_ref()
+                .unwrap()
+                .relate(prepared[other.data].as_ref().unwrap());
             if relation.get(CoordPos::Inside, CoordPos::Inside) == Dimensions::TwoDimensional
                 || relation.get(CoordPos::OnBoundary, CoordPos::OnBoundary)
                     == Dimensions::OneDimensional
@@ -136,9 +153,7 @@ mod tests {
     #[test]
     fn indexed_checks_reject_crossings_spikes_and_invalid_holes() {
         use super::*;
-        fn ring(points: &[(f64, f64)]) -> LineString<f64> {
-            LineString::from(points.to_vec())
-        }
+        let ring = |points: &[(f64, f64)]| LineString::from(points.to_vec());
         let square = ring(&[(0., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
         let hole = ring(&[(2., 2.), (4., 2.), (4., 4.), (2., 4.), (2., 2.)]);
         assert!(polygon_valid(&Polygon::new(square.clone(), vec![hole])));
@@ -163,5 +178,51 @@ mod tests {
             Polygon::new(square.clone(), vec![]),
             Polygon::new(square, vec![])
         ]));
+    }
+
+    #[test]
+    fn overlapping_envelopes_prefilter_preserves_boundary_rules() {
+        use super::*;
+        let ring = |points: &[(f64, f64)]| LineString::from(points.to_vec());
+        let c_shape = Polygon::new(
+            ring(&[
+                (0., 0.),
+                (4., 0.),
+                (4., 1.),
+                (1., 1.),
+                (1., 3.),
+                (4., 3.),
+                (4., 4.),
+                (0., 4.),
+                (0., 0.),
+            ]),
+            vec![],
+        );
+        let in_notch = Polygon::new(
+            ring(&[(2., 1.5), (3., 1.5), (3., 2.5), (2., 2.5), (2., 1.5)]),
+            vec![],
+        );
+        assert!(c_shape
+            .bounding_rect()
+            .unwrap()
+            .intersects(&in_notch.bounding_rect().unwrap()));
+        assert!(!MonotoneChainPolygon::from(&c_shape)
+            .intersects(&MonotoneChainPolygon::from(&in_notch)));
+        assert!(multipolygon_valid(&[c_shape, in_notch]));
+
+        let first = Polygon::new(
+            ring(&[(0., 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)]),
+            vec![],
+        );
+        let point_touch = Polygon::new(
+            ring(&[(1., 1.), (2., 1.), (2., 2.), (1., 2.), (1., 1.)]),
+            vec![],
+        );
+        let edge_touch = Polygon::new(
+            ring(&[(1., 0.), (2., 0.), (2., 1.), (1., 1.), (1., 0.)]),
+            vec![],
+        );
+        assert!(multipolygon_valid(&[first.clone(), point_touch]));
+        assert!(!multipolygon_valid(&[first, edge_touch]));
     }
 }
