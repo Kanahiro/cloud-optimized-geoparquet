@@ -76,6 +76,52 @@ test('encodes only the clipped boundary of a huge polygon', () => {
   );
 });
 
+test('skips distant MultiPolygon parts before projecting their vertices', () => {
+  const near = [[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1], [-0.1, -0.1]];
+  const distant = (lon, lat) => {
+    const ring = Array.from({ length: 2048 }, (_, i) => {
+      const angle = 2 * Math.PI * i / 2048;
+      return [lon + 0.1 * Math.cos(angle), lat + 0.1 * Math.sin(angle)];
+    });
+    return [...ring, ring[0]];
+  };
+  const options = { int32: true, scale: [0.001, 0.001], offset: [0, 0] };
+  const expected = encodeGeometryRow(columnFromGeoJSON([
+    { type: 'MultiPolygon', coordinates: [[near]] },
+  ], options), 0, 10, 512, 512, 7);
+  const combined = columnFromGeoJSON([
+    { type: 'MultiPolygon', coordinates: [[near], [distant(120, 0)], [distant(120, 45)]] },
+  ], options);
+  let projections = 0;
+  const sin = Math.sin;
+  Math.sin = value => { projections++; return sin(value); };
+  let actual;
+  try {
+    actual = encodeGeometryRow(combined, 0, 10, 512, 512, 7);
+  } finally {
+    Math.sin = sin;
+  }
+  assert.deepEqual(actual, expected);
+  assert.ok(projections < 30, `projected distant vertices ${projections} times`);
+});
+
+test('retains a polygon crossing the antimeridian outside its raw longitude bbox', () => {
+  const ring = [
+    [179.8, -0.1], [-179.8, -0.1], [-179.8, 0.1], [179.8, 0.1], [179.8, -0.1],
+  ];
+  const feature = encodePrimaryFeature({ type: 'MultiPolygon', coordinates: [[ring]] }, 16, 9, 32768);
+  assert.ok(feature);
+  assert.ok(feature.geometry.byteLength > 0);
+});
+
+test('skips distant MultiLineString parts while keeping crossing lines', () => {
+  const near = [[-0.1, -0.1], [0.1, 0.1]];
+  const distant = Array.from({ length: 2048 }, (_, i) => [120 + i / 2048, 0]);
+  const expected = encodePrimaryFeature({ type: 'MultiLineString', coordinates: [near] }, 10, 512, 512);
+  const actual = encodePrimaryFeature({ type: 'MultiLineString', coordinates: [near, distant] }, 10, 512, 512);
+  assert.deepEqual(actual, expected);
+});
+
 test('drops point-family coordinates outside the buffered tile', () => {
   assert.equal(encodePrimaryFeature({ type: 'Point', coordinates: [120, 45] }, 10, 512, 512), null);
 });

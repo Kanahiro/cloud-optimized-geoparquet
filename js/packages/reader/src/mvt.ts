@@ -123,8 +123,8 @@ function writeTile(
 
 /**
  * Write MVT command integers directly from the column's coordinate arrays.
- * CogpReader bbox-prunes candidates at page granularity; clipping them here
- * to the buffered extent avoids sending whole large geometries to renderers.
+ * CogpReader selects candidate rows; reject distant parts here before
+ * projecting and clipping their coordinates to the buffered tile extent.
  */
 function encodeGeometry(
   column: GeometryColumn,
@@ -138,34 +138,48 @@ function encodeGeometry(
   const p0 = go[row]!, p1 = go[row + 1]!;
   const c0 = ro[po[p0]!]!, c1 = ro[po[p1]!]!;
   if (c0 === c1) return null;
-  // Page-level pruning can leave many off-tile features. Latitude bounds are
-  // monotonic in Mercator, even across the antimeridian; reject them before
-  // allocating projected paths or evaluating trigonometry for every vertex.
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (let i = c0; i < c1; i++) {
-    const y = column.y[i]!;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-  }
-  const a = projection.y(column.offset[1] + column.scale[1] * minY);
-  const b = projection.y(column.offset[1] + column.scale[1] * maxY);
-  if (Math.max(a, b) < MVT_CLIP_BBOX[1] || Math.min(a, b) > MVT_CLIP_BBOX[3]) return null;
-
   const mvtType = type === 1 || type === 4 ? 1 : type === 2 || type === 5 ? 2 : 3;
   const commands = new ByteWriter();
   const cursor = { x: 0, y: 0 };
   if (mvtType === 1) {
+    if (!partIntersectsTile(column, projection, c0, c1)) return null;
     writePoints(commands, column, projection, cursor, c0, c1);
   } else {
     for (let p = p0; p < p1; p++) {
-      for (let r = po[p]!; r < po[p + 1]!; r++) {
-        if (mvtType === 3) writePolygonRing(commands, column, projection, cursor, ro[r]!, ro[r + 1]!, r === po[p]);
-        else writeLine(commands, column, projection, cursor, ro[r]!, ro[r + 1]!);
+      const firstRing = po[p]!, lastRing = po[p + 1]!;
+      if (mvtType === 3 && (firstRing === lastRing
+        || !partIntersectsTile(column, projection, ro[firstRing]!, ro[lastRing]!))) continue;
+      for (let r = firstRing; r < lastRing; r++) {
+        if (mvtType === 3) writePolygonRing(commands, column, projection, cursor, ro[r]!, ro[r + 1]!, r === firstRing);
+        else if (partIntersectsTile(column, projection, ro[r]!, ro[r + 1]!)) {
+          writeLine(commands, column, projection, cursor, ro[r]!, ro[r + 1]!);
+        }
       }
     }
   }
   return commands.length === 0 ? null : { id, type: mvtType, geometry: commands.finish() };
+}
+
+/** Reject a part before projecting or clipping all its coordinates. */
+function partIntersectsTile(column: GeometryColumn, projection: TileProjection, start: number, end: number): boolean {
+  if (start >= end) return false;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = start; i < end; i++) {
+    const x = column.x[i]!, y = column.y[i]!;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  // Leave non-finite inputs to the existing projection and clipping path.
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)
+    || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return true;
+  const west = column.offset[0] + column.scale[0] * minX;
+  const east = column.offset[0] + column.scale[0] * maxX;
+  if (!projection.intersectsLongitudeRange(Math.min(west, east), Math.max(west, east))) return false;
+  const south = projection.y(column.offset[1] + column.scale[1] * minY);
+  const north = projection.y(column.offset[1] + column.scale[1] * maxY);
+  return Math.max(south, north) >= MVT_CLIP_BBOX[1] && Math.min(south, north) <= MVT_CLIP_BBOX[3];
 }
 
 function writePoints(
@@ -335,6 +349,20 @@ class TileProjection {
     let local = (((longitude + 180) / 360) * this.tiles - this.tileX) * MVT_EXTENT;
     local += Math.round((reference - local) / this.worldSize) * this.worldSize;
     return Math.round(local);
+  }
+
+  intersectsLongitudeRange(minimum: number, maximum: number): boolean {
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return true;
+    // A ring crossing the antimeridian can follow the short path outside its
+    // raw longitude interval; keep such wide intervals for exact clipping.
+    if (maximum - minimum >= 180) return true;
+    const left = (((minimum + 180) / 360) * this.tiles - this.tileX) * MVT_EXTENT;
+    const right = (((maximum + 180) / 360) * this.tiles - this.tileX) * MVT_EXTENT;
+    // TileProjection.x can shift a part by whole worlds. Check every possible
+    // shifted copy, with one pixel of slack for coordinate rounding.
+    const first = Math.ceil((MVT_CLIP_BBOX[0] - 1 - right) / this.worldSize);
+    const last = Math.floor((MVT_CLIP_BBOX[2] + 1 - left) / this.worldSize);
+    return first <= last;
   }
 
   y(latitude: number): number {
