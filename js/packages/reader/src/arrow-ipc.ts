@@ -14,6 +14,12 @@ export type ArrowType =
   | { id: 'list' }
   | { id: 'fixedSizeList'; size: number };
 
+/** Buffer filled after the IPC body has been allocated, avoiding a temporary copy. */
+export interface DirectArrowBuffer {
+  readonly byteLength: number;
+  writeTo(buffer: ArrayBuffer, byteOffset: number): void;
+}
+
 /** A field together with its record batch data; buffers follow the Arrow layout for `type`. */
 export interface ArrowColumn {
   name: string;
@@ -22,7 +28,7 @@ export interface ArrowColumn {
   metadata?: Readonly<Record<string, string>>;
   length: number;
   nullCount: number;
-  buffers: ArrayBufferView[];
+  buffers: (ArrayBufferView | DirectArrowBuffer)[];
   children?: ArrowColumn[];
 }
 
@@ -93,7 +99,8 @@ export function writeIpcStream(columns: readonly ArrowColumn[], length: number):
   writeMessage(schema);
   writeMessage(batch);
   for (const buffer of buffers) {
-    out.set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength), at);
+    if ('writeTo' in buffer) buffer.writeTo(out.buffer, at);
+    else out.set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength), at);
     at += align(buffer.byteLength, 8);
   }
   // End-of-stream marker.

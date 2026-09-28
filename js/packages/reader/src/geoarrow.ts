@@ -5,6 +5,7 @@ import {
   writeIpcStream,
   type ArrowColumn,
   type ArrowType,
+  type DirectArrowBuffer,
 } from './arrow-ipc.js';
 import { requireGeometry, type FeatureSource, type GeometryColumn } from './geometry.js';
 import { formatPropertyValue } from './properties.js';
@@ -73,12 +74,18 @@ function geometryColumn(column: GeometryColumn, name: string, crs: unknown): Arr
   const [ox, oy] = column.offset;
   const dimensions = z ? 3 : 2;
   const count = x.length;
-  const coordinates = new Float64Array(count * dimensions);
-  for (let k = 0, at = 0; k < count; k++) {
-    coordinates[at++] = ox + sx * x[k]!;
-    coordinates[at++] = oy + sy * y[k]!;
-    if (z) coordinates[at++] = z[k]!;
-  }
+  const coordinateCount = count * dimensions;
+  const coordinates: DirectArrowBuffer = {
+    byteLength: coordinateCount * Float64Array.BYTES_PER_ELEMENT,
+    writeTo(buffer, byteOffset) {
+      const output = new Float64Array(buffer, byteOffset, coordinateCount);
+      for (let k = 0, at = 0; k < count; k++) {
+        output[at++] = ox + sx * x[k]!;
+        output[at++] = oy + sy * y[k]!;
+        if (z) output[at++] = z[k]!;
+      }
+    },
+  };
   const vertices = (childName: string): ArrowColumn => ({
     name: childName,
     nullable: false,
@@ -90,7 +97,7 @@ function geometryColumn(column: GeometryColumn, name: string, crs: unknown): Arr
       name: z ? 'xyz' : 'xy',
       nullable: false,
       type: { id: 'float', precision: 'double' },
-      length: coordinates.length,
+      length: coordinateCount,
       nullCount: 0,
       buffers: [NO_VALIDITY, coordinates],
     }],
