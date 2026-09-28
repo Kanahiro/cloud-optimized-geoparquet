@@ -106,7 +106,7 @@ const batch = await reader.read({
 });
 
 const geojson = toGeoJSON(batch); // FeatureCollection; feature IDs are source row indexes
-const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer, source layer `cogp`
+const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer
 const arrow = toGeoArrow(batch, { crs: 'OGC:CRS84' }); // ArrayBuffer, Arrow IPC stream
 ```
 

@@ -2,7 +2,7 @@ import type { AddProtocolAction } from 'maplibre-gl';
 import { callWorker } from './worker-client.js';
 import { COGP_PROTOCOL, parseTileUrl } from './url.js';
 
-export { cogpUrl, COGP_SOURCE_LAYER } from './url.js';
+export { cogpUrl } from './url.js';
 export type { CogpLayerInput, CogpLayerOptions } from './url.js';
 
 const registered = new WeakSet<object>();

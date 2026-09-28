@@ -46,9 +46,10 @@ const map = new maplibregl.Map({
 });
 ```
 
-Each named entry produces one MVT `source-layer`. A single file may be passed
-as `cogpUrl('https://example.com/data.cogp.parquet')`; its `source-layer` is
-`cogp` (also exported as `COGP_SOURCE_LAYER`).
+Each named entry produces one MVT `source-layer`. For a single file, use a
+single named entry, for example
+`cogpUrl({ parcels: 'https://example.com/data.cogp.parquet' })`, and set
+`source-layer` to `parcels`.
 
 Options are optional. With no `properties` mapping, all ordinary attributes
 are read. An empty mapping `{}` reads geometry only. A mapping renames and

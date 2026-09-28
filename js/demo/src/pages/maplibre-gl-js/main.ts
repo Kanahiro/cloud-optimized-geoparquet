@@ -1,7 +1,7 @@
 import * as maplibregl from 'maplibre-gl';
 import type { LngLatBoundsLike } from 'maplibre-gl';
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-import { cogpUrl, COGP_SOURCE_LAYER, registerCogpProtocol } from '@cogp/maplibre';
+import { cogpUrl, registerCogpProtocol } from '@cogp/maplibre';
 
 import { openDataset as openCogpDataset, type OpenResult } from '../../shared/dataset-service';
 import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
@@ -14,6 +14,7 @@ maplibregl.setWorkerUrl(maplibreWorkerUrl);
 registerCogpProtocol(maplibregl);
 
 const COGP_SOURCE_ID = 'cogp';
+const COGP_LAYER_NAME = 'features';
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -134,7 +135,7 @@ function installCogpSource(): void {
     id: 'cogp-fill',
     type: 'fill',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_SOURCE_LAYER,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'Polygon'],
     paint: {
       'fill-color': '#4a6cf7',
@@ -146,7 +147,7 @@ function installCogpSource(): void {
     id: 'cogp-line',
     type: 'line',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_SOURCE_LAYER,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'LineString'],
     paint: {
       'line-color': '#1f3aa8',
@@ -157,7 +158,7 @@ function installCogpSource(): void {
     id: 'cogp-point',
     type: 'circle',
     source: COGP_SOURCE_ID,
-    'source-layer': COGP_SOURCE_LAYER,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'Point'],
     paint: {
       'circle-radius': 3,
@@ -176,7 +177,9 @@ function removeCogpLayersAndSource(): void {
 }
 
 function sourceUrl(url: string): string {
-  return fetchPropertiesInput.checked ? cogpUrl(url) : cogpUrl(url, { properties: {} });
+  return cogpUrl({
+    [COGP_LAYER_NAME]: fetchPropertiesInput.checked ? url : { url, properties: {} },
+  });
 }
 
 /** Level the worker selects for tiles at the map center. */

@@ -1,4 +1,3 @@
-export const COGP_SOURCE_LAYER = 'cogp';
 export const COGP_PROTOCOL = 'cogp';
 
 export interface CogpLayerOptions {
@@ -21,14 +20,13 @@ export interface CogpConfig {
 
 const TILE = /^cogp:\/\/tile\/v1\/([A-Za-z0-9_-]+)\/(\d+)\/(\d+)\/(\d+)\.pbf$/;
 
-/** Create a serializable MapLibre vector tile URL template for one or more COGP files. */
-export function cogpUrl(url: string, options?: CogpLayerOptions): string;
-export function cogpUrl(layers: Record<string, CogpLayerInput>): string;
-export function cogpUrl(input: string | Record<string, CogpLayerInput>, options?: CogpLayerOptions): string {
-  const layers: CogpLayer[] = typeof input === 'string'
-    ? [normalizeLayer(COGP_SOURCE_LAYER, { url: input, ...options })]
-    : Object.entries(input).map(([name, entry]) => normalizeLayer(name,
-      typeof entry === 'string' ? { url: entry } : entry));
+/** Create a serializable MapLibre vector tile URL template from named COGP layers. */
+export function cogpUrl(input: Record<string, CogpLayerInput>): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('COGP source requires a name-to-layer object');
+  }
+  const layers: CogpLayer[] = Object.entries(input).map(([name, entry]) => normalizeLayer(name,
+    typeof entry === 'string' ? { url: entry } : entry));
   if (layers.length === 0) throw new Error('COGP source requires at least one layer');
   layers.sort((a, b) => a.name.localeCompare(b.name));
   return `cogp://tile/v1/${encode({ layers })}/{z}/{x}/{y}.pbf`;
