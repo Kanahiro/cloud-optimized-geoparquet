@@ -6,8 +6,8 @@ MapLibre GL JS vector source adapter for Cloud Optimized GeoParquet (COGP).
 npm install @cogp/maplibre @cogp/reader maplibre-gl
 ```
 
-Register the protocol once, then pass the URL returned by `cogpUrl` to a
-MapLibre vector source. `cogpUrl` includes the layer configuration in the URL,
+Register the protocol once, then pass the tile URL template returned by `cogpUrl`
+to a MapLibre vector source. `cogpUrl` includes the layer configuration in the URL,
 so the source can be recreated without carrying a protocol instance.
 
 ```ts
@@ -23,7 +23,7 @@ const map = new maplibregl.Map({
     sources: {
       city: {
         type: 'vector',
-        url: cogpUrl({
+        tiles: [cogpUrl({
           buildings: {
             url: 'https://example.com/buildings.cogp.parquet',
             properties: {
@@ -33,7 +33,9 @@ const map = new maplibregl.Map({
             maxRowsPerTile: 10_000,
           },
           roads: 'https://example.com/roads.cogp.parquet',
-        }),
+        })],
+        minzoom: 0,
+        maxzoom: 24,
       },
     },
     layers: [

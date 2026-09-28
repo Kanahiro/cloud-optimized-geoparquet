@@ -126,7 +126,9 @@ function installCogpSource(): void {
 
   map.addSource(COGP_SOURCE_ID, {
     type: 'vector',
-    url: sourceUrl(active.url),
+    tiles: [sourceUrl(active.url)],
+    minzoom: 0,
+    maxzoom: 24,
   });
   map.addLayer({
     id: 'cogp-fill',
@@ -252,7 +254,7 @@ fetchPropertiesInput.addEventListener('change', () => {
   hidePropertyPopup();
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
-  if (active) source.setUrl(sourceUrl(active.url));
+  if (active) source.setTiles([sourceUrl(active.url)]);
 });
 
 loadBtn.addEventListener('click', () => {

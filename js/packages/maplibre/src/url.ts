@@ -19,10 +19,9 @@ export interface CogpConfig {
   layers: CogpLayer[];
 }
 
-const SOURCE = /^cogp:\/\/source\/v1\/([A-Za-z0-9_-]+)$/;
 const TILE = /^cogp:\/\/tile\/v1\/([A-Za-z0-9_-]+)\/(\d+)\/(\d+)\/(\d+)\.pbf$/;
 
-/** Create a serializable MapLibre vector source URL for one or more COGP files. */
+/** Create a serializable MapLibre vector tile URL template for one or more COGP files. */
 export function cogpUrl(url: string, options?: CogpLayerOptions): string;
 export function cogpUrl(layers: Record<string, CogpLayerInput>): string;
 export function cogpUrl(input: string | Record<string, CogpLayerInput>, options?: CogpLayerOptions): string {
@@ -32,13 +31,7 @@ export function cogpUrl(input: string | Record<string, CogpLayerInput>, options?
       typeof entry === 'string' ? { url: entry } : entry));
   if (layers.length === 0) throw new Error('COGP source requires at least one layer');
   layers.sort((a, b) => a.name.localeCompare(b.name));
-  return `cogp://source/v1/${encode({ layers })}`;
-}
-
-export function parseSourceUrl(url: string): CogpConfig {
-  const match = SOURCE.exec(url);
-  if (!match) throw new Error(`Invalid COGP source URL: ${url}`);
-  return decodeConfig(match[1]!);
+  return `cogp://tile/v1/${encode({ layers })}/{z}/{x}/{y}.pbf`;
 }
 
 export function parseTileUrl(url: string): { config: CogpConfig; z: number; x: number; y: number } {
@@ -49,12 +42,6 @@ export function parseTileUrl(url: string): { config: CogpConfig; z: number; x: n
     throw new Error(`Invalid COGP tile coordinates: ${url}`);
   }
   return { config: decodeConfig(match[1]!), z: z!, x: x!, y: y! };
-}
-
-export function tileJsonUrl(sourceUrl: string): string {
-  const match = SOURCE.exec(sourceUrl);
-  if (!match) throw new Error(`Invalid COGP source URL: ${sourceUrl}`);
-  return `cogp://tile/v1/${match[1]}/{z}/{x}/{y}.pbf`;
 }
 
 function normalizeLayer(name: string, entry: { url: string } & CogpLayerOptions): CogpLayer {

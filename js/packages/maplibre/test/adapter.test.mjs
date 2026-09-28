@@ -4,8 +4,8 @@ import { createRequire } from 'node:module';
 import test from 'node:test';
 import { CogpReader } from '@cogp/reader';
 import { cogpUrl, COGP_SOURCE_LAYER, registerCogpProtocol } from '../dist/index.js';
-import { parseSourceUrl, parseTileUrl, tileJsonUrl } from '../dist/url.js';
-import { prepareConfig, renderTile } from '../dist/tile.js';
+import { parseTileUrl } from '../dist/url.js';
+import { renderTile } from '../dist/tile.js';
 
 const require = createRequire(import.meta.url);
 const { VectorTile } = require('@mapbox/vector-tile');
@@ -21,8 +21,8 @@ async function fixtureReader(name) {
   }, `fixture:${name}`);
 }
 
-test('cogpUrl keeps configuration in a versioned, serializable URL', () => {
-  const source = cogpUrl({
+test('cogpUrl keeps configuration in a versioned, serializable tile template', () => {
+  const template = cogpUrl({
     roads: 'https://example.com/roads.cogp.parquet?token=a%2Fb',
     buildings: {
       url: 'https://example.com/buildings.cogp.parquet',
@@ -30,13 +30,12 @@ test('cogpUrl keeps configuration in a versioned, serializable URL', () => {
       maxRowsPerTile: 7,
     },
   });
-  assert.match(source, /^cogp:\/\/source\/v1\//);
-  assert.deepEqual(parseSourceUrl(source).layers.map(layer => layer.name), ['buildings', 'roads']);
-  assert.equal(parseSourceUrl(source).layers[1].url, 'https://example.com/roads.cogp.parquet?token=a%2Fb');
-  assert.equal(parseSourceUrl(source).layers[0].properties.value, 'struct.array[1]');
-  assert.equal(tileJsonUrl(source), source.replace('source', 'tile') + '/{z}/{x}/{y}.pbf');
-  assert.deepEqual(parseTileUrl(tileJsonUrl(source).replace('{z}/{x}/{y}', '2/1/3')).config, parseSourceUrl(source));
-  assert.equal(parseSourceUrl(cogpUrl('https://example.com/data.parquet')).layers[0].name, COGP_SOURCE_LAYER);
+  assert.match(template, /^cogp:\/\/tile\/v1\/[A-Za-z0-9_-]+\/\{z\}\/\{x\}\/\{y\}\.pbf$/);
+  const config = parseTileUrl(template.replace('{z}/{x}/{y}', '2/1/3')).config;
+  assert.deepEqual(config.layers.map(layer => layer.name), ['buildings', 'roads']);
+  assert.equal(config.layers[1].url, 'https://example.com/roads.cogp.parquet?token=a%2Fb');
+  assert.equal(config.layers[0].properties.value, 'struct.array[1]');
+  assert.equal(parseTileUrl(cogpUrl('https://example.com/data.parquet').replace('{z}/{x}/{y}', '0/0/0')).config.layers[0].name, COGP_SOURCE_LAYER);
 });
 
 test('invalid source options and tile coordinates fail early', () => {
@@ -45,8 +44,8 @@ test('invalid source options and tile coordinates fail early', () => {
   assert.throws(() => cogpUrl('https://'), /HTTP\(S\)/);
   assert.throws(() => cogpUrl('https://example.com/data.parquet', { maxRowsPerTile: -1 }), /maxRowsPerTile/);
   assert.throws(() => cogpUrl('https://example.com/data.parquet', { properties: { x: '' } }), /mapping/);
-  const source = cogpUrl('https://example.com/data.parquet');
-  assert.throws(() => parseTileUrl(tileJsonUrl(source).replace('{z}/{x}/{y}', '1/2/0')), /coordinates/);
+  const template = cogpUrl('https://example.com/data.parquet');
+  assert.throws(() => parseTileUrl(template.replace('{z}/{x}/{y}', '1/2/0')), /coordinates/);
 });
 
 test('registration is explicit and idempotent for each MapLibre module', () => {
@@ -58,7 +57,7 @@ test('registration is explicit and idempotent for each MapLibre module', () => {
   assert.equal(calls[0][0], 'cogp');
 });
 
-test('protocol serves TileJSON and MVT requests through its worker', async () => {
+test('protocol serves MVT requests through its worker', async () => {
   const OriginalWorker = globalThis.Worker;
   const messages = [];
   globalThis.Worker = class {
@@ -70,7 +69,7 @@ test('protocol serves TileJSON and MVT requests through its worker', async () =>
       queueMicrotask(() => this.listeners.get('message')({ data: {
         id: request.id,
         ok: true,
-        ...(request.type === 'tile' ? { data: Uint8Array.of(1, 2, 3).buffer } : {}),
+        data: Uint8Array.of(1, 2, 3).buffer,
       } }));
     }
     terminate() {}
@@ -78,14 +77,11 @@ test('protocol serves TileJSON and MVT requests through its worker', async () =>
   try {
     let load;
     registerCogpProtocol({ addProtocol(_scheme, action) { load = action; } });
-    const source = cogpUrl({ roads: 'https://example.com/roads.parquet' });
+    const template = cogpUrl({ roads: 'https://example.com/roads.parquet' });
     const controller = new AbortController();
-    const json = await load({ type: 'json', url: source }, controller);
-    assert.deepEqual(json.data.vector_layers.map(layer => layer.id), ['roads']);
-    assert.deepEqual(json.data.tiles, [tileJsonUrl(source)]);
-    const tile = await load({ type: 'arrayBuffer', url: tileJsonUrl(source).replace('{z}/{x}/{y}', '0/0/0') }, controller);
+    const tile = await load({ type: 'arrayBuffer', url: template.replace('{z}/{x}/{y}', '0/0/0') }, controller);
     assert.deepEqual([...new Uint8Array(tile.data)], [1, 2, 3]);
-    assert.deepEqual(messages.map(message => message.type), ['prepare', 'tile']);
+    assert.deepEqual(messages.map(message => message.type), ['tile']);
   } finally {
     globalThis.Worker = OriginalWorker;
   }
@@ -99,16 +95,15 @@ test('multiple files become named MVT layers with projected properties', async (
     ['https://example.com/attributes.parquet', attributes],
     ['https://example.com/refinement.parquet', refinement],
   ]);
-  const config = parseSourceUrl(cogpUrl({
+  const config = parseTileUrl(cogpUrl({
     buildings: {
       url: 'https://example.com/attributes.parquet',
       properties: { label: 'nested.label', second: 'values[1]', id: 'id' },
       maxRowsPerTile: 5,
     },
     roads: { url: 'https://example.com/refinement.parquet', properties: {} },
-  }));
+  }).replace('{z}/{x}/{y}', '0/0/0')).config;
   const getReader = url => readers.get(url);
-  await prepareConfig(config, getReader);
   const bytes = await renderTile(config, 0, 0, 0, getReader);
   const tile = new VectorTile(new Pbf(new Uint8Array(bytes)));
   assert.deepEqual(Object.keys(tile.layers).sort(), ['buildings', 'roads']);
@@ -122,7 +117,7 @@ test('multiple files become named MVT layers with projected properties', async (
 
 test('omitted options read every attribute and leave row count unlimited', async () => {
   const reader = await fixtureReader('attribute-encodings');
-  const config = parseSourceUrl(cogpUrl('https://example.com/attributes.parquet'));
+  const config = parseTileUrl(cogpUrl('https://example.com/attributes.parquet').replace('{z}/{x}/{y}', '0/0/0')).config;
   const bytes = await renderTile(config, 0, 0, 0, async () => reader);
   const tile = new VectorTile(new Pbf(new Uint8Array(bytes)));
   assert.ok(tile.layers.cogp.length > 5);

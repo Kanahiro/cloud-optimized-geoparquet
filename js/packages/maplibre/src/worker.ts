@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import { CogpReader } from '@cogp/reader';
-import { prepareConfig, renderTile } from './tile.js';
+import { renderTile } from './tile.js';
 import type { WorkerRequest, WorkerResponse } from './messages.js';
 
 const scope = self as DedicatedWorkerGlobalScope;
@@ -34,15 +34,9 @@ scope.addEventListener('message', (event: MessageEvent<WorkerRequest>) => {
   controllers.set(request.id, controller);
   void (async () => {
     try {
-      if (request.type === 'prepare') {
-        await prepareConfig(request.config, getReader, controller.signal);
-        const response: WorkerResponse = { id: request.id, ok: true };
-        scope.postMessage(response);
-      } else {
-        const data = await renderTile(request.config, request.z, request.x, request.y, getReader, controller.signal);
-        const response: WorkerResponse = { id: request.id, ok: true, data };
-        scope.postMessage(response, [data]);
-      }
+      const data = await renderTile(request.config, request.z, request.x, request.y, getReader, controller.signal);
+      const response: WorkerResponse = { id: request.id, ok: true, data };
+      scope.postMessage(response, [data]);
     } catch (error) {
       const cause = error as Error;
       const response: WorkerResponse = {

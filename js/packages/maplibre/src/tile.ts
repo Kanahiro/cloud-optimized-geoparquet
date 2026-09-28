@@ -5,17 +5,6 @@ export type GetReader = (url: string) => Promise<CogpReader>;
 
 const VECTOR_TILE_SIZE = 512;
 
-export async function prepareConfig(config: CogpConfig, getReader: GetReader, signal?: AbortSignal): Promise<void> {
-  await Promise.all(config.layers.map(async layer => {
-    const reader = await getReader(layer.url);
-    signal?.throwIfAborted();
-    if (layer.properties !== undefined) {
-      // maxRows: 0 validates every nested path without fetching data pages.
-      await reader.read({ columns: Object.values(layer.properties), maxRows: 0, signal });
-    }
-  }));
-}
-
 export async function renderTile(
   config: CogpConfig, z: number, x: number, y: number, getReader: GetReader, signal?: AbortSignal,
 ): Promise<ArrayBuffer> {
