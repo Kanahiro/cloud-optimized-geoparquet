@@ -26,7 +26,8 @@
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@cogp/reader": "workspace:^"
+    "@cogp/reader": "workspace:^",
+    "@hpcc-js/wasm-zstd": "1.15.0"
   },
   "peerDependencies": {
     "maplibre-gl": "^6.0.0"

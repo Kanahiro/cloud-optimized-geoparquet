@@ -1,11 +1,10 @@
 import * as maplibregl from 'maplibre-gl';
 import type { LngLatBoundsLike } from 'maplibre-gl';
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-import { cogpUrl, registerCogpProtocol } from '@cogp/maplibre';
+import { cogpUrl, getCogpStats, inspectCogp, registerCogpProtocol, type CogpDatasetInfo } from '@cogp/maplibre';
 
-import { openDataset as openCogpDataset, type OpenResult } from '../../shared/dataset-service';
 import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
-import { datasetName, escapeHtml, formatBytes, formatDistance } from '../../shared/format';
+import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
 
 // MapLibre v6 derives its worker URL from import.meta.url, which breaks once
@@ -119,6 +118,7 @@ map.on('load', () => {
 });
 map.on('move', renderLevel);
 map.on('idle', renderFeaturesInView);
+map.on('idle', () => { void renderStats(); });
 
 function installCogpSource(): void {
   if (!map.isStyleLoaded()) return;
@@ -211,6 +211,24 @@ function renderFeaturesInView(): void {
   statFeatures.textContent = `${(ids.size + unnamed).toLocaleString()} features`;
 }
 
+async function renderStats(): Promise<void> {
+  const ds = active;
+  if (!ds) return;
+  const { requests, bytes, tileMs } = await getCogpStats(ds.url);
+  if (active !== ds) return;
+  const share = ds.byteLength ? bytes / ds.byteLength : 0;
+  statFetched.innerHTML = `${formatBytes(bytes)} in ${requests.toLocaleString()} requests`
+    + (ds.byteLength ? ` <small>· ${formatPercent(share)} of ${formatBytes(ds.byteLength)}</small>` : '');
+  if (tileMs.length) {
+    const sorted = tileMs.sort((a, b) => a - b);
+    const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
+    statTiles.innerHTML = `median ${at(0.5).toFixed(0)} ms · p90 ${at(0.9).toFixed(0)} ms`
+      + ` <small>(${tileMs.length} tiles)</small>`;
+  } else {
+    statTiles.textContent = '–';
+  }
+}
+
 const urlInput = document.getElementById('url') as HTMLInputElement;
 const presetSelect = document.getElementById('preset') as HTMLSelectElement;
 const loadBtn = document.getElementById('load') as HTMLButtonElement;
@@ -223,6 +241,8 @@ const panelToggle = document.getElementById('panel-toggle') as HTMLButtonElement
 const statsEl = document.getElementById('stats') as HTMLDListElement;
 const statLevel = document.getElementById('stat-level') as HTMLElement;
 const statFeatures = document.getElementById('stat-features') as HTMLElement;
+const statFetched = document.getElementById('stat-fetched') as HTMLElement;
+const statTiles = document.getElementById('stat-tiles') as HTMLElement;
 const smallScreen = window.matchMedia('(max-width: 640px)');
 
 function setStatus(msg: string, error = false): void {
@@ -244,7 +264,7 @@ interface ActiveDataset {
   url: string;
   byteLength: number;
   dataBbox: LngLatBoundsLike | null;
-  summary: OpenResult['geo'];
+  summary: CogpDatasetInfo['geo'];
 }
 
 let active: ActiveDataset | null = null;
@@ -258,6 +278,7 @@ fetchPropertiesInput.addEventListener('change', () => {
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
   if (active) source.setTiles([sourceUrl(active.url)]);
+  void renderStats();
 });
 
 loadBtn.addEventListener('click', () => {
@@ -290,7 +311,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { geo, numRowGroups, byteLength, dataBbox } = await openCogpDataset(url, controller.signal);
+    const { geo, numRowGroups, byteLength, dataBbox } = await inspectCogp(url, controller.signal);
     if (latestUrl !== url) return;
     active = {
       url,
@@ -307,6 +328,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
     installCogpSource();
     statsEl.hidden = false;
     renderLevel();
+    void renderStats();
     statFeatures.textContent = '–';
     setStatus(`${datasetName(url)} · ${formatBytes(byteLength)} · ${numRowGroups} row groups · ${geo.lod.levels.length} levels`);
     // Give the map the screen on phones once there is something to look at.
@@ -326,7 +348,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   }
 }
 
-function renderMetadata(summary: OpenResult['geo']): void {
+function renderMetadata(summary: CogpDatasetInfo['geo']): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
 }
 

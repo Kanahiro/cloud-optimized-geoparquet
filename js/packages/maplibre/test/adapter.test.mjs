@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 import { CogpReader } from '@cogp/reader';
-import { cogpUrl, registerCogpProtocol } from '../dist/index.js';
+import { cogpUrl, getCogpStats, inspectCogp, registerCogpProtocol } from '../dist/index.js';
 import { parseTileUrl } from '../dist/url.js';
 import { renderTile } from '../dist/tile.js';
 
@@ -59,7 +59,7 @@ test('registration is explicit and idempotent for each MapLibre module', () => {
   assert.equal(calls[0][0], 'cogp');
 });
 
-test('protocol serves MVT requests through its worker', async () => {
+test('inspection, stats, and MVT requests share one worker', async () => {
   const OriginalWorker = globalThis.Worker;
   const messages = [];
   globalThis.Worker = class {
@@ -71,7 +71,11 @@ test('protocol serves MVT requests through its worker', async () => {
       queueMicrotask(() => this.listeners.get('message')({ data: {
         id: request.id,
         ok: true,
-        data: Uint8Array.of(1, 2, 3).buffer,
+        ...(request.type === 'inspect'
+          ? { info: { numRowGroups: 2, byteLength: 100, dataBbox: null, geo: {} } }
+          : request.type === 'stats'
+            ? { stats: { requests: 3, bytes: 75, tileMs: [4, 6] } }
+            : { data: Uint8Array.of(1, 2, 3).buffer }),
       } }));
     }
     terminate() {}
@@ -81,9 +85,11 @@ test('protocol serves MVT requests through its worker', async () => {
     registerCogpProtocol({ addProtocol(_scheme, action) { load = action; } });
     const template = cogpUrl({ roads: { url: 'https://example.com/roads.parquet' } });
     const controller = new AbortController();
+    assert.equal((await inspectCogp('https://example.com/roads.parquet', controller.signal)).numRowGroups, 2);
     const tile = await load({ type: 'arrayBuffer', url: template.replace('{z}/{x}/{y}', '0/0/0') }, controller);
     assert.deepEqual([...new Uint8Array(tile.data)], [1, 2, 3]);
-    assert.deepEqual(messages.map(message => message.type), ['tile']);
+    assert.equal((await getCogpStats('https://example.com/roads.parquet')).bytes, 75);
+    assert.deepEqual(messages.map(message => message.type), ['inspect', 'tile', 'stats']);
   } finally {
     globalThis.Worker = OriginalWorker;
   }

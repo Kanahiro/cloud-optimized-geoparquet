@@ -1,6 +1,6 @@
 import type { WorkerRequest, WorkerResponse } from './messages.js';
 
-type Request = Extract<WorkerRequest, { type: 'prepare' | 'tile' }>;
+type Request = Extract<WorkerRequest, { type: 'inspect' | 'stats' | 'tile' }>;
 type RequestInput = Request extends infer T ? T extends Request ? Omit<T, 'id'> : never : never;
 
 let worker: Worker | undefined;
