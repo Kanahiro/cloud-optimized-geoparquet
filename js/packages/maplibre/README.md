@@ -32,7 +32,7 @@ const map = new maplibregl.Map({
             },
             maxRowsPerTile: 10_000,
           },
-          roads: 'https://example.com/roads.cogp.parquet',
+          roads: { url: 'https://example.com/roads.cogp.parquet' },
         })],
         minzoom: 0,
         maxzoom: 24,
@@ -48,7 +48,7 @@ const map = new maplibregl.Map({
 
 Each named entry produces one MVT `source-layer`. For a single file, use a
 single named entry, for example
-`cogpUrl({ parcels: 'https://example.com/data.cogp.parquet' })`, and set
+`cogpUrl({ parcels: { url: 'https://example.com/data.cogp.parquet' } })`, and set
 `source-layer` to `parcels`.
 
 Options are optional. With no `properties` mapping, all ordinary attributes

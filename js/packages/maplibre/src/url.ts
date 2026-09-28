@@ -7,11 +7,12 @@ export interface CogpLayerOptions {
   maxRowsPerTile?: number;
 }
 
-export type CogpLayerInput = string | ({ url: string } & CogpLayerOptions);
-
-export interface CogpLayer extends CogpLayerOptions {
-  name: string;
+export interface CogpLayerInput extends CogpLayerOptions {
   url: string;
+}
+
+export interface CogpLayer extends CogpLayerInput {
+  name: string;
 }
 
 export interface CogpConfig {
@@ -25,8 +26,7 @@ export function cogpUrl(input: Record<string, CogpLayerInput>): string {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('COGP source requires a name-to-layer object');
   }
-  const layers: CogpLayer[] = Object.entries(input).map(([name, entry]) => normalizeLayer(name,
-    typeof entry === 'string' ? { url: entry } : entry));
+  const layers: CogpLayer[] = Object.entries(input).map(([name, entry]) => normalizeLayer(name, entry));
   if (layers.length === 0) throw new Error('COGP source requires at least one layer');
   layers.sort((a, b) => a.name.localeCompare(b.name));
   return `cogp://tile/v1/${encode({ layers })}/{z}/{x}/{y}.pbf`;
@@ -42,8 +42,11 @@ export function parseTileUrl(url: string): { config: CogpConfig; z: number; x: n
   return { config: decodeConfig(match[1]!), z: z!, x: x!, y: y! };
 }
 
-function normalizeLayer(name: string, entry: { url: string } & CogpLayerOptions): CogpLayer {
+function normalizeLayer(name: string, entry: CogpLayerInput): CogpLayer {
   if (!name) throw new Error('COGP layer name must not be empty');
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`COGP layer ${name} requires an object with a url`);
+  }
   let parsed: URL | undefined;
   try { parsed = new URL(entry?.url); } catch { /* Invalid URLs are reported below. */ }
   if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
@@ -87,7 +90,7 @@ function decodeConfig(token: string): CogpConfig {
     if (!entry || typeof entry !== 'object' || !('name' in entry) || typeof entry.name !== 'string') {
       throw new Error('Invalid COGP URL layer');
     }
-    return normalizeLayer(entry.name, entry as unknown as { url: string } & CogpLayerOptions);
+    return normalizeLayer(entry.name, entry as unknown as CogpLayerInput);
   });
   if (new Set(layers.map(layer => layer.name)).size !== layers.length) {
     throw new Error('Duplicate COGP layer name');

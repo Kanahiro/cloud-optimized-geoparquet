@@ -178,7 +178,7 @@ function removeCogpLayersAndSource(): void {
 
 function sourceUrl(url: string): string {
   return cogpUrl({
-    [COGP_LAYER_NAME]: fetchPropertiesInput.checked ? url : { url, properties: {} },
+    [COGP_LAYER_NAME]: fetchPropertiesInput.checked ? { url } : { url, properties: {} },
   });
 }
 

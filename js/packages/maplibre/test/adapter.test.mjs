@@ -23,7 +23,7 @@ async function fixtureReader(name) {
 
 test('cogpUrl keeps configuration in a versioned, serializable tile template', () => {
   const template = cogpUrl({
-    roads: 'https://example.com/roads.cogp.parquet?token=a%2Fb',
+    roads: { url: 'https://example.com/roads.cogp.parquet?token=a%2Fb' },
     buildings: {
       url: 'https://example.com/buildings.cogp.parquet',
       properties: { height: 'struct.child.height', value: 'struct.array[1]' },
@@ -35,17 +35,18 @@ test('cogpUrl keeps configuration in a versioned, serializable tile template', (
   assert.deepEqual(config.layers.map(layer => layer.name), ['buildings', 'roads']);
   assert.equal(config.layers[1].url, 'https://example.com/roads.cogp.parquet?token=a%2Fb');
   assert.equal(config.layers[0].properties.value, 'struct.array[1]');
-  assert.equal(parseTileUrl(cogpUrl({ parcels: 'https://example.com/data.parquet' }).replace('{z}/{x}/{y}', '0/0/0')).config.layers[0].name, 'parcels');
+  assert.equal(parseTileUrl(cogpUrl({ parcels: { url: 'https://example.com/data.parquet' } }).replace('{z}/{x}/{y}', '0/0/0')).config.layers[0].name, 'parcels');
 });
 
 test('invalid source options and tile coordinates fail early', () => {
   assert.throws(() => cogpUrl({}), /at least one layer/);
   assert.throws(() => cogpUrl('https://example.com/data.parquet'), /name-to-layer object/);
-  assert.throws(() => cogpUrl({ parcels: 'file:///tmp/data.parquet' }), /HTTP\(S\)/);
-  assert.throws(() => cogpUrl({ parcels: 'https://' }), /HTTP\(S\)/);
+  assert.throws(() => cogpUrl({ parcels: 'https://example.com/data.parquet' }), /object with a url/);
+  assert.throws(() => cogpUrl({ parcels: { url: 'file:///tmp/data.parquet' } }), /HTTP\(S\)/);
+  assert.throws(() => cogpUrl({ parcels: { url: 'https://' } }), /HTTP\(S\)/);
   assert.throws(() => cogpUrl({ parcels: { url: 'https://example.com/data.parquet', maxRowsPerTile: -1 } }), /maxRowsPerTile/);
   assert.throws(() => cogpUrl({ parcels: { url: 'https://example.com/data.parquet', properties: { x: '' } } }), /mapping/);
-  const template = cogpUrl({ parcels: 'https://example.com/data.parquet' });
+  const template = cogpUrl({ parcels: { url: 'https://example.com/data.parquet' } });
   assert.throws(() => parseTileUrl(template.replace('{z}/{x}/{y}', '1/2/0')), /coordinates/);
 });
 
@@ -78,7 +79,7 @@ test('protocol serves MVT requests through its worker', async () => {
   try {
     let load;
     registerCogpProtocol({ addProtocol(_scheme, action) { load = action; } });
-    const template = cogpUrl({ roads: 'https://example.com/roads.parquet' });
+    const template = cogpUrl({ roads: { url: 'https://example.com/roads.parquet' } });
     const controller = new AbortController();
     const tile = await load({ type: 'arrayBuffer', url: template.replace('{z}/{x}/{y}', '0/0/0') }, controller);
     assert.deepEqual([...new Uint8Array(tile.data)], [1, 2, 3]);
@@ -118,7 +119,7 @@ test('multiple files become named MVT layers with projected properties', async (
 
 test('omitted options read every attribute and leave row count unlimited', async () => {
   const reader = await fixtureReader('attribute-encodings');
-  const config = parseTileUrl(cogpUrl({ parcels: 'https://example.com/attributes.parquet' }).replace('{z}/{x}/{y}', '0/0/0')).config;
+  const config = parseTileUrl(cogpUrl({ parcels: { url: 'https://example.com/attributes.parquet' } }).replace('{z}/{x}/{y}', '0/0/0')).config;
   const bytes = await renderTile(config, 0, 0, 0, async () => reader);
   const tile = new VectorTile(new Pbf(new Uint8Array(bytes)));
   assert.ok(tile.layers.parcels.length > 5);
