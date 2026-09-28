@@ -128,7 +128,7 @@ This repository is the source of truth for the specification and its reference
 implementations:
 
 - [`cogp-rs`](./cogp-rs): Rust producer, validator, CLI, and reader library.
-- [`js`](./js): TypeScript packages ([`@cogp/reader`](./js/packages/reader)) and the browser demo ([`js/demo`](./js/demo)).
+- [`js`](./js): TypeScript packages ([`@cogp/reader`](./js/packages/reader), [`@cogp/maplibre`](./js/packages/maplibre)) and the browser demo ([`js/demo`](./js/demo)).
 
 The implementations remain independently publishable. The repository root owns
 shared dependency locks, CI, releases, and development commands so changes to the
@@ -144,12 +144,15 @@ separately, each with its own tag prefix:
 | Specification | `spec-v<version>` | GitHub Releases |
 | `cogp-rs` | `cogp-rs-v<version>` | GitHub Releases (binaries), crates.io (`cogp`) |
 | `@cogp/reader` (`js/packages/reader`) | `cogp-js-v<version>` | npm (`@cogp/reader`) |
+| `@cogp/maplibre` (`js/packages/maplibre`) | `cogp-maplibre-v<version>` | npm (`@cogp/maplibre`) |
 
 Each implementation README states the specification version it implements.
 To release an implementation, bump the version in its `Cargo.toml` or
 `package.json`, merge, then publish a GitHub Release whose tag matches that
 version. Tags `v0.1.0`–`v2.0.1` predate this split and covered the whole
 repository.
+Release `@cogp/reader` 2.1.3 or newer before `@cogp/maplibre` 0.1.0, since
+the adapter depends on nested column selection in that reader version.
 
 The demo is not released: it deploys to GitHub Pages from `main` whenever
 `js/**` changes.

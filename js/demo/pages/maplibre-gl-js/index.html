@@ -32,7 +32,8 @@
       <div id="panel-body" class="panel-body">
         <p class="hint">
           Map tiles are read straight from one Parquet file with HTTP range
-          requests, then encoded to MVT in a worker.
+          requests by <a href="https://www.npmjs.com/package/@cogp/maplibre" target="_blank" rel="noopener noreferrer">@cogp/maplibre</a>,
+          then encoded to MVT in a worker.
           <a
             href="https://github.com/Kanahiro/cloud-optimized-geoparquet"
             target="_blank"
@@ -93,10 +94,6 @@
           <dd id="stat-level">–</dd>
           <dt>In view</dt>
           <dd id="stat-features">–</dd>
-          <dt>Fetched</dt>
-          <dd id="stat-fetched">–</dd>
-          <dt>Tile time</dt>
-          <dd id="stat-tiles">–</dd>
         </dl>
 
         <details class="metadata">

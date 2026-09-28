@@ -27,6 +27,23 @@ const arrow = toGeoArrow(batch, { crs: 'OGC:CRS84' }); // Arrow IPC stream bytes
 const detail = await reader.readRow(batch.rowIndex[0]!, { columns: ['id'] }); // a one-row batch
 ```
 
+Select one field of a nested Parquet struct with a dotted path. The result uses
+the same path as its column key, and the reader fetches only that physical leaf,
+not its sibling fields. A list index selects one decoded element after reading
+the entire list:
+
+```ts
+const batch = await reader.read({ columns: ['geometry', 'building.details.height', 'building.floors[1]'] });
+batch.columns['building.details.height'];
+batch.columns['building.floors[1]'];
+```
+
+Paths can cross structs and indexed lists, but not maps. Fields inside an indexed
+list remain available (for example `building.floors[1].height`), although the
+whole list is read. An out-of-range index returns null. Selecting a top-level
+struct still returns the whole nested value. Missing paths fail before column
+data is read.
+
 `read()` returns a columnar `CogpBatch` and creates no per-row objects: `rowIndex`
 holds each result row's source row, `columns` holds the requested attributes as
 decoded by hyparquet (typed arrays where the Parquet type allows), and `geometry`

@@ -182,6 +182,46 @@ test('plain attribute encoding preserves scalars, binary and nested values', asy
   assert.deepEqual(first, rows[0]);
 });
 
+test('dotted struct projection reads only selected physical children', async () => {
+  const { reader, requests } = await openFixture('attribute-encodings');
+  const unused = reader.metadata.row_groups.flatMap(group => group.columns)
+    .filter(chunk => chunk.meta_data.path_in_schema.join('.') === 'nested.label')
+    .map(chunk => {
+      const meta = chunk.meta_data;
+      const start = Number(meta.dictionary_page_offset ?? meta.data_page_offset);
+      return [start, start + Number(meta.total_compressed_size)];
+    });
+  const batch = await reader.read({
+    columns: ['id', 'nested.score', 'geometry'],
+    bbox: [-180, -90, 180, 90],
+    useOverview: true,
+    maxRows: 3,
+  });
+  assert.deepEqual(Object.keys(batch.columns), ['id', 'nested.score']);
+  assert.deepEqual([...batch.columns['nested.score']], [5, 7.75, 8]);
+  assert.ok(batch.geometry);
+  for (const [start, end] of unused) {
+    assert.ok(requests.every(([a, b]) => b <= start || a >= end), 'unselected struct child was fetched');
+  }
+
+  const row = await readRecord(reader, 0, { columns: ['nested.score'] });
+  assert.deepEqual(row, { 'nested.score': 5 });
+  await assert.rejects(reader.read({ columns: ['nested.missing'] }), /parquet column not found/);
+  await assert.rejects(reader.read({ columns: ['nested.score.child'] }), /non-struct field/);
+});
+
+test('list indices select decoded elements, including null and out-of-range values', async () => {
+  const { reader } = await openFixture('attribute-encodings');
+  const batch = await reader.read({ columns: ['id', 'values[0]', 'values[1]', 'values[99]'], maxRows: 3 });
+  assert.deepEqual([...batch.columns['values[0]']], [20.5, 31.5, 32.5]);
+  assert.deepEqual([...batch.columns['values[1]']], [null, null, null]);
+  assert.deepEqual([...batch.columns['values[99]']], [null, null, null]);
+  assert.deepEqual(await readRecord(reader, 0, { columns: ['values[0]'] }), { 'values[0]': 20.5 });
+  const all = await reader.read({ columns: ['id', 'values[0]'] });
+  assert.equal(all.columns['values[0]'][[...all.columns.id].indexOf(9)], null);
+  await assert.rejects(reader.read({ columns: ['nested.score[1]'] }), /not a list/);
+});
+
 test('toGeoJSON and toMvt accept a CogpBatch as is', async () => {
   const { toGeoJSON, toMvt } = await import('../dist/index.js');
   const { reader } = await openFixture('shared');

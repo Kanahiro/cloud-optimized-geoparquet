@@ -1,0 +1,50 @@
+name: Release cogp-maplibre
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (cogp-maplibre-v<version>)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'cogp-maplibre-v')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Check version
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          manifest=$(node -p "require('./js/packages/maplibre/package.json').version")
+          if [ "${tag#cogp-maplibre-v}" != "$manifest" ]; then
+            echo "::error::tag $tag does not match js/packages/maplibre/package.json version $manifest"
+            exit 1
+          fi
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @cogp/reader build
+      - run: pnpm --filter @cogp/maplibre test
+      # pnpm pack rewrites workspace:^ to the published reader version.
+      # npm publish then uses npm's trusted publishing and provenance setup.
+      - run: pnpm pack
+        working-directory: js/packages/maplibre
+      - run: npm publish ./cogp-maplibre-*.tgz --access public
+        working-directory: js/packages/maplibre

@@ -1,22 +1,17 @@
 /// <reference lib="webworker" />
-import { CogpReader, toGeoArrow, toMvt } from '@cogp/reader';
+import { CogpReader, toGeoArrow } from '@cogp/reader';
 import { Zstd } from '@hpcc-js/wasm-zstd';
 
 import {
-  MVT_LAYER_NAME,
   type ArrowResult,
   type BudgetRequest,
   type BudgetResult,
   type NetworkStats,
   type OpenResult,
-  type TileResult,
   type ViewRequest,
   type WorkerMessage,
   type WorkerResponse,
 } from './cogp-types';
-import { tileBounds, tileResolution } from './tiles';
-
-
 
 interface ActiveDataset {
   url: string;
@@ -63,37 +58,6 @@ async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult
   };
 
   return { geo: reader.geo, numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
-}
-
-async function readTile(
-  url: string,
-  z: number,
-  x: number,
-  y: number,
-  fetchProperties: boolean,
-  signal: AbortSignal,
-): Promise<TileResult> {
-  const ds = active;
-  if (!ds || ds.url !== url) {
-    throw new Error('Dataset is no longer active');
-  }
-  const targetResolution = tileResolution(z, y);
-  const geomColumn = ds.reader.primaryGeometryColumn;
-  const maxLevel = ds.reader.selectLevel(targetResolution);
-  const propertyColumns = fetchProperties ? ds.propertyColumns : [];
-  const startedAt = performance.now();
-  const batch = await ds.reader.read({
-    bbox: tileBounds(z, x, y),
-    columns: [geomColumn, ...propertyColumns],
-    maxLevel,
-    // Quantized overviews go straight to toMvt without a GeoJSON tree.
-    useOverview: true,
-    signal,
-  });
-  signal.throwIfAborted();
-  // Attribute lifetime follows MapLibre's tile cache; clicks need no I/O.
-  const data = toMvt(batch, { z, x, y, layer: MVT_LAYER_NAME, signal });
-  return { data, ms: performance.now() - startedAt, network: { ...network } };
 }
 
 /** Read the rows intersecting a view at the level selected for its resolution, as GeoArrow. */
@@ -216,17 +180,6 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       const result: OpenResult = await openDataset(payload.url, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
       self.postMessage(response);
-    } else if (payload.type === 'readTile') {
-      const result: TileResult = await readTile(
-        payload.url,
-        payload.z,
-        payload.x,
-        payload.y,
-        payload.fetchProperties,
-        controller.signal,
-      );
-      const response: WorkerResponse = { id, ok: true, result };
-      self.postMessage(response, { transfer: [result.data] });
     } else if (payload.type === 'readArrow') {
       const result: ArrowResult = await readArrow(payload, controller.signal);
       const response: WorkerResponse = { id, ok: true, result };
