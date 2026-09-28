@@ -15,9 +15,10 @@ import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/
 import { attributeTooltip, createDeckMap, FILL, LINE, type Tooltip } from '../../shared/deck-map';
 import { datasetName, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
+import earcutWorkerUrl from '../../assets/earcut.worker.min.js?url';
 
-/** Upper bound on rows per view, so a coarse view of a large file stays responsive. */
-const MAX_ROWS = 200_000;
+/** Keep layer construction and GPU uploads within a smaller budget on touch devices. */
+const MAX_ROWS = window.matchMedia('(pointer: coarse)').matches ? 20_000 : 200_000;
 const GEOMETRY_FIELD = 'geometry';
 
 interface ActiveDataset {
@@ -109,8 +110,7 @@ function geoArrowLayer(batch: RecordBatch, revision: number): Layer {
         getLineWidth: 1,
         pickable: true,
         autoHighlight: true,
-        // Triangulate on the main thread instead of loading a worker from a CDN.
-        earcutWorkerUrl: null,
+        earcutWorkerUrl,
       });
     case 'geoarrow.multilinestring':
       return new GeoArrowPathLayer({
@@ -142,9 +142,12 @@ function geoArrowLayer(batch: RecordBatch, revision: number): Layer {
 }
 
 function renderTooltip(info: PickingInfo): Tooltip {
-  const row = info.object as { toJSON(): Record<string, unknown> } | undefined;
+  const row = info.object as Record<string, unknown> | undefined;
   if (!row) return null;
-  const entries = Object.entries(row.toJSON()).filter(([key]) => key !== GEOMETRY_FIELD);
+  // Arrow rows read fields lazily; toJSON() would decode the geometry on every pick.
+  const entries: [string, unknown][] = Object.keys(row)
+    .filter((key) => key !== GEOMETRY_FIELD)
+    .map((key) => [key, row[key]]);
   return attributeTooltip(entries, fetchPropertiesInput.checked);
 }
 

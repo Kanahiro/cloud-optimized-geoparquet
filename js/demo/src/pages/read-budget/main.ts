@@ -16,11 +16,14 @@ import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/
 import { attributeTooltip, createDeckMap, type Tooltip } from '../../shared/deck-map';
 import { datasetName, escapeHtml, formatBytes, formatDistance } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
+import earcutWorkerUrl from '../../assets/earcut.worker.min.js?url';
 
 /** Where the map starts without a view in the URL: central Tokyo, covered by every sample. */
 const START_BOUNDS: [[number, number], [number, number]] = [[139.68, 35.63], [139.82, 35.72]];
 /** Row budgets on the slider, in 1-2-5 steps. */
 const BUDGETS = [100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
+/** Cap explicit reads on touch devices, where layer uploads also use the main thread. */
+const TOUCH_MAX_ROWS = 20_000;
 /** Wait this long after the slider stops moving before reading. */
 const BUDGET_DEBOUNCE_MS = 150;
 /** `#max-level` values: no level limit (the default), or the level for the current zoom. */
@@ -207,8 +210,7 @@ function geoArrowLayer(batch: RecordBatch, ds: ActiveDataset): Layer {
         getLineWidth: 1,
         pickable: true,
         autoHighlight: true,
-        // Triangulate on the main thread instead of loading a worker from a CDN.
-        earcutWorkerUrl: null,
+        earcutWorkerUrl,
       });
     case 'geoarrow.multilinestring':
       return new GeoArrowPathLayer({
@@ -240,9 +242,10 @@ function geoArrowLayer(batch: RecordBatch, ds: ActiveDataset): Layer {
 }
 
 function renderTooltip(info: PickingInfo): Tooltip {
-  const row = info.object as { toJSON(): Record<string, unknown> } | undefined;
+  const row = info.object as { rowIndex?: bigint; level?: number } | undefined;
   if (!row) return null;
-  const { rowIndex, level } = row.toJSON() as { rowIndex?: bigint; level?: number };
+  // Arrow rows read fields lazily; only access the two fields shown in the tooltip.
+  const { rowIndex, level } = row;
   const entries: [string, unknown][] = [
     ['level', level === undefined ? '' : level + 1],
     ['row', rowIndex],
@@ -270,6 +273,7 @@ const maxLevelSelect = document.getElementById('max-level') as HTMLSelectElement
 const allOption = maxLevelSelect.options[0]!;
 const autoOption = maxLevelSelect.options[1]!;
 const budgetValue = document.getElementById('budget-value') as HTMLOutputElement;
+const budgetMax = document.getElementById('budget-max') as HTMLElement;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const panel = document.getElementById('panel') as HTMLElement;
 const panelToggle = document.getElementById('panel-toggle') as HTMLButtonElement;
@@ -382,6 +386,12 @@ function datasetStatus(ds: ActiveDataset): string {
   return `${datasetName(ds.url)} · ${formatBytes(ds.byteLength)} · ${ds.summary.lod.levels.length} levels`;
 }
 
+if (window.matchMedia('(pointer: coarse)').matches) {
+  const maxIndex = BUDGETS.indexOf(TOUCH_MAX_ROWS);
+  budgetInput.max = String(maxIndex);
+  budgetInput.value = String(Math.min(Number(budgetInput.value), maxIndex));
+  budgetMax.textContent = TOUCH_MAX_ROWS.toLocaleString();
+}
 showBudget();
 // Keep a shared view from the URL; otherwise frame the area in central Tokyo.
 if (!location.hash) mapView.fitBounds(START_BOUNDS);

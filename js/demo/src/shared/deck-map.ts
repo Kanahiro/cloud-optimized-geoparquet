@@ -58,7 +58,10 @@ export function createDeckMap(options: {
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   const settleAfter = (ms: number): void => {
     clearTimeout(settleTimer);
-    settleTimer = setTimeout(options.onViewSettled, ms);
+    settleTimer = setTimeout(() => {
+      writeHash(viewState);
+      options.onViewSettled();
+    }, ms);
   };
 
   const basemap = new TileLayer<ImageBitmap>({
@@ -84,10 +87,18 @@ export function createDeckMap(options: {
       new ZoomWidget({ placement: 'top-right' }),
       new CompassWidget({ placement: 'top-right' }),
     ],
-    onViewStateChange: ({ viewState: next }) => {
+    // A held touch can pause for longer than the debounce; wait for release.
+    onViewStateChange: ({ viewState: next, interactionState }) => {
       viewState = next as MapViewState;
-      writeHash(viewState);
-      settleAfter(SETTLE_MS);
+      if (!interactionState.isDragging && !interactionState.isPanning && !interactionState.isZooming
+        && !interactionState.inTransition) settleAfter(SETTLE_MS);
+    },
+    onInteractionStateChange: (state) => {
+      if (state.isDragging || state.isPanning || state.isZooming || state.inTransition) {
+        clearTimeout(settleTimer);
+      } else {
+        settleAfter(SETTLE_MS);
+      }
     },
   });
 
