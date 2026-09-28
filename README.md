@@ -116,7 +116,7 @@ a tile-sized `bbox`. `toGeoArrow` writes one record batch that
 `tableFromIPC` from `apache-arrow` (or pyarrow) can read, with the geometry as a
 GeoArrow multi type (`geoarrow.multipolygon`, `geoarrow.multilinestring` or
 `geoarrow.multipoint`). See the [JavaScript reader README](./js/packages/reader/README.md)
-for the full API and the [demo](./js/demo) for rendering with MapLibre or deck.gl.
+for usage and options, and the [demo](./js/demo) for rendering with MapLibre or deck.gl.
 
 ## Specification
 
