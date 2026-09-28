@@ -1,6 +1,6 @@
 {
   "name": "@cogp/maplibre",
-  "version": "0.1.0",
+  "version": "2.1.3",
   "description": "MapLibre GL JS vector tile adapter for Cloud Optimized GeoParquet.",
   "license": "MIT",
   "repository": {

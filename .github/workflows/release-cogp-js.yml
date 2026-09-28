@@ -1,7 +1,7 @@
 name: Release cogp-js
 
-# Runs for GitHub Releases tagged `cogp-js-v<version>`. The spec and cogp-rs
-# are released under their own tag prefixes.
+# Publishes every JavaScript package for one `cogp-js-v<version>` release.
+# The spec and cogp-rs are released under their own tag prefixes.
 on:
   release:
     types: [published]
@@ -32,19 +32,29 @@ jobs:
           node-version: 24
           cache: pnpm
           registry-url: https://registry.npmjs.org
-      - name: Check version
+      - name: Check package versions
         run: |
           tag="${{ github.event.release.tag_name || inputs.tag }}"
-          manifest=$(node -p "require('./js/packages/reader/package.json').version")
-          if [ "${tag#cogp-js-v}" != "$manifest" ]; then
-            echo "::error::tag $tag does not match js/packages/reader/package.json version $manifest"
-            exit 1
-          fi
+          version="${tag#cogp-js-v}"
+          for package in reader maplibre; do
+            manifest=$(node -p "require('./js/packages/$package/package.json').version")
+            if [ "$version" != "$manifest" ]; then
+              echo "::error::tag $tag does not match js/packages/$package/package.json version $manifest"
+              exit 1
+            fi
+          done
       # Trusted Publishing needs npm 11.5.1 or later.
       - run: npm install -g npm@latest
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @cogp/reader test
+      - run: pnpm --filter @cogp/maplibre test
       # Trusted Publishing: npm exchanges this workflow's OIDC token for a
       # short-lived publish credential and attaches provenance automatically.
+      # The adapter depends on this reader version, so publish the reader first.
       - run: npm publish
         working-directory: js/packages/reader
+      # pnpm pack rewrites workspace:^ to the published reader version.
+      - run: pnpm pack
+        working-directory: js/packages/maplibre
+      - run: npm publish ./cogp-maplibre-*.tgz --access public
+        working-directory: js/packages/maplibre
