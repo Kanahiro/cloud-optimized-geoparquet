@@ -3,13 +3,12 @@ import type {
   BudgetRequest,
   BudgetResult,
   OpenResult,
-  TileResult,
   ViewRequest,
   WorkerEnvelope,
   WorkerResponse,
 } from './cogp-types';
 
-export type { ArrowResult, BudgetResult, OpenResult, TileResult } from './cogp-types';
+export type { ArrowResult, BudgetResult, OpenResult } from './cogp-types';
 
 const worker = new Worker(new URL('./cogp-worker.ts', import.meta.url), { type: 'module' });
 
@@ -62,17 +61,6 @@ function call<T>(payload: WorkerEnvelope['payload'], signal?: AbortSignal): Prom
 
 export function openDataset(url: string, signal?: AbortSignal): Promise<OpenResult> {
   return call<OpenResult>({ type: 'open', url }, signal);
-}
-
-export function readTile(
-  url: string,
-  z: number,
-  x: number,
-  y: number,
-  fetchProperties: boolean,
-  signal?: AbortSignal,
-): Promise<TileResult> {
-  return call<TileResult>({ type: 'readTile', url, z, x, y, fetchProperties }, signal);
 }
 
 /** Read the rows intersecting a view at the level for its resolution, as GeoArrow IPC. */

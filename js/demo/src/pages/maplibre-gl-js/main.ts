@@ -1,13 +1,8 @@
 import * as maplibregl from 'maplibre-gl';
 import type { LngLatBoundsLike } from 'maplibre-gl';
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+import { cogpUrl, getCogpStats, inspectCogp, registerCogpProtocol, type CogpDatasetInfo } from '@cogp/maplibre';
 
-import {
-  openDataset as openCogpDataset,
-  readTile,
-  type OpenResult,
-} from '../../shared/dataset-service';
-import { MVT_LAYER_NAME, type NetworkStats } from '../../shared/cogp-types';
 import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
 import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
@@ -15,57 +10,10 @@ import { latitudeResolution } from '../../shared/tiles';
 // MapLibre v6 derives its worker URL from import.meta.url, which breaks once
 // Vite bundles the library; hand it the Vite-built worker instead.
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
+registerCogpProtocol(maplibregl);
 
 const COGP_SOURCE_ID = 'cogp';
-const COGP_PROTOCOL = 'cogp';
-
-interface TileAddress {
-  revision: number;
-  z: number;
-  x: number;
-  y: number;
-}
-
-interface Stats {
-  network: NetworkStats;
-  /** Recent tile read + encode wall times. */
-  tileMs: number[];
-}
-
-const RECENT_TILES = 200;
-
-let datasetRevision = 0;
-let stats: Stats = emptyStats();
-
-maplibregl.addProtocol(COGP_PROTOCOL, async (params, abortController) => {
-  const address = parseTileAddress(params.url);
-  const ds = active;
-  if (!ds || address.revision !== datasetRevision) {
-    // AbortError keeps MapLibre from marking the tile errored; a reload
-    // waiting on this tile would otherwise never start.
-    throw new DOMException('Stale COGP tile request', 'AbortError');
-  }
-
-  const result = await readTile(
-    ds.url,
-    address.z,
-    address.x,
-    address.y,
-    fetchPropertiesInput.checked,
-    abortController.signal,
-  );
-  if (abortController.signal.aborted) {
-    throw new DOMException('COGP tile request aborted', 'AbortError');
-  }
-  if (active?.url === ds.url && address.revision === datasetRevision) {
-    // Tiles finish out of order; the largest snapshot is the latest total.
-    if (result.network.requests >= stats.network.requests) stats.network = result.network;
-    stats.tileMs.push(result.ms);
-    if (stats.tileMs.length > RECENT_TILES) stats.tileMs.shift();
-    renderStats();
-  }
-  return { data: result.data };
-});
+const COGP_LAYER_NAME = 'features';
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -170,16 +118,16 @@ map.on('load', () => {
 });
 map.on('move', renderLevel);
 map.on('idle', renderFeaturesInView);
+map.on('idle', () => { void renderStats(); });
 
 function installCogpSource(): void {
   if (!map.isStyleLoaded()) return;
   removeCogpLayersAndSource();
-  datasetRevision += 1;
-  stats = emptyStats();
+  if (!active) return;
 
   map.addSource(COGP_SOURCE_ID, {
     type: 'vector',
-    tiles: [`${COGP_PROTOCOL}://tiles/${datasetRevision}/{z}/{x}/{y}.pbf`],
+    tiles: [sourceUrl(active.url)],
     minzoom: 0,
     maxzoom: 24,
   });
@@ -187,7 +135,7 @@ function installCogpSource(): void {
     id: 'cogp-fill',
     type: 'fill',
     source: COGP_SOURCE_ID,
-    'source-layer': MVT_LAYER_NAME,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'Polygon'],
     paint: {
       'fill-color': '#4a6cf7',
@@ -199,7 +147,7 @@ function installCogpSource(): void {
     id: 'cogp-line',
     type: 'line',
     source: COGP_SOURCE_ID,
-    'source-layer': MVT_LAYER_NAME,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'LineString'],
     paint: {
       'line-color': '#1f3aa8',
@@ -210,7 +158,7 @@ function installCogpSource(): void {
     id: 'cogp-point',
     type: 'circle',
     source: COGP_SOURCE_ID,
-    'source-layer': MVT_LAYER_NAME,
+    'source-layer': COGP_LAYER_NAME,
     filter: ['==', ['geometry-type'], 'Point'],
     paint: {
       'circle-radius': 3,
@@ -228,19 +176,10 @@ function removeCogpLayersAndSource(): void {
   if (map.getSource(COGP_SOURCE_ID)) map.removeSource(COGP_SOURCE_ID);
 }
 
-function parseTileAddress(url: string): TileAddress {
-  const match = /^cogp:\/\/tiles\/(\d+)\/(\d+)\/(\d+)\/(\d+)\.pbf$/.exec(url);
-  if (!match) throw new Error(`Invalid COGP tile URL: ${url}`);
-  return {
-    revision: Number(match[1]),
-    z: Number(match[2]),
-    x: Number(match[3]),
-    y: Number(match[4]),
-  };
-}
-
-function emptyStats(): Stats {
-  return { network: { requests: 0, bytes: 0 }, tileMs: [] };
+function sourceUrl(url: string): string {
+  return cogpUrl({
+    [COGP_LAYER_NAME]: fetchPropertiesInput.checked ? { url } : { url, properties: {} },
+  });
 }
 
 /** Level the worker selects for tiles at the map center. */
@@ -272,13 +211,16 @@ function renderFeaturesInView(): void {
   statFeatures.textContent = `${(ids.size + unnamed).toLocaleString()} features`;
 }
 
-function renderStats(): void {
-  const { network, tileMs } = stats;
-  const share = active?.byteLength ? network.bytes / active.byteLength : 0;
-  statFetched.innerHTML = `${formatBytes(network.bytes)} in ${network.requests.toLocaleString()} requests`
-    + (active?.byteLength ? ` <small>· ${formatPercent(share)} of ${formatBytes(active.byteLength)}</small>` : '');
+async function renderStats(): Promise<void> {
+  const ds = active;
+  if (!ds) return;
+  const { requests, bytes, tileMs } = await getCogpStats(ds.url);
+  if (active !== ds) return;
+  const share = ds.byteLength ? bytes / ds.byteLength : 0;
+  statFetched.innerHTML = `${formatBytes(bytes)} in ${requests.toLocaleString()} requests`
+    + (ds.byteLength ? ` <small>· ${formatPercent(share)} of ${formatBytes(ds.byteLength)}</small>` : '');
   if (tileMs.length) {
-    const sorted = [...tileMs].sort((a, b) => a - b);
+    const sorted = tileMs.sort((a, b) => a - b);
     const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]!;
     statTiles.innerHTML = `median ${at(0.5).toFixed(0)} ms · p90 ${at(0.9).toFixed(0)} ms`
       + ` <small>(${tileMs.length} tiles)</small>`;
@@ -322,7 +264,7 @@ interface ActiveDataset {
   url: string;
   byteLength: number;
   dataBbox: LngLatBoundsLike | null;
-  summary: OpenResult['geo'];
+  summary: CogpDatasetInfo['geo'];
 }
 
 let active: ActiveDataset | null = null;
@@ -335,12 +277,8 @@ fetchPropertiesInput.addEventListener('change', () => {
   hidePropertyPopup();
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
-  // A new URL revision prevents reuse of tiles containing the previous attributes.
-  // Network totals keep accumulating: the reader and its caches are unchanged.
-  datasetRevision += 1;
-  stats.tileMs = [];
-  renderStats();
-  source.setTiles([`${COGP_PROTOCOL}://tiles/${datasetRevision}/{z}/{x}/{y}.pbf`]);
+  if (active) source.setTiles([sourceUrl(active.url)]);
+  void renderStats();
 });
 
 loadBtn.addEventListener('click', () => {
@@ -373,7 +311,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { geo, numRowGroups, byteLength, dataBbox } = await openCogpDataset(url, controller.signal);
+    const { geo, numRowGroups, byteLength, dataBbox } = await inspectCogp(url, controller.signal);
     if (latestUrl !== url) return;
     active = {
       url,
@@ -390,7 +328,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
     installCogpSource();
     statsEl.hidden = false;
     renderLevel();
-    renderStats();
+    void renderStats();
     statFeatures.textContent = '–';
     setStatus(`${datasetName(url)} · ${formatBytes(byteLength)} · ${numRowGroups} row groups · ${geo.lod.levels.length} levels`);
     // Give the map the screen on phones once there is something to look at.
@@ -403,7 +341,6 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
     active = null;
     statsEl.hidden = true;
     flyBtn.disabled = true;
-    datasetRevision += 1;
     removeCogpLayersAndSource();
   } finally {
     if (datasetLoadController === controller) datasetLoadController = null;
@@ -411,7 +348,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   }
 }
 
-function renderMetadata(summary: OpenResult['geo']): void {
+function renderMetadata(summary: CogpDatasetInfo['geo']): void {
   metaEl.textContent = JSON.stringify(summary, null, 2);
 }
 

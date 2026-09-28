@@ -32,7 +32,7 @@ export class PageIndexCache {
     visit(parquetSchema(metadata));
   }
 
-  async plan(metadata: FileMetaData, groups: number[], columns: string[] | undefined,
+  async plan(metadata: FileMetaData, groups: number[], physicalPaths: readonly string[],
     filterPaths: string[], filter: ParquetQueryFilter, signal?: AbortSignal): Promise<PageIndexPlan> {
     throwIfAborted(signal);
     const pageRangesByGroup: PageIndexPlan['pageRangesByGroup'] = metadata.row_groups.map(() => undefined);
@@ -48,7 +48,7 @@ export class PageIndexCache {
       // Without bbox indexes leave the group's full candidate range intact.
       if (!filterChunks.length) return;
       const selected = rg.columns.filter(c => filterChunks.includes(c)
-        || (c.meta_data && (!columns || columns.includes(c.meta_data.path_in_schema[0]!))));
+        || (c.meta_data && physicalPaths.includes(c.meta_data.path_in_schema.join('.'))));
       await Promise.all(selected.map(async chunk => {
         if (!chunk.offset_index_offset || !chunk.offset_index_length) return;
         const path = chunk.meta_data!.path_in_schema.join('.');

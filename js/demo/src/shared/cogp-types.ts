@@ -1,5 +1,3 @@
-export const MVT_LAYER_NAME = 'cogp';
-
 export interface OpenResult {
   geo: import('@cogp/reader').CogpReader['geo'];
   numRowGroups: number;
@@ -18,13 +16,6 @@ export interface ViewportBbox {
 export interface NetworkStats {
   requests: number;
   bytes: number;
-}
-
-export interface TileResult {
-  data: ArrayBuffer;
-  /** Wall time to read and encode this tile. */
-  ms: number;
-  network: NetworkStats;
 }
 
 /** One viewport read encoded by `toGeoArrow`. */
@@ -80,7 +71,6 @@ export interface BudgetResult {
 
 export type WorkerRequest =
   | { type: 'open'; url: string }
-  | { type: 'readTile'; url: string; z: number; x: number; y: number; fetchProperties: boolean }
   | ({ type: 'readArrow' } & ViewRequest)
   | ({ type: 'readBudget' } & BudgetRequest);
 
@@ -97,5 +87,5 @@ export interface WorkerCancel {
 export type WorkerMessage = WorkerEnvelope | WorkerCancel;
 
 export type WorkerResponse =
-  | { id: number; ok: true; result: OpenResult | TileResult | ArrowResult | BudgetResult }
+  | { id: number; ok: true; result: OpenResult | ArrowResult | BudgetResult }
   | { id: number; ok: false; error: string; name: string };

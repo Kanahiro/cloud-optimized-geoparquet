@@ -106,7 +106,7 @@ const batch = await reader.read({
 });
 
 const geojson = toGeoJSON(batch); // FeatureCollection; feature IDs are source row indexes
-const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer, source layer `cogp`
+const tile = toMvt(batch, { z: 12, x: 3635, y: 1615 }); // ArrayBuffer
 const arrow = toGeoArrow(batch, { crs: 'OGC:CRS84' }); // ArrayBuffer, Arrow IPC stream
 ```
 
@@ -116,7 +116,7 @@ a tile-sized `bbox`. `toGeoArrow` writes one record batch that
 `tableFromIPC` from `apache-arrow` (or pyarrow) can read, with the geometry as a
 GeoArrow multi type (`geoarrow.multipolygon`, `geoarrow.multilinestring` or
 `geoarrow.multipoint`). See the [JavaScript reader README](./js/packages/reader/README.md)
-for the full API and the [demo](./js/demo) for rendering with MapLibre or deck.gl.
+for usage and options, and the [demo](./js/demo) for rendering with MapLibre or deck.gl.
 
 ## Specification
 
@@ -128,7 +128,7 @@ This repository is the source of truth for the specification and its reference
 implementations:
 
 - [`cogp-rs`](./cogp-rs): Rust producer, validator, CLI, and reader library.
-- [`js`](./js): TypeScript packages ([`@cogp/reader`](./js/packages/reader)) and the browser demo ([`js/demo`](./js/demo)).
+- [`js`](./js): TypeScript packages ([`@cogp/reader`](./js/packages/reader), [`@cogp/maplibre`](./js/packages/maplibre)) and the browser demo ([`js/demo`](./js/demo)).
 
 The implementations remain independently publishable. The repository root owns
 shared dependency locks, CI, releases, and development commands so changes to the
@@ -144,12 +144,16 @@ separately, each with its own tag prefix:
 | Specification | `spec-v<version>` | GitHub Releases |
 | `cogp-rs` | `cogp-rs-v<version>` | GitHub Releases (binaries), crates.io (`cogp`) |
 | `@cogp/reader` (`js/packages/reader`) | `cogp-js-v<version>` | npm (`@cogp/reader`) |
+| `@cogp/maplibre` (`js/packages/maplibre`) | `cogp-js-v<version>` | npm (`@cogp/maplibre`) |
 
 Each implementation README states the specification version it implements.
 To release an implementation, bump the version in its `Cargo.toml` or
 `package.json`, merge, then publish a GitHub Release whose tag matches that
 version. Tags `v0.1.0`–`v2.0.1` predate this split and covered the whole
 repository.
+The JavaScript packages share one version and are published together by the
+`cogp-js-v<version>` release workflow. It publishes `@cogp/reader` before
+`@cogp/maplibre`, which depends on that reader version.
 
 The demo is not released: it deploys to GitHub Pages from `main` whenever
 `js/**` changes.

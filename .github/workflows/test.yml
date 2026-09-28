@@ -37,5 +37,6 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @cogp/reader test
+      - run: pnpm --filter @cogp/maplibre test
       - run: pnpm typecheck
       - run: pnpm build

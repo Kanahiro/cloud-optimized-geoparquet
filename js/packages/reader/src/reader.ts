@@ -46,6 +46,7 @@ import {
 } from './overview.js';
 import { bindAbortSignal, throwIfAborted } from './abort.js';
 import { abortableAsyncBufferFromUrl } from './http-buffer.js';
+import { projectNestedColumns, selectColumns, type SelectedColumn } from './column-projection.js';
 
 // Minimal structural view of the metadata object we need; this avoids tight
 // coupling to a specific hyparquet major version's exported types.
@@ -135,9 +136,12 @@ export interface ReadOptions {
    */
   bbox?: BboxInput;
   /**
-   * Columns to read. The default is every attribute plus the primary geometry;
-   * other geometry columns, the overview column and bbox covering are only
-   * read when named. Naming the primary or overview column fills `geometry`.
+   * Columns to read. Dotted paths select individual fields of nested structs;
+   * `[index]` selects an element after reading its entire list. Results appear
+   * under the requested path in `CogpBatch.columns`. The default
+   * is every top-level attribute plus the primary geometry; other geometry
+   * columns, the overview column and bbox covering are only read when named.
+   * Naming the primary or overview column fills `geometry`.
    */
   columns?: string[];
   /**
@@ -300,7 +304,7 @@ export class CogpReader {
     return selectLevelByResolution(this.levels, targetResolution);
   }
 
-  /** Read selected top-level columns for one absolute source row as a one-row batch. */
+  /** Read selected columns for one absolute source row as a one-row batch. */
   async readRow(
     rowIndex: number,
     opts: Pick<ReadOptions, 'columns' | 'signal'> = {},
@@ -310,11 +314,14 @@ export class CogpReader {
     }
     throwIfAborted(opts.signal);
     const columns = [...(opts.columns ?? [...this.defaultColumns(), this.primaryGeometryColumn])];
+    const selected = selectColumns(this.metadata.schema, columns);
+    const projected = projectNestedColumns(this.metadata, selected);
     const chunks = await this.readColumnChunks(
-      bindAbortSignal(this.file, opts.signal), this.metadata, rowIndex, rowIndex + 1, columns);
+      bindAbortSignal(this.file, opts.signal), projected, rowIndex, rowIndex + 1,
+      [...new Set(selected.map(column => column.root))]);
     throwIfAborted(opts.signal);
     const run: RunData = { rowStart: rowIndex, rows: [0], chunks };
-    const attributes = columns.filter(column => column !== this.primaryGeometryColumn);
+    const attributes = selected.filter(column => column.name !== this.primaryGeometryColumn);
     const builder = columns.includes(this.primaryGeometryColumn) ? new GeometryBuilder(false) : undefined;
     return this.batch([run], attributes, builder, false, undefined);
   }
@@ -341,7 +348,7 @@ export class CogpReader {
     const lodMetadata = useOverview
       ? this.overviews!.lods[lod!]!
       : undefined;
-    const projectedMetadata = useOverview
+    const overviewMetadata = useOverview
       ? this.projectedMetadata(lod!)
       : this.metadata;
     const bbox = normalizeBbox(opts.bbox);
@@ -363,11 +370,14 @@ export class CogpReader {
     const columns = wantsGeometry
       ? [...attributes, useOverview ? this.overviewColumn! : this.primaryGeometryColumn]
       : attributes;
+    const selected = selectColumns(overviewMetadata.schema, columns);
+    const projectedMetadata = projectNestedColumns(overviewMetadata, selected);
+    const roots = [...new Set(selected.map(column => column.root))];
     const builder = wantsGeometry ? new GeometryBuilder(useOverview) : undefined;
     const runs = maxRows === 0 ? [] : await this.readRuns(
       useOverview ? this.overviewFile : this.file,
       rgs,
-      columns,
+      roots,
       projectedMetadata,
       maxRows,
       bbox,
@@ -376,11 +386,12 @@ export class CogpReader {
       opts.signal,
     );
     throwIfAborted(opts.signal);
-    return this.batch(runs, attributes, builder, useOverview, undefined, lodMetadata);
+    return this.batch(runs, selected.filter(column => attributes.includes(column.name)), builder,
+      useOverview, undefined, lodMetadata);
   }
 
   /** Gather the selected rows of every run into contiguous output columns. */
-  private batch(runs: RunData[], attributes: string[], builder: GeometryBuilder | undefined,
+  private batch(runs: RunData[], attributes: SelectedColumn[], builder: GeometryBuilder | undefined,
     useOverview: boolean, maxRows: number | undefined, lodMetadata?: OverviewLod): CogpBatch {
     const counts = runs.map(run => run.rows.length);
     let length = 0;
@@ -395,14 +406,23 @@ export class CogpReader {
     });
     const columns: Record<string, ArrayLike<unknown>> = {};
     for (const column of attributes) {
-      const Typed = typedConstructor(runs.flatMap(run => run.chunks.get(column) ?? []));
+      const Typed = column.access.length === 0
+        ? typedConstructor(runs.flatMap(run => run.chunks.get(column.root) ?? []))
+        : undefined;
       const out = Typed ? new Typed(length) : new Array<unknown>(length);
       let offset = 0;
       runs.forEach((run, i) => {
-        forEachSelected(run, column, counts[i]!, (value, k) => { out[offset + k] = value; });
+        forEachSelected(run, column.root, counts[i]!, (value, k) => {
+          let selected = value;
+          for (const step of column.access) {
+            if (selected == null) { selected = null; break; }
+            selected = (selected as Record<string | number, unknown>)[step] ?? null;
+          }
+          out[offset + k] = selected;
+        });
         offset += counts[i]!;
       });
-      columns[column] = out;
+      columns[column.name] = out;
     }
     let geometry: GeometryColumn | undefined;
     if (builder) {
@@ -520,12 +540,16 @@ export class CogpReader {
     const rowEnd = rowStart + this.sumRowsInRange(groups[0]!, groups[groups.length - 1]!);
     let pagePlan: PageIndexPlan | undefined;
     if (bbox && this.bboxPaths) {
+      const physicalPaths = metadata.row_groups[groups[0]!]!.columns
+        .map(chunk => chunk.meta_data?.path_in_schema)
+        .filter((path): path is string[] => !!path && columns.includes(path[0]!))
+        .map(path => path.join('.'));
       pagePlan = await this.pageIndexCache.plan(
-        metadata as never, groups, columns, Object.values(this.bboxPaths).map(path => path.join('.')),
+        this.metadata as never, groups, physicalPaths, Object.values(this.bboxPaths).map(path => path.join('.')),
         bboxFilter(this.bboxPaths, bbox), signal,
       );
       // Page statistics alone leave most candidates outside small bboxes.
-      await this.refineBboxPlan(file, metadata, groups, rowStart, rowEnd, bbox, this.bboxPaths, pagePlan);
+      await this.refineBboxPlan(file, this.metadata, groups, rowStart, rowEnd, bbox, this.bboxPaths, pagePlan);
     }
     const rows: number[] = [];
     for (const group of groups) {

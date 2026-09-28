@@ -10,6 +10,9 @@ importers:
 
   js/demo:
     dependencies:
+      '@cogp/maplibre':
+        specifier: workspace:*
+        version: link:../packages/maplibre
       '@cogp/reader':
         specifier: workspace:*
         version: link:../packages/reader
@@ -53,6 +56,28 @@ importers:
       vite:
         specifier: ^5.4.0
         version: 5.4.21(@types/node@24.13.6)
+
+  js/packages/maplibre:
+    dependencies:
+      '@cogp/reader':
+        specifier: workspace:^
+        version: link:../reader
+      '@hpcc-js/wasm-zstd':
+        specifier: 1.15.0
+        version: 1.15.0
+    devDependencies:
+      '@mapbox/vector-tile':
+        specifier: 1.3.1
+        version: 1.3.1
+      maplibre-gl:
+        specifier: ^6.11.2
+        version: 6.11.2
+      pbf:
+        specifier: 3.3.0
+        version: 3.3.0
+      typescript:
+        specifier: ^5.6.0
+        version: 5.9.3
 
   js/packages/reader:
     dependencies:
