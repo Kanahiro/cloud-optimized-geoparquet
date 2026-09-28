@@ -1,5 +1,10 @@
 # Cloud Optimized GeoParquet (COGP)
 
+[![Tests](https://github.com/Kanahiro/cloud-optimized-geoparquet/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Kanahiro/cloud-optimized-geoparquet/actions/workflows/test.yml)
+[![npm: @cogp/reader](https://img.shields.io/npm/v/%40cogp%2Freader?label=%40cogp%2Freader)](https://www.npmjs.com/package/@cogp/reader)
+[![npm: @cogp/maplibre](https://img.shields.io/npm/v/%40cogp%2Fmaplibre?label=%40cogp%2Fmaplibre)](https://www.npmjs.com/package/@cogp/maplibre)
+[![crates.io: cogp](https://img.shields.io/crates/v/cogp?label=cogp)](https://crates.io/crates/cogp)
+
 A GeoParquet extension for progressive map rendering and partial access over HTTP range requests or object storage.
 
 Created by [Kanahiro Iguchi](https://github.com/Kanahiro).
