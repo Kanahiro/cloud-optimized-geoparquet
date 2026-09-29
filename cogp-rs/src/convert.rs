@@ -6,10 +6,10 @@ use arrow::array::{
 use arrow::compute::{cast, concat, interleave, rank, SortOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow_buffer::{NullBuffer, OffsetBuffer};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
 use clap::Args;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
-};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::ZstdLevel;
 use parquet::basic::{Compression, Encoding};
@@ -20,11 +20,12 @@ use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
+use tempfile::NamedTempFile;
 
 use crate::meta::{
     geometry_family, BboxCovering, Covering, GeoColumn, GeoMeta, GeometryFamily, Level, LodMeta,
@@ -729,6 +730,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_bboxes = Arc::new(bboxes);
     let producer_meta = arrow_meta.clone();
     let producer_input = args.input.clone();
+    let producer_output_dir = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let producer_keep = keep_col_indices;
     let producer_append_bbox = append_bbox;
     let producer_geom_col = geom_col_idx;
@@ -746,25 +753,39 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     .map(move |chunk| (level_i, chunk))
             })
             .collect();
+        eprintln!("      gathering source attributes in one pass");
+        // The source is decoded once in input order. The temporary spool
+        // holds only projected source columns; gather workers read its output
+        // partitions instead of repeatedly seeking across the source file.
+        let (spool, records) = spool_input(
+            &producer_input,
+            &producer_meta,
+            &producer_keep,
+            &chunks,
+            producer_gather_rows,
+            &producer_output_dir,
+        )?;
+        eprintln!(
+            "      temporary gather spool: {} MiB",
+            spool.as_file().metadata()?.len().div_ceil(1 << 20)
+        );
         // The producer waits for ordered gather results below. Keep that
         // blocking wait on this thread so it cannot occupy a Rayon worker
         // needed to run the gather tasks.
         rayon::in_place_scope(|scope| -> Result<()> {
             let mut pending = VecDeque::new();
-            for (level_i, chunk) in chunks {
+            for (chunk_i, (level_i, chunk)) in chunks.into_iter().enumerate() {
                 let (task_tx, task_rx) = sync_channel(1);
                 let schema = &producer_schema;
                 let bboxes = &producer_bboxes;
-                let meta = &producer_meta;
-                let input = &producer_input;
-                let keep = &producer_keep;
+                let spool_path = spool.path();
+                let chunk_records = &records[chunk_i];
                 let overview_plan = &producer_overview_plan;
                 let entry_levels = &producer_overview_entry_levels;
                 scope.spawn(move |_| {
                     let result = gather_chunk(
-                        input,
-                        meta,
-                        keep,
+                        spool_path,
+                        chunk_records,
                         chunk,
                         bboxes,
                         &GatherLayout {
@@ -1349,32 +1370,91 @@ fn var_width_bytes_at(arr: &dyn Array, i: usize) -> usize {
 /// every i32-offset column comfortably below arrow's ~2 GiB overflow point.
 const SEGMENT_MAX_BYTES: usize = 1 << 30;
 
-/// Skip/select run-length selection over the whole file for the given
-/// ascending, duplicate-free row indices.
-fn row_selection_for(sorted: &[u32]) -> RowSelection {
-    let mut selectors: Vec<RowSelector> = Vec::new();
-    let mut cursor = 0usize;
-    let mut i = 0;
-    while i < sorted.len() {
-        let start = sorted[i] as usize;
-        let mut end = start + 1;
-        i += 1;
-        while i < sorted.len() && sorted[i] as usize == end {
-            end += 1;
-            i += 1;
-        }
-        if start > cursor {
-            selectors.push(RowSelector::skip(start - cursor));
-        }
-        selectors.push(RowSelector::select(end - start));
-        cursor = end;
-    }
-    RowSelection::from(selectors)
+/// One independently decodable IPC batch in the temporary source spool.
+#[derive(Clone, Copy)]
+struct SpoolRecord {
+    offset: u64,
+    len: u64,
 }
 
-/// Pass 2 gather: read exactly `chunk`'s rows from the input via a parquet
-/// row selection, interleave them into the chunk's (STR-packed) output order,
-/// and append the bbox struct built from the already-computed `bboxes`.
+/// Read source attributes once and distribute rows to their output chunks.
+/// A single append-only file keeps descriptor use independent of chunk count;
+/// the record index lets ordered gather workers find their own batches.
+fn spool_input(
+    input: &Path,
+    meta: &ArrowReaderMetadata,
+    keep_cols: &[usize],
+    chunks: &[(usize, &[u32])],
+    batch_rows: usize,
+    spool_dir: &Path,
+) -> Result<(NamedTempFile, Vec<Vec<SpoolRecord>>)> {
+    let n_rows = usize::try_from(meta.metadata().file_metadata().num_rows())?;
+    let mut destinations = vec![u32::MAX; n_rows];
+    for (chunk_i, (_, rows)) in chunks.iter().enumerate() {
+        let chunk_i = u32::try_from(chunk_i)?;
+        for &row in *rows {
+            let slot = destinations
+                .get_mut(row as usize)
+                .ok_or_else(|| anyhow!("internal: output row beyond input"))?;
+            anyhow::ensure!(*slot == u32::MAX, "internal: duplicate output row {row}");
+            *slot = chunk_i;
+        }
+    }
+    anyhow::ensure!(
+        destinations.iter().all(|&d| d != u32::MAX),
+        "internal: output omits input rows"
+    );
+
+    let mask = ProjectionMask::roots(
+        meta.metadata().file_metadata().schema_descr(),
+        keep_cols.iter().copied(),
+    );
+    let reader =
+        ParquetRecordBatchReaderBuilder::new_with_metadata(File::open(input)?, meta.clone())
+            .with_projection(mask)
+            .with_batch_size(batch_rows.clamp(1, 65_536))
+            .build()?;
+    let mut spool = NamedTempFile::new_in(spool_dir)
+        .with_context(|| format!("creating temporary gather spool in {}", spool_dir.display()))?;
+    let mut records = vec![Vec::new(); chunks.len()];
+    let mut row_base = 0usize;
+    let mut offset = 0u64;
+    for batch in reader {
+        let batch = batch?;
+        let mut groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for local_row in 0..batch.num_rows() {
+            groups
+                .entry(destinations[row_base + local_row] as usize)
+                .or_default()
+                .push((0, local_row));
+        }
+        for (chunk_i, indices) in groups {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|col| interleave(&[col.as_ref()], &indices))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let selected = RecordBatch::try_new(batch.schema(), columns)?;
+            let mut encoded = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut encoded, selected.schema().as_ref())?;
+                writer.write(&selected)?;
+                writer.finish()?;
+            }
+            spool.as_file_mut().write_all(&encoded)?;
+            let len = encoded.len() as u64;
+            records[chunk_i].push(SpoolRecord { offset, len });
+            offset += len;
+        }
+        row_base += batch.num_rows();
+    }
+    anyhow::ensure!(row_base == n_rows, "internal: source row count changed");
+    spool.as_file_mut().flush()?;
+    Ok((spool, records))
+}
+
+/// Pass 2 gather: read `chunk` from the temporary spool, interleave it into
+/// the chunk's (STR-packed) output order, and append the bbox struct.
 /// Returns one batch normally; the chunk is split into several whenever its
 /// variable-width payload approaches the i32 offset budget (see
 /// `SEGMENT_MAX_BYTES`), so arbitrarily fat rows cannot overflow.
@@ -1388,9 +1468,8 @@ struct GatherLayout<'a> {
 }
 
 fn gather_chunk(
-    input: &Path,
-    meta: &ArrowReaderMetadata,
-    keep_cols: &[usize],
+    spool_path: &Path,
+    records: &[SpoolRecord],
     chunk: &[u32],
     bboxes: &[Bbox],
     layout: &GatherLayout<'_>,
@@ -1398,17 +1477,19 @@ fn gather_chunk(
     let mut sorted = chunk.to_vec();
     sorted.sort_unstable();
 
-    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let mask = ProjectionMask::roots(
-        meta.metadata().file_metadata().schema_descr(),
-        keep_cols.iter().copied(),
-    );
-    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta.clone())
-        .with_projection(mask)
-        .with_row_selection(row_selection_for(&sorted))
-        .build()?;
-    let mut batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-    batches.retain(|b| b.num_rows() > 0);
+    let mut file = File::open(spool_path)?;
+    let mut batches = Vec::with_capacity(records.len());
+    for record in records {
+        file.seek(SeekFrom::Start(record.offset))?;
+        let len = usize::try_from(record.len)?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes)?;
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| anyhow!("internal: empty gather spool record"))??;
+        batches.push(batch);
+    }
     let gathered: usize = batches.iter().map(|b| b.num_rows()).sum();
     if gathered != sorted.len() {
         bail!(
@@ -1436,7 +1517,7 @@ fn gather_chunk(
         })
         .collect();
 
-    let n_cols = keep_cols.len();
+    let n_cols = batches[0].num_columns();
     let col_refs: Vec<Vec<&dyn Array>> = (0..n_cols)
         .map(|c| batches.iter().map(|b| b.column(c).as_ref()).collect())
         .collect();
@@ -2257,6 +2338,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spooled_gather_preserves_output_order_across_source_batches() {
+        use arrow::array::Int32Array;
+
+        let input = NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let mut writer =
+            ArrowWriter::try_new(input.reopen().unwrap(), schema.clone(), None).unwrap();
+        for pair in 0..3 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![pair * 2, pair * 2 + 1]))],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let meta =
+            ArrowReaderMetadata::load(&File::open(input.path()).unwrap(), Default::default())
+                .unwrap();
+        let first = vec![5, 0, 3];
+        let second = vec![4, 1, 2];
+        let chunks = vec![(0, first.as_slice()), (0, second.as_slice())];
+        let (spool, records) = spool_input(
+            input.path(),
+            &meta,
+            &[0],
+            &chunks,
+            2,
+            input.path().parent().unwrap(),
+        )
+        .unwrap();
+        let layout = GatherLayout {
+            output_schema: &schema,
+            append_bbox: false,
+            geometry_col: 0,
+            first_covered_level: 0,
+            overview_plan: &[],
+            overview_entry_levels: &[],
+        };
+        for (chunk, records, expected) in [
+            (&first, &records[0], &[5, 0, 3][..]),
+            (&second, &records[1], &[4, 1, 2][..]),
+        ] {
+            let batches = gather_chunk(spool.path(), records, chunk, &[], &layout).unwrap();
+            let ids = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(ids.values().as_ref(), expected);
+        }
+    }
+
+    #[test]
     fn cli_visibility_defaults_and_priority_options() {
         use clap::Parser;
         #[derive(Parser)]
@@ -2567,24 +2703,6 @@ mod tests {
         // asc → smallest value gets the highest rank, null still lowest.
         let asc = compute_sort_ranks(&col, PriorityColumnOrder::Asc).unwrap();
         assert!(asc[0] > asc[3] && asc[3] > asc[2] && asc[2] > asc[1]);
-    }
-
-    #[test]
-    fn row_selection_for_builds_skip_select_runs() {
-        let sel = row_selection_for(&[0, 1, 2, 5, 6, 9]);
-        let expected = RowSelection::from(vec![
-            RowSelector::select(3),
-            RowSelector::skip(2),
-            RowSelector::select(2),
-            RowSelector::skip(2),
-            RowSelector::select(1),
-        ]);
-        assert_eq!(sel, expected);
-
-        // Leading skip when the first selected row is not row 0.
-        let sel = row_selection_for(&[3, 4]);
-        let expected = RowSelection::from(vec![RowSelector::skip(3), RowSelector::select(2)]);
-        assert_eq!(sel, expected);
     }
 
     #[test]
