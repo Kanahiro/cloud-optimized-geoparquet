@@ -61,4 +61,14 @@ See the [browser demo](https://kanahiro.github.io/cloud-optimized-geoparquet/) f
 
 ```sh
 pnpm --filter @cogp/reader test
+pnpm --filter @cogp/reader bench
 ```
+
+The benchmark uses committed local Parquet fixtures and reports time per read
+for cold spatial queries, cached spatial queries, full WKB reads, and overview
+reads. The [CI benchmark](../../../.github/workflows/reader-benchmark.yml)
+builds both the change and its base commit, then measures them on the same
+runner in alternating order. Five runs per version are compared by median;
+the job fails when a case takes over 1.25 times as long or fetches over 10%
+more range bytes or requests. This isolates reader CPU and range selection.
+It does not measure browser rendering or network latency.
