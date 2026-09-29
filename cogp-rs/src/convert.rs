@@ -746,7 +746,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     .map(move |chunk| (level_i, chunk))
             })
             .collect();
-        rayon::scope(|scope| -> Result<()> {
+        // The producer waits for ordered gather results below. Keep that
+        // blocking wait on this thread so it cannot occupy a Rayon worker
+        // needed to run the gather tasks.
+        rayon::in_place_scope(|scope| -> Result<()> {
             let mut pending = VecDeque::new();
             for (level_i, chunk) in chunks {
                 let (task_tx, task_rx) = sync_channel(1);
