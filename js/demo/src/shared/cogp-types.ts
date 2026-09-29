@@ -1,5 +1,6 @@
 export interface OpenResult {
   geo: import('@cogp/reader').CogpReader['geo'];
+  columnNames: string[];
   numRowGroups: number;
   byteLength: number;
   dataBbox: [[number, number], [number, number]] | null;
@@ -37,7 +38,8 @@ export interface ViewRequest {
   /** Target resolution in primary geometry CRS units per pixel. */
   resolution: number;
   maxRows: number;
-  fetchProperties: boolean;
+  /** Attribute paths to read alongside geometry; null reads every attribute. */
+  columns: string[] | null;
 }
 
 /**

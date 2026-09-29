@@ -12,6 +12,7 @@ import {
   type OpenResult,
 } from '../../shared/dataset-service';
 import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
+import { parseColumns } from '../../shared/columns';
 import { attributeTooltip, createDeckMap, FILL, LINE, type Tooltip } from '../../shared/deck-map';
 import { datasetName, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
@@ -34,6 +35,7 @@ let datasetRevision = 0;
 let latestUrl = '';
 let datasetLoadController: AbortController | null = null;
 let viewController: AbortController | null = null;
+let appliedColumns: string[] = [];
 
 const map = createDeckMap({
   parent: document.getElementById('map')!,
@@ -57,7 +59,7 @@ async function readView(): Promise<void> {
       bbox: map.viewportBbox(),
       resolution,
       maxRows: MAX_ROWS,
-      fetchProperties: fetchPropertiesInput.checked,
+      columns: readAllColumnsInput.checked ? null : appliedColumns,
     }, controller.signal);
     if (controller.signal.aborted || active !== ds) return;
     const decodeStartedAt = performance.now();
@@ -148,14 +150,16 @@ function renderTooltip(info: PickingInfo): Tooltip {
   const entries: [string, unknown][] = Object.keys(row)
     .filter((key) => key !== GEOMETRY_FIELD)
     .map((key) => [key, row[key]]);
-  return attributeTooltip(entries, fetchPropertiesInput.checked);
+  return attributeTooltip(entries, readAllColumnsInput.checked || appliedColumns.length > 0);
 }
 
 const urlInput = document.getElementById('url') as HTMLInputElement;
 const presetSelect = document.getElementById('preset') as HTMLSelectElement;
 const loadBtn = document.getElementById('load') as HTMLButtonElement;
 const flyBtn = document.getElementById('fly') as HTMLButtonElement;
-const fetchPropertiesInput = document.getElementById('fetch-properties') as HTMLInputElement;
+const columnsInput = document.getElementById('columns') as HTMLInputElement;
+const readAllColumnsInput = document.getElementById('read-all-columns') as HTMLInputElement;
+const availableColumnsEl = document.getElementById('available-columns') as HTMLElement;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const metaEl = document.getElementById('meta') as HTMLPreElement;
 const panel = document.getElementById('panel') as HTMLElement;
@@ -183,7 +187,15 @@ panelToggle.addEventListener('click', () => {
   setPanelCollapsed(!panel.classList.contains('collapsed'));
 });
 
-fetchPropertiesInput.addEventListener('change', () => void readView());
+columnsInput.addEventListener('change', () => {
+  appliedColumns = parseColumns(columnsInput.value).filter((column) => column !== active?.summary.primary_column);
+  void readView();
+});
+
+readAllColumnsInput.addEventListener('change', () => {
+  columnsInput.disabled = readAllColumnsInput.checked;
+  void readView();
+});
 
 loadBtn.addEventListener('click', () => {
   void loadDataset(urlInput.value.trim());
@@ -215,9 +227,12 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { geo, byteLength, dataBbox } = await openCogpDataset(url, controller.signal);
+    const { geo, columnNames, byteLength, dataBbox } = await openCogpDataset(url, controller.signal);
     if (latestUrl !== url) return;
     active = { url, byteLength, dataBbox, summary: geo, revision: ++datasetRevision };
+    appliedColumns = parseColumns(columnsInput.value).filter((column) => column !== geo.primary_column);
+    availableColumnsEl.textContent = `File columns: ${columnNames.join(', ')}`;
+    availableColumnsEl.hidden = false;
     writeDatasetQuery(url);
     map.setLayers([]);
     metaEl.textContent = JSON.stringify(geo, null, 2);
@@ -234,6 +249,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
     console.error(err);
     setStatus(`Could not open ${datasetName(url)}: ${(err as Error).message}`, true);
     active = null;
+    availableColumnsEl.hidden = true;
     statsEl.hidden = true;
     flyBtn.disabled = true;
     map.setLayers([]);

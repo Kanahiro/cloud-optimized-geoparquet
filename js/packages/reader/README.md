@@ -36,7 +36,7 @@ const features = toGeoJSON(batch);
 | `maxRows` | Keep the first matching rows in source order. A limit can omit later spatial matches. |
 | `signal` | Cancel a read with an `AbortSignal`. |
 
-Nested fields use paths such as `building.details.height`. The reader fetches only that struct field. A list path such as `building.floors[1]` selects one element **after reading the whole list**. Results use the requested path as their key in `batch.columns`.
+Nested fields use paths such as `building.details.height`. The reader fetches only that struct field. A map key such as `tags.name` is selected after reading the map's key and value columns. A list path such as `building.floors[1]` selects one element **after reading the whole list**. Results use the requested path as their key in `batch.columns`.
 
 For a single row's attributes, call `reader.readRow(batch.rowIndex[0], { columns: ['id'] })`.
 

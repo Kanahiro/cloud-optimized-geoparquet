@@ -53,7 +53,7 @@ const tiles = cogpUrl({
 ```
 
 - Omit `properties` to read all ordinary attributes; pass `{}` for geometry only. A mapping selects columns and renames their MVT properties.
-- A struct path fetches only the selected field. An indexed list path reads the whole list before selecting an element.
+- A struct path fetches only the selected field. A map key such as `tags.name` reads the map's key and value columns before selecting the key. An indexed list path reads the whole list before selecting an element.
 - Omit `maxRowsPerTile` for no row limit. A limit keeps the first matching rows in source order.
 
 MVT property values are display strings, including numbers.

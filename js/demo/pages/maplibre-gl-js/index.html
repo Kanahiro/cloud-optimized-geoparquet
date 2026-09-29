@@ -76,14 +76,18 @@
           </div>
         </section>
 
-        <section class="options">
-          <label class="checkbox">
-            <input id="fetch-properties" type="checkbox" />
-            <span>
-              Fetch attributes
-              <small>Adds attribute columns to tile reads; hover a feature to see them, click to pin.</small>
-            </span>
+        <section class="field">
+          <label for="columns">Columns to read</label>
+          <input id="columns" type="text" autocomplete="off" spellcheck="false" placeholder="id, tags.name" aria-describedby="columns-hint" />
+          <small id="columns-hint" class="field-hint">Comma-separated paths; dots select struct fields or map keys. Blank reads geometry only. Press Enter to apply.</small>
+          <label class="checkbox read-all-columns" for="read-all-columns">
+            <input id="read-all-columns" type="checkbox" />
+            <span>Read all attribute columns</span>
           </label>
+          <small id="available-columns" class="field-hint" hidden></small>
+        </section>
+
+        <section class="options">
           <button id="fly" class="secondary" type="button" disabled>Fit to data</button>
         </section>
 
