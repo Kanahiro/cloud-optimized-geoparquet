@@ -142,6 +142,7 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
+        zstd_level: 9,
         page_row_count: 2,
         webmerc_resolution: 1024,
         point_thinning_factor: 4,
@@ -150,6 +151,85 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         priority_column: None,
         priority_column_order: PriorityColumnOrder::Desc,
     }
+}
+
+#[test]
+fn wide_rows_use_smaller_gathers_and_row_groups() {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let tmp = TempDir::new("wide-rows");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("payload", DataType::Binary, false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+    let payload = vec![0x5a; 4 * 1024 * 1024];
+    let geometry = wkb::polygon(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..17)),
+            Arc::new(BinaryArray::from_iter_values(
+                (0..17).map(|_| payload.as_slice()),
+            )),
+            Arc::new(BinaryArray::from_iter_values(
+                (0..17).map(|_| geometry.as_slice()),
+            )),
+        ],
+    )
+    .unwrap();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&input).unwrap(), schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue {
+        key: GEO_METADATA_KEY.into(),
+        value: Some(
+            serde_json::json!({
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}}
+            })
+            .to_string(),
+        ),
+    });
+    writer.close().unwrap();
+
+    let mut args = convert_args(&input, &output);
+    args.resolution = vec![0.01];
+    args.row_group_size = 17;
+    args.zstd_level = 3;
+    cogp::convert::run(args).unwrap();
+    cogp::validate::run(&output).unwrap();
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
+    assert!(builder.metadata().num_row_groups() > 1);
+    let mut seen = vec![false; 17];
+    for batch in builder.build().unwrap() {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let payloads = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row) as usize;
+            assert!(!seen[id]);
+            seen[id] = true;
+            assert_eq!(payloads.value(row), payload);
+        }
+    }
+    assert!(seen.into_iter().all(|value| value));
 }
 
 #[test]

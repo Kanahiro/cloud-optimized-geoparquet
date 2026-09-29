@@ -120,6 +120,10 @@ Other options:
   it does not guarantee spatial coverage. Geometry and attributes are preserved.
 
 - `--row-group-size` (default `262144`) — max Parquet row group size in rows.
+  The converter may use smaller row groups for wide input rows to limit memory use.
+- `--zstd-level` (default `9`, range `1..=22`) — output compression level.
+  Lower levels can speed up conversion, with a larger output file. Use the
+  default when transfer size and selective reads matter more than write time.
 - `--simplification-tolerance-factor` (default `0.25`) — overview simplification
   tolerance and quantization grid, in multiples of each level's resolution.
 - `--page-row-count` (default `1024`) — maximum top-level rows per data page.
