@@ -120,13 +120,7 @@ Other options:
   it does not guarantee spatial coverage. Geometry and attributes are preserved.
 
 - `--row-group-size` (default `262144`) — max Parquet row group size in rows.
-- `--write-memory-mb` (default `512`, minimum `64`) — approximate working budget
-  for gathering, reordering, and writing output. The converter uses input
-  row-group sizes to choose smaller gather chunks and row groups for wide rows,
-  and limits concurrent gathers accordingly. Increase it for more concurrent
-  work if RAM is available; decrease it when conversion runs out of memory.
-  The first pass still keeps one bbox and a small amount of indexing data per
-  feature in memory, so this is not a total process memory limit.
+  The converter may use smaller row groups for wide input rows to limit memory use.
 - `--zstd-level` (default `9`, range `1..=22`) — output compression level.
   Lower levels can speed up conversion, with a larger output file. Use the
   default when transfer size and selective reads matter more than write time.

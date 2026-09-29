@@ -142,7 +142,6 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         webmerc_minzoom: 0,
         webmerc_maxzoom: 4,
         row_group_size: 8,
-        write_memory_mb: 512,
         zstd_level: 9,
         page_row_count: 2,
         webmerc_resolution: 1024,
@@ -166,17 +165,17 @@ fn wide_rows_use_smaller_gathers_and_row_groups() {
         Field::new("payload", DataType::Binary, false),
         Field::new("geometry", DataType::Binary, false),
     ]));
-    let payload = vec![0x5a; 512 * 1024];
+    let payload = vec![0x5a; 4 * 1024 * 1024];
     let geometry = wkb::polygon(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int32Array::from_iter_values(0..24)),
+            Arc::new(Int32Array::from_iter_values(0..17)),
             Arc::new(BinaryArray::from_iter_values(
-                (0..24).map(|_| payload.as_slice()),
+                (0..17).map(|_| payload.as_slice()),
             )),
             Arc::new(BinaryArray::from_iter_values(
-                (0..24).map(|_| geometry.as_slice()),
+                (0..17).map(|_| geometry.as_slice()),
             )),
         ],
     )
@@ -203,15 +202,14 @@ fn wide_rows_use_smaller_gathers_and_row_groups() {
 
     let mut args = convert_args(&input, &output);
     args.resolution = vec![0.01];
-    args.row_group_size = 24;
-    args.write_memory_mb = 64;
+    args.row_group_size = 17;
     args.zstd_level = 3;
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
     assert!(builder.metadata().num_row_groups() > 1);
-    let mut seen = vec![false; 24];
+    let mut seen = vec![false; 17];
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
         let ids = batch

@@ -70,10 +70,6 @@ pub struct ConvertArgs {
     /// Maximum Parquet row group size in rows.
     #[arg(long, default_value_t = 262_144)]
     pub row_group_size: usize,
-    /// Approximate memory budget for the gather/write pipeline, in MiB. This
-    /// excludes the per-feature spatial index built during the first pass.
-    #[arg(long, default_value_t = 512)]
-    pub write_memory_mb: usize,
     /// ZSTD compression level for output columns (1..=22). Lower levels
     /// usually write faster at the cost of a larger file.
     #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
@@ -199,15 +195,9 @@ fn forward_gathered_chunk(
 /// Parquet's uncompressed row-group sizes give a cheap payload estimate before
 /// gathering. Cap both task size and task count: a gathered chunk temporarily
 /// exists as decoded input, reordered output, and encoded writer buffers.
-fn write_plan(
-    meta: &ArrowReaderMetadata,
-    requested_rows: usize,
-    memory_mb: usize,
-) -> Result<WritePlan> {
-    anyhow::ensure!(memory_mb >= 64, "--write-memory-mb must be >= 64");
-    let budget = memory_mb
-        .checked_mul(1 << 20)
-        .ok_or_else(|| anyhow!("--write-memory-mb is too large"))?;
+fn write_plan(meta: &ArrowReaderMetadata, requested_rows: usize) -> WritePlan {
+    // This is a pipeline-sizing heuristic, not a total process memory limit.
+    let budget = 512usize << 20;
     let bytes_per_row = meta
         .metadata()
         .row_groups()
@@ -225,12 +215,12 @@ fn write_plan(
     let workers = rayon::current_num_threads()
         .min(budget / gather_bytes.saturating_mul(4))
         .max(1);
-    Ok(WritePlan {
+    WritePlan {
         row_group_rows,
         gather_rows,
         workers,
         writer_bytes,
-    })
+    }
 }
 
 /// Convert equatorial meter hints to horizontal CRS units; never guess that
@@ -361,9 +351,6 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
     }
-    if args.write_memory_mb < 64 {
-        bail!("--write-memory-mb must be >= 64");
-    }
     anyhow::ensure!(
         args.simplification_tolerance_factor.is_finite()
             && args.simplification_tolerance_factor > 0.0,
@@ -447,7 +434,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     eprintln!("      features: {n_rows}");
-    let write_plan = write_plan(&arrow_meta, args.row_group_size, args.write_memory_mb)?;
+    let write_plan = write_plan(&arrow_meta, args.row_group_size);
     eprintln!(
         "      write plan: {} rows/row group, {} rows/gather, {} workers",
         write_plan.row_group_rows, write_plan.gather_rows, write_plan.workers
