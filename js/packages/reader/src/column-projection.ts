@@ -51,6 +51,14 @@ function isPlainStruct(node: Node): boolean {
     && node.element.converted_type === undefined && node.element.logical_type === undefined;
 }
 
+function mapValue(node: Node): Node | undefined {
+  if (node.element.converted_type !== 'MAP' || node.children.length !== 1) return undefined;
+  const entries = node.children[0]!;
+  if (entries.element.repetition_type !== 'REPEATED' || entries.children.length !== 2
+    || !entries.children.some(child => child.element.name === 'key')) return undefined;
+  return entries.children.find(child => child.element.name === 'value');
+}
+
 function listElement(node: Node): Node | undefined {
   if (node.element.converted_type !== 'LIST' && node.element.logical_type?.type !== 'LIST') return undefined;
   if (node.children.length !== 1) return undefined;
@@ -61,7 +69,7 @@ function listElement(node: Node): Node | undefined {
   return repeated.children[0] ?? repeated;
 }
 
-/** Resolve struct fields and list indices against the physical schema before any column I/O. */
+/** Resolve struct fields, map keys and list indices against the physical schema before any column I/O. */
 export function selectColumns(schema: readonly SchemaElement[], names: readonly string[]): SelectedColumn[] {
   const roots = schemaTree(schema).children;
   return names.map(name => {
@@ -82,13 +90,21 @@ export function selectColumns(schema: readonly SchemaElement[], names: readonly 
         if (!node) throw new Error(`parquet column not found: ${name}`);
         root = field;
       } else {
-        if (!node || !isPlainStruct(node)) {
+        const value = node && mapValue(node);
+        if (value) {
+          // Map lookup needs both the physical key and value leaves, so keep
+          // the map whole and select its logical key after decoding.
+          access.push(field);
+          indexed = true;
+          node = value;
+        } else if (!node || !isPlainStruct(node)) {
           throw new Error(`parquet column path crosses a non-struct field: ${name}`);
+        } else {
+          node = node.children.find(candidate => candidate.element.name === field);
+          if (!node) throw new Error(`parquet column not found: ${name}`);
+          access.push(field);
+          if (!indexed) projection.push(field);
         }
-        node = node.children.find(candidate => candidate.element.name === field);
-        if (!node) throw new Error(`parquet column not found: ${name}`);
-        access.push(field);
-        if (!indexed) projection.push(field);
       }
       for (const indexMatch of match[2]!.matchAll(/\[(\d+)\]/g)) {
         const index = Number(indexMatch[1]);

@@ -136,7 +136,7 @@ export interface ReadOptions {
    */
   bbox?: BboxInput;
   /**
-   * Columns to read. Dotted paths select individual fields of nested structs;
+   * Columns to read. Dotted paths select fields of nested structs or keys of maps;
    * `[index]` selects an element after reading its entire list. Results appear
    * under the requested path in `CogpBatch.columns`. The default
    * is every top-level attribute plus the primary geometry; other geometry
@@ -416,7 +416,9 @@ export class CogpReader {
           let selected = value;
           for (const step of column.access) {
             if (selected == null) { selected = null; break; }
-            selected = (selected as Record<string | number, unknown>)[step] ?? null;
+            selected = Object.hasOwn(selected, step)
+              ? (selected as Record<string | number, unknown>)[step] ?? null
+              : null;
           }
           out[offset + k] = selected;
         });

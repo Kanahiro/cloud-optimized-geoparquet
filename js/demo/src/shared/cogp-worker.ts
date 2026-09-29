@@ -17,7 +17,6 @@ interface ActiveDataset {
   url: string;
   reader: CogpReader;
   dataBbox: [[number, number], [number, number]] | null;
-  propertyColumns: string[];
 }
 
 let active: ActiveDataset | null = null;
@@ -54,10 +53,9 @@ async function openDataset(url: string, signal: AbortSignal): Promise<OpenResult
     url,
     reader,
     dataBbox,
-    propertyColumns: propertyColumnNames(reader),
   };
 
-  return { geo: reader.geo, numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
+  return { geo: reader.geo, columnNames: [...reader.columnNames], numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
 }
 
 /** Read the rows intersecting a view at the level selected for its resolution, as GeoArrow. */
@@ -71,7 +69,7 @@ async function readArrow(request: ViewRequest, signal: AbortSignal): Promise<Arr
   const startedAt = performance.now();
   const batch = await ds.reader.read({
     bbox: request.bbox,
-    columns: [geomColumn, ...(request.fetchProperties ? ds.propertyColumns : [])],
+    ...(request.columns === null ? {} : { columns: [geomColumn, ...request.columns] }),
     maxLevel: level,
     useOverview: true,
     maxRows: request.maxRows,
@@ -131,20 +129,6 @@ async function readBudget(request: BudgetRequest, signal: AbortSignal): Promise<
     ms: performance.now() - startedAt,
     network: { requests: network.requests - before.requests, bytes: network.bytes - before.bytes },
   };
-}
-
-function propertyColumnNames(reader: CogpReader): string[] {
-  const excluded = new Set<string>(Object.keys(reader.geo.columns));
-  if (reader.geo.lod.overviews) excluded.add(reader.geo.lod.overviews.column);
-  for (const column of Object.values(reader.geo.columns)) {
-    const covering = column.covering?.bbox;
-    for (const path of covering
-      ? [covering.xmin, covering.ymin, covering.xmax, covering.ymax]
-      : []) {
-      if (path[0]) excluded.add(path[0]);
-    }
-  }
-  return reader.columnNames.filter((name) => !excluded.has(name) && !name.startsWith('__'));
 }
 
 function computeDataBbox(reader: CogpReader): [[number, number], [number, number]] | null {

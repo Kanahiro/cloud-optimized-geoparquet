@@ -3,6 +3,7 @@ import type { CogpConfig } from './url.js';
 
 export interface CogpDatasetInfo {
   geo: CogpReader['geo'];
+  columnNames: string[];
   numRowGroups: number;
   byteLength: number;
   dataBbox: [[number, number], [number, number]] | null;

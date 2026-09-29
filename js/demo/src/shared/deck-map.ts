@@ -151,8 +151,8 @@ export function createDeckMap(options: {
 }
 
 /** Attribute table for a deck.gl tooltip, styled like the MapLibre popup. */
-export function attributeTooltip(entries: [string, unknown][], fetchProperties: boolean): Tooltip {
-  if (!fetchProperties) entries.push(['', 'Turn on “Fetch attributes” to see attributes.']);
+export function attributeTooltip(entries: [string, unknown][], hasAttributes: boolean): Tooltip {
+  if (!hasAttributes) entries.push(['', 'Enter column names to see attributes.']);
   const rows = entries
     .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(formatValue(v))}</td></tr>`)
     .join('');

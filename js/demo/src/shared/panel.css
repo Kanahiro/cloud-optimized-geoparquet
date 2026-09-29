@@ -89,7 +89,8 @@
 }
 
 select,
-input[type='url'] {
+input[type='url'],
+input[type='text'] {
   width: 100%;
   min-width: 0;
   padding: 7px 9px;
@@ -104,6 +105,18 @@ input[type='url'] {
 input[type='url'] {
   font-family: var(--mono);
   font-size: 12px;
+}
+
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.field-hint[hidden] {
+  display: none;
 }
 
 select:focus,
@@ -179,6 +192,16 @@ button.secondary:hover:not(:disabled) {
 .checkbox input {
   margin: 2px 0 0;
   accent-color: var(--accent);
+}
+
+.field .read-all-columns {
+  display: flex;
+  margin-top: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  letter-spacing: normal;
+  text-transform: none;
 }
 
 .checkbox small {
@@ -299,7 +322,8 @@ button.secondary:hover:not(:disabled) {
 
   /* Avoid iOS zooming into focused inputs. */
   select,
-  input[type='url'] {
+  input[type='url'],
+  input[type='text'] {
     font-size: 16px;
   }
 

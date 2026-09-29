@@ -4,6 +4,7 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import { cogpUrl, getCogpStats, inspectCogp, registerCogpProtocol, type CogpDatasetInfo } from '@cogp/maplibre';
 
 import { datasetFromQuery, selectPreset, writeDatasetQuery } from '../../shared/dataset-query';
+import { parseColumns } from '../../shared/columns';
 import { datasetName, escapeHtml, formatBytes, formatDistance, formatPercent } from '../../shared/format';
 import { latitudeResolution } from '../../shared/tiles';
 
@@ -99,8 +100,8 @@ map.on('mouseout', hidePreviewPropertyPopup);
 map.on('dragstart', hidePreviewPropertyPopup);
 
 function renderPropertiesHtml(properties: Record<string, unknown> | null | undefined): string {
-  if (!fetchPropertiesInput.checked) {
-    return '<div class="cogp-popup"><em>Turn on “Fetch attributes” to see this feature’s attributes.</em></div>';
+  if (!readAllColumnsInput.checked && appliedColumns.length === 0) {
+    return '<div class="cogp-popup"><em>Enter column names to see this feature’s attributes.</em></div>';
   }
   const entries = properties ? Object.entries(properties) : [];
   if (entries.length === 0) {
@@ -178,7 +179,9 @@ function removeCogpLayersAndSource(): void {
 
 function sourceUrl(url: string): string {
   return cogpUrl({
-    [COGP_LAYER_NAME]: fetchPropertiesInput.checked ? { url } : { url, properties: {} },
+    [COGP_LAYER_NAME]: readAllColumnsInput.checked
+      ? { url }
+      : { url, properties: Object.fromEntries(appliedColumns.map((column) => [column, column])) },
   });
 }
 
@@ -233,7 +236,9 @@ const urlInput = document.getElementById('url') as HTMLInputElement;
 const presetSelect = document.getElementById('preset') as HTMLSelectElement;
 const loadBtn = document.getElementById('load') as HTMLButtonElement;
 const flyBtn = document.getElementById('fly') as HTMLButtonElement;
-const fetchPropertiesInput = document.getElementById('fetch-properties') as HTMLInputElement;
+const columnsInput = document.getElementById('columns') as HTMLInputElement;
+const readAllColumnsInput = document.getElementById('read-all-columns') as HTMLInputElement;
+const availableColumnsEl = document.getElementById('available-columns') as HTMLElement;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const metaEl = document.getElementById('meta') as HTMLPreElement;
 const panel = document.getElementById('panel') as HTMLElement;
@@ -272,14 +277,25 @@ let latestUrl = '';
 let datasetLoadController: AbortController | null = null;
 let propertyPopup: maplibregl.Popup | null = null;
 let propertyPopupPinned = false;
+let appliedColumns: string[] = [];
 
-fetchPropertiesInput.addEventListener('change', () => {
+columnsInput.addEventListener('change', () => {
+  appliedColumns = parseColumns(columnsInput.value).filter((column) => column !== active?.summary.primary_column);
+  refreshSourceColumns();
+});
+
+readAllColumnsInput.addEventListener('change', () => {
+  columnsInput.disabled = readAllColumnsInput.checked;
+  refreshSourceColumns();
+});
+
+function refreshSourceColumns(): void {
   hidePropertyPopup();
   const source = map.getSource(COGP_SOURCE_ID) as maplibregl.VectorTileSource | undefined;
   if (!source) return;
   if (active) source.setTiles([sourceUrl(active.url)]);
   void renderStats();
-});
+}
 
 loadBtn.addEventListener('click', () => {
   void loadDataset(urlInput.value.trim());
@@ -311,7 +327,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
   datasetLoadController = controller;
   latestUrl = url;
   try {
-    const { geo, numRowGroups, byteLength, dataBbox } = await inspectCogp(url, controller.signal);
+    const { geo, columnNames, numRowGroups, byteLength, dataBbox } = await inspectCogp(url, controller.signal);
     if (latestUrl !== url) return;
     active = {
       url,
@@ -319,6 +335,9 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
       dataBbox,
       summary: geo,
     };
+    appliedColumns = parseColumns(columnsInput.value).filter((column) => column !== geo.primary_column);
+    availableColumnsEl.textContent = `File columns: ${columnNames.join(', ')}`;
+    availableColumnsEl.hidden = false;
     writeDatasetQuery(url);
     renderMetadata(geo);
     if (dataBbox && !keepView) {
@@ -339,6 +358,7 @@ async function loadDataset(url: string, keepView = false): Promise<void> {
     console.error(err);
     setStatus(`Could not open ${datasetName(url)}: ${(err as Error).message}`, true);
     active = null;
+    availableColumnsEl.hidden = true;
     statsEl.hidden = true;
     flyBtn.disabled = true;
     removeCogpLayersAndSource();

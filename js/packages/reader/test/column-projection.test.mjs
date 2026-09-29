@@ -55,3 +55,22 @@ test('an indexed list keeps its physical subtree while pruning sibling struct fi
   assert.deepEqual(selectColumns(logicalSchema, ['struct.array[1].height'])[0].access,
     ['array', 1, 'height']);
 });
+
+test('a dotted map key keeps both physical key and value leaves', () => {
+  const schema = [
+    { name: 'schema', num_children: 2 },
+    { name: 'tags', num_children: 1, converted_type: 'MAP' },
+    { name: 'key_value', num_children: 2, repetition_type: 'REPEATED' },
+    { name: 'key', type: 'BYTE_ARRAY', repetition_type: 'REQUIRED' },
+    { name: 'value', type: 'BYTE_ARRAY', repetition_type: 'OPTIONAL' },
+    { name: 'id', type: 'INT64' },
+  ];
+  const selected = selectColumns(schema, ['tags.name', 'id']);
+  assert.deepEqual(selected[0], { name: 'tags.name', root: 'tags', projection: [], access: ['name'] });
+  const metadata = {
+    schema,
+    row_groups: [{ columns: ['tags.key_value.key', 'tags.key_value.value', 'id']
+      .map(path => ({ meta_data: { path_in_schema: path.split('.') } })) }],
+  };
+  assert.strictEqual(projectNestedColumns(metadata, selected), metadata);
+});

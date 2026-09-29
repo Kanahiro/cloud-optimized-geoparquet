@@ -107,5 +107,5 @@ function inspectReader(reader: CogpReader): CogpDatasetInfo {
   }
   const dataBbox: [[number, number], [number, number]] | null = Number.isFinite(minX)
     ? [[minX, minY], [maxX, maxY]] : null;
-  return { geo: reader.geo, numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
+  return { geo: reader.geo, columnNames: [...reader.columnNames], numRowGroups: reader.numRowGroups, byteLength: reader.byteLength, dataBbox };
 }
