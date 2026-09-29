@@ -17,11 +17,12 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
@@ -30,6 +31,7 @@ use crate::meta::{
     OverviewLod, OverviewsMeta, GEOARROW_ENCODING, GEOPARQUET_VERSION, GEO_METADATA_KEY,
     OVERVIEWS_COLUMN,
 };
+use crate::parallel_writer::ParallelWriter;
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
 
 use crate::wkb_simplify::{
@@ -68,6 +70,14 @@ pub struct ConvertArgs {
     /// Maximum Parquet row group size in rows.
     #[arg(long, default_value_t = 262_144)]
     pub row_group_size: usize,
+    /// Approximate memory budget for the gather/write pipeline, in MiB. This
+    /// excludes the per-feature spatial index built during the first pass.
+    #[arg(long, default_value_t = 512)]
+    pub write_memory_mb: usize,
+    /// ZSTD compression level for output columns (1..=22). Lower levels
+    /// usually write faster at the cost of a larger file.
+    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
+    pub zstd_level: i32,
     /// Simplification tolerance in multiples of the CRS-unit resolution.
     #[arg(long, default_value_t = 0.25)]
     pub simplification_tolerance_factor: f64,
@@ -132,29 +142,95 @@ pub enum PriorityColumnOrder {
 /// Write without allowing an input batch to push a row group beyond the
 /// public row-count limit. Levels explicitly flush at their boundaries.
 fn write_with_row_group_limit<W: Write + Send>(
-    writer: &mut ArrowWriter<W>,
+    writer: &mut ParallelWriter<W>,
     batch: &RecordBatch,
     max_rows: usize,
+    max_bytes: usize,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < batch.num_rows() {
-        if writer.in_progress_rows() >= max_rows {
+        if writer.in_progress_rows() >= max_rows || writer.memory_size() >= max_bytes {
             writer.flush()?;
         }
         let capacity = max_rows - writer.in_progress_rows();
         let rows = (batch.num_rows() - offset).min(capacity);
         writer.write(&batch.slice(offset, rows))?;
         offset += rows;
+        if writer.memory_size() >= max_bytes {
+            writer.flush()?;
+        }
     }
     Ok(())
 }
 
-fn flushed_row_group_end<W: Write + Send>(writer: &ArrowWriter<W>) -> Result<i64> {
+fn flushed_row_group_end<W: Write + Send>(writer: &ParallelWriter<W>) -> Result<i64> {
     let count = writer.flushed_row_groups().len();
     if count == 0 {
         bail!("internal error: level ended before any row group was written");
     }
     Ok((count as i64) - 1)
+}
+
+struct WritePlan {
+    row_group_rows: usize,
+    gather_rows: usize,
+    workers: usize,
+    writer_bytes: usize,
+}
+
+/// Drain only the oldest gather result, preserving sorted output while other
+/// workers continue. False means the writer has stopped receiving.
+fn forward_gathered_chunk(
+    pending: &mut VecDeque<(usize, Receiver<Result<Vec<RecordBatch>>>)>,
+    writer: &SyncSender<(usize, RecordBatch)>,
+) -> Result<bool> {
+    let (level, receiver) = pending.pop_front().expect("pending gather missing");
+    let batches = receiver
+        .recv()
+        .map_err(|_| anyhow!("gather worker exited without a result"))??;
+    for batch in batches {
+        if writer.send((level, batch)).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Parquet's uncompressed row-group sizes give a cheap payload estimate before
+/// gathering. Cap both task size and task count: a gathered chunk temporarily
+/// exists as decoded input, reordered output, and encoded writer buffers.
+fn write_plan(
+    meta: &ArrowReaderMetadata,
+    requested_rows: usize,
+    memory_mb: usize,
+) -> Result<WritePlan> {
+    anyhow::ensure!(memory_mb >= 64, "--write-memory-mb must be >= 64");
+    let budget = memory_mb
+        .checked_mul(1 << 20)
+        .ok_or_else(|| anyhow!("--write-memory-mb is too large"))?;
+    let bytes_per_row = meta
+        .metadata()
+        .row_groups()
+        .iter()
+        .filter(|rg| rg.num_rows() > 0)
+        .map(|rg| (rg.total_byte_size().max(0) as usize).div_ceil(rg.num_rows() as usize))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let writer_bytes = budget / 4;
+    // Allow headroom for Arrow arrays and intermediate overview geometry.
+    let row_group_rows = requested_rows.min(writer_bytes / bytes_per_row / 2).max(1);
+    let gather_bytes = (budget / 16).min(32 << 20);
+    let gather_rows = row_group_rows.min(gather_bytes / bytes_per_row).max(1);
+    let workers = rayon::current_num_threads()
+        .min(budget / gather_bytes.saturating_mul(4))
+        .max(1);
+    Ok(WritePlan {
+        row_group_rows,
+        gather_rows,
+        workers,
+        writer_bytes,
+    })
 }
 
 /// Convert equatorial meter hints to horizontal CRS units; never guess that
@@ -257,6 +333,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             bail!("Resolution values must be positive, got {:?}", resolutions);
         }
     }
+    anyhow::ensure!(
+        resolutions.len() <= u16::MAX as usize,
+        "too many resolution levels"
+    );
     if args.min_root_features == 0 {
         bail!("--min-root-features must be >= 1");
     }
@@ -280,6 +360,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
+    }
+    if args.write_memory_mb < 64 {
+        bail!("--write-memory-mb must be >= 64");
     }
     anyhow::ensure!(
         args.simplification_tolerance_factor.is_finite()
@@ -327,7 +410,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .with_context(|| format!("geometry column `{geom_col_name}` not found"))?;
     eprintln!("      geometry column: {geom_col_name}");
 
-    let n_rows = arrow_meta.metadata().file_metadata().num_rows() as usize;
+    let n_rows = usize::try_from(arrow_meta.metadata().file_metadata().num_rows())
+        .context("input has a negative or unrepresentable row count")?;
+    anyhow::ensure!(n_rows <= u32::MAX as usize, "more than u32::MAX input rows");
     if n_rows == 0 {
         let mut geo = input_geo_json
             .clone()
@@ -362,6 +447,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     eprintln!("      features: {n_rows}");
+    let write_plan = write_plan(&arrow_meta, args.row_group_size, args.write_memory_mb)?;
+    eprintln!(
+        "      write plan: {} rows/row group, {} rows/gather, {} workers",
+        write_plan.row_group_rows, write_plan.gather_rows, write_plan.workers
+    );
 
     let priority_column_idx = match &args.priority_column {
         Some(name) => Some(
@@ -404,7 +494,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 )
             })?
         }
-        None => vec![0u64; n_rows],
+        None => Vec::new(),
     };
     drop(priority_column);
     if let Some(col) = &args.priority_column {
@@ -429,6 +519,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         },
         &sort_ranks,
     )?;
+    drop(kinds);
+    drop(sort_ranks);
     let family = input_geo
         .as_ref()
         .and_then(|g| g.columns.get(&geom_col_name))
@@ -503,6 +595,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         occupied
     };
     let mut per_level = remap_levels(&assignment, &selected)?;
+    drop(assignment);
     let resolutions: Vec<_> = selected.iter().map(|i| resolutions[*i]).collect();
     for (i, rows) in per_level.iter().enumerate() {
         eprintln!(
@@ -513,11 +606,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(rows, &bboxes, args.row_group_size, level_idx);
+        str_pack(rows, &bboxes, write_plan.row_group_rows, level_idx);
         str_pack_pages(
             rows,
             &bboxes,
-            args.row_group_size,
+            write_plan.row_group_rows,
             args.page_row_count,
             level_idx,
         );
@@ -593,7 +686,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let output_schema = Arc::new(Schema::new(output_fields));
 
     // ZSTD 9 reduced representative Range payloads without the decode cost
-    // observed with Brotli 6. Keep this workload-specific choice internal.
+    // observed with Brotli 6, so retain it as the default.
     // Selective page reads should not require a column-chunk-wide dictionary.
     // Keep dictionaries disabled for every leaf, including nested attributes.
     // Physical-type transforms can worsen ZSTD compression on arbitrary attributes.
@@ -601,8 +694,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let mut props_builder = WriterProperties::builder()
         .set_dictionary_enabled(false)
         .set_encoding(Encoding::PLAIN)
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(9)?))
-        .set_max_row_group_size(args.row_group_size)
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(args.zstd_level)?))
+        .set_max_row_group_size(write_plan.row_group_rows)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_statistics_enabled(
             ColumnPath::from(geom_col_name.as_str()),
@@ -639,17 +732,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let props = props_builder.build();
     let out_file = File::create(&args.output)
         .with_context(|| format!("creating {}", args.output.display()))?;
-    let mut writer = ArrowWriter::try_new(out_file, output_schema.clone(), Some(props))?;
+    let mut writer = ParallelWriter::try_new(out_file, output_schema.clone(), Some(props))?;
 
-    // Pass 2: a background thread gathers output chunks straight from the
-    // input file (row-selection read + interleave into output order) while the
-    // main thread flushes finished batches through the parquet writer. Chunks
-    // are independent, so the producer gathers them in rayon-parallel waves of
-    // one chunk per worker; each wave is sent in order once complete. Resident
-    // memory is bounded by one wave of `row_group_size`-row chunks plus the
-    // channel, never the whole table. The barrier per wave costs little
-    // because chunks are equal-sized and similarly priced.
-    let (tx, rx) = sync_channel::<(usize, RecordBatch)>(2);
+    // Gather tasks run ahead of the writer in a bounded window. Each has its
+    // own result slot, so completion order does not affect physical row order;
+    // the oldest result can be written while later gathers are still running.
+    let (tx, rx) = sync_channel::<(usize, RecordBatch)>(0);
     let producer_schema = output_schema.clone();
     let producer_bboxes = Arc::new(bboxes);
     let producer_meta = arrow_meta.clone();
@@ -660,51 +748,63 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_overview_plan = overview_plan.clone();
     let producer_overview_entry_levels = overview_entry_levels;
     let producer_per_level = per_level;
-    let producer_row_group_size = args.row_group_size;
+    let producer_gather_rows = write_plan.gather_rows;
+    let producer_workers = write_plan.workers;
     let producer = thread::spawn(move || -> Result<()> {
         let chunks: Vec<(usize, &[u32])> = producer_per_level
             .iter()
             .enumerate()
             .flat_map(|(level_i, rows)| {
-                rows.chunks(producer_row_group_size)
+                rows.chunks(producer_gather_rows)
                     .map(move |chunk| (level_i, chunk))
             })
             .collect();
-        for wave in chunks.chunks(rayon::current_num_threads()) {
-            let gathered = wave
-                .par_iter()
-                .map(|(level_i, chunk)| {
-                    let batches = gather_chunk(
-                        &producer_input,
-                        &producer_meta,
-                        &producer_keep,
+        rayon::scope(|scope| -> Result<()> {
+            let mut pending = VecDeque::new();
+            for (level_i, chunk) in chunks {
+                let (task_tx, task_rx) = sync_channel(1);
+                let schema = &producer_schema;
+                let bboxes = &producer_bboxes;
+                let meta = &producer_meta;
+                let input = &producer_input;
+                let keep = &producer_keep;
+                let overview_plan = &producer_overview_plan;
+                let entry_levels = &producer_overview_entry_levels;
+                scope.spawn(move |_| {
+                    let result = gather_chunk(
+                        input,
+                        meta,
+                        keep,
                         chunk,
-                        &producer_bboxes,
+                        bboxes,
                         &GatherLayout {
-                            output_schema: &producer_schema,
+                            output_schema: schema,
                             append_bbox: producer_append_bbox,
                             geometry_col: producer_geom_col,
-                            first_covered_level: if *level_i == first_occupied_level {
+                            first_covered_level: if level_i == first_occupied_level {
                                 0
                             } else {
-                                *level_i
+                                level_i
                             },
-                            overview_plan: &producer_overview_plan,
-                            overview_entry_levels: &producer_overview_entry_levels,
+                            overview_plan,
+                            overview_entry_levels: entry_levels,
                         },
-                    )?;
-                    Ok((*level_i, batches))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (level_i, batches) in gathered {
-                for batch in batches {
-                    if tx.send((level_i, batch)).is_err() {
-                        return Ok(());
-                    }
+                    );
+                    let _ = task_tx.send(result);
+                });
+                pending.push_back((level_i, task_rx));
+                if pending.len() >= producer_workers && !forward_gathered_chunk(&mut pending, &tx)?
+                {
+                    return Ok(());
                 }
             }
-        }
-        Ok(())
+            while !pending.is_empty() {
+                if !forward_gathered_chunk(&mut pending, &tx)? {
+                    break;
+                }
+            }
+            Ok(())
+        })
     });
 
     let mut last_level: Option<usize> = None;
@@ -722,7 +822,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 }
             }
         }
-        write_with_row_group_limit(&mut writer, &batch, args.row_group_size)?;
+        write_with_row_group_limit(
+            &mut writer,
+            &batch,
+            write_plan.row_group_rows,
+            write_plan.writer_bytes,
+        )?;
         last_level = Some(level_i);
     }
     if last_level.is_some() {
@@ -846,7 +951,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             writer.append_key_value_metadata(entry);
         }
     }
-    let _ = writer.close()?;
+    writer.close()?;
 
     let row_group_count = lod_meta
         .levels
@@ -1654,8 +1759,11 @@ fn assign_levels(
     sort_ranks: &[u64],
 ) -> Result<Vec<u16>> {
     let n = bboxes.len();
-    let mut assigned: Vec<i32> = vec![-1; n];
-    let mut remaining: Vec<u32> = (0..n as u32).collect();
+    anyhow::ensure!(
+        sort_ranks.is_empty() || sort_ranks.len() == n,
+        "internal: priority rank count mismatch"
+    );
+    anyhow::ensure!(n <= u32::MAX as usize, "more than u32::MAX input rows");
     let last_level = (resolutions.len() - 1) as u16;
 
     let precs = resolutions.to_vec();
@@ -1706,6 +1814,15 @@ fn assign_levels(
         })
         .collect();
 
+    // Extended features never compete for a cell. Their visibility threshold
+    // already is their final assignment, so avoid the point index entirely.
+    if kinds.iter().all(|kind| *kind != GeomKind::Point) {
+        return Ok(min_visible);
+    }
+
+    let mut assigned: Vec<u16> = vec![u16::MAX; n];
+    let mut remaining: Vec<u32> = (0..n as u32).collect();
+
     let cell_key = |row: u32, prec: f64| -> (i64, i64) {
         let b = bboxes[row as usize];
         let ep = prec * point_thin_mul;
@@ -1714,6 +1831,14 @@ fn assign_levels(
 
     let mut assigned_points: Vec<u32> = Vec::new();
     for (level_i, prec) in precs.iter().enumerate() {
+        // Nothing competes after the finest level: all remaining rows must be
+        // retained there, even if they share a point cell.
+        if level_i == last_level as usize {
+            for row in remaining.drain(..) {
+                assigned[row as usize] = last_level;
+            }
+            break;
+        }
         // Re-project every coarser-level point onto this level's grid and mark
         // those cells as blocked, so a candidate point falling into the same
         // cell as an already-placed coarse winner is skipped.
@@ -1723,7 +1848,13 @@ fn assign_levels(
             .map(|&row| cell_key(row, *prec))
             .collect();
 
-        let prio = |row: u32| priority(&bboxes[row as usize], sort_ranks[row as usize], row);
+        let prio = |row: u32| {
+            priority(
+                &bboxes[row as usize],
+                sort_ranks.get(row as usize).copied().unwrap_or(0),
+                row,
+            )
+        };
 
         // Per-cell point winner map built in parallel: each thread folds into a
         // local HashMap, then reduce merges them keeping the higher-score row
@@ -1773,37 +1904,31 @@ fn assign_levels(
                 }
                 a
             });
-        let mut picked: Vec<u32> = best.values().copied().collect();
-        let extended: Vec<u32> = remaining
-            .par_iter()
-            .filter_map(|&row| {
-                (kinds[row as usize] != GeomKind::Point
-                    && min_visible[row as usize] as usize <= level_i)
-                    .then_some(row)
-            })
-            .collect();
-        picked.extend(extended);
-        for r in &picked {
-            assigned[*r as usize] = level_i as i32;
+        for &row in best.values() {
+            assigned[row as usize] = level_i as u16;
         }
         assigned_points.extend(best.values().copied());
-        let picked_set: std::collections::HashSet<u32> = picked.iter().copied().collect();
-        remaining.retain(|r| !picked_set.contains(r));
+        remaining.retain(|&row| {
+            if kinds[row as usize] != GeomKind::Point
+                && min_visible[row as usize] as usize <= level_i
+            {
+                assigned[row as usize] = level_i as u16;
+            }
+            assigned[row as usize] == u16::MAX
+        });
         if remaining.is_empty() {
             break;
         }
     }
     for r in remaining {
-        assigned[r as usize] = last_level as i32;
+        assigned[r as usize] = last_level;
     }
-    let mut out: Vec<u16> = Vec::with_capacity(n);
     for (i, a) in assigned.iter().enumerate() {
-        if *a < 0 {
+        if *a == u16::MAX {
             bail!("internal: row {i} was never assigned");
         }
-        out.push(*a as u16);
     }
-    Ok(out)
+    Ok(assigned)
 }
 
 /// Point-cell winner priority. The optional `--priority-column` rank leads, bbox
@@ -1894,10 +2019,16 @@ impl SnakeStart {
 /// STR bulk-loading into spatially compact row-group leaves.
 fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_idx: usize) {
     let dir = SnakeStart::for_level(level_idx).initial_dir();
-    let mut scratch: Vec<(f64, u32)> = vec![(0.0, 0); rows.len()];
+    // Cached keys avoid repeated random bbox reads on normal levels. On very
+    // large levels their 16-byte-per-row scratch array can exceed available
+    // RAM; Rayon can sort row ids in place without allocating that array.
+    const MAX_SORT_SCRATCH_BYTES: usize = 256 << 20;
+    let mut scratch = (rows.len().saturating_mul(std::mem::size_of::<(f64, u32)>())
+        <= MAX_SORT_SCRATCH_BYTES)
+        .then(|| vec![(0.0, 0); rows.len()]);
     str_pack_rec(
         rows.as_mut_slice(),
-        &mut scratch,
+        scratch.as_deref_mut(),
         bboxes,
         row_group_size,
         dir,
@@ -1919,13 +2050,13 @@ fn str_pack_pages(
         .for_each(|(row_group_idx, row_group)| {
             let mut scratch = vec![(0.0, 0); row_group.len()];
             let dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
-            str_pack_rec(row_group, &mut scratch, bboxes, page_row_count, dir);
+            str_pack_rec(row_group, Some(&mut scratch), bboxes, page_row_count, dir);
         });
 }
 
 fn str_pack_rec(
     rows: &mut [u32],
-    scratch: &mut [(f64, u32)],
+    scratch: Option<&mut [(f64, u32)]>,
     bboxes: &[Bbox],
     m: usize,
     dir: SortDir,
@@ -1947,39 +2078,57 @@ fn str_pack_rec(
     let split_x = extent.width() >= extent.height();
     let reverse = dir.reverse_on(split_x);
 
-    // Decorate-Sort-Undecorate: stage (key, row_idx) pairs once, sort by
-    // key, then write the reordered row indices back. The sort comparator
-    // touches only the local scratch buffer instead of doing O(n log n)
-    // random reads into `bboxes`.
-    scratch
-        .par_iter_mut()
-        .zip(rows.par_iter())
-        .for_each(|(slot, i)| {
-            let b = &bboxes[*i as usize];
-            let key = if split_x { b.cx() } else { b.cy() };
-            *slot = (key, *i);
-        });
-    scratch.par_sort_unstable_by(|a, b| {
-        let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
-        if reverse {
-            ord.reverse()
-        } else {
-            ord
+    // Split on the physical-unit boundary; only the last leaf may be partial.
+    let split_at = (n.div_ceil(m) / 2).max(1) * m;
+    let (left_scratch, right_scratch) = match scratch {
+        Some(scratch) => {
+            // Cache keys to avoid random bbox reads inside the comparator.
+            debug_assert_eq!(scratch.len(), rows.len());
+            scratch
+                .par_iter_mut()
+                .zip(rows.par_iter())
+                .for_each(|(slot, i)| {
+                    let b = &bboxes[*i as usize];
+                    let key = if split_x { b.cx() } else { b.cy() };
+                    *slot = (key, *i);
+                });
+            scratch.par_sort_unstable_by(|a, b| {
+                let ord = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                if reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+            rows.par_iter_mut()
+                .zip(scratch.par_iter())
+                .for_each(|(r, (_, i))| *r = *i);
+            let (left_scratch, right_scratch) = scratch.split_at_mut(split_at);
+            (Some(left_scratch), Some(right_scratch))
         }
-    });
-    rows.par_iter_mut()
-        .zip(scratch.par_iter())
-        .for_each(|(r, (_, i))| {
-            *r = *i;
-        });
-
-    // Split on the caller's physical-unit boundary (row group in the outer
-    // pass, page in the inner pass). Only the final leaf may be partial.
-    let num_leaves = n.div_ceil(m);
-    let left_leaves = (num_leaves / 2).max(1);
-    let split_at = left_leaves * m;
+        None => {
+            rows.par_sort_unstable_by(|a, b| {
+                let a = if split_x {
+                    bboxes[*a as usize].cx()
+                } else {
+                    bboxes[*a as usize].cy()
+                };
+                let b = if split_x {
+                    bboxes[*b as usize].cx()
+                } else {
+                    bboxes[*b as usize].cy()
+                };
+                let ord = a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+                if reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+            (None, None)
+        }
+    };
     let (left_rows, right_rows) = rows.split_at_mut(split_at);
-    let (left_scratch, right_scratch) = scratch.split_at_mut(split_at);
     let right_dir = dir.flip_for_right_child(split_x);
     rayon::join(
         || str_pack_rec(left_rows, left_scratch, bboxes, m, dir),
@@ -2014,6 +2163,7 @@ mod tests {
         assert_eq!(cli.args.line_visibility_factor, 4);
         assert_eq!(cli.args.polygon_visibility_factor, 4);
         assert_eq!(cli.args.row_group_size, 262_144);
+        assert_eq!(cli.args.zstd_level, 9);
         assert_eq!(cli.args.page_row_count, 1024);
         assert_eq!(cli.args.simplification_tolerance_factor, 0.25);
         assert_eq!(cli.args.priority_column.as_deref(), Some("population"));
@@ -2362,12 +2512,30 @@ mod tests {
     }
 
     #[test]
+    fn in_place_spatial_pack_matches_cached_key_pack() {
+        let bboxes: Vec<_> = (0..128)
+            .map(|i| {
+                let x = i as f64;
+                let y = ((i * 37) % 128) as f64;
+                bb(x, y, x + 0.1, y + 0.1)
+            })
+            .collect();
+        let mut cached: Vec<u32> = (0..128).collect();
+        let mut in_place = cached.clone();
+        let mut scratch = vec![(0.0, 0); cached.len()];
+        let dir = SnakeStart::for_level(0).initial_dir();
+        str_pack_rec(&mut cached, Some(&mut scratch), &bboxes, 10, dir);
+        str_pack_rec(&mut in_place, None, &bboxes, 10, dir);
+        assert_eq!(in_place, cached);
+    }
+
+    #[test]
     fn flushed_row_group_end_errors_on_empty() {
         // The shim error path is hard to hit in real code (there's always
         // ≥1 row group), but the helper must refuse to lie.
         let buf = Vec::new();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let writer = ArrowWriter::try_new(buf, schema, None).unwrap();
+        let writer = ParallelWriter::try_new(buf, schema, None).unwrap();
         assert!(flushed_row_group_end(&writer).is_err());
     }
 
