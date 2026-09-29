@@ -1731,8 +1731,8 @@ fn point_cell_key(bbox: &Bbox, pitch: f64) -> (i64, i64) {
     )
 }
 
-/// Group point cells into bounded-size partitions before choosing winners.
-/// Previously one map per level could hold almost every input point at once.
+/// Hash-partition point cells before choosing winners. The partition target
+/// controls average row count, not a hard per-partition memory limit.
 fn assign_points_partitioned(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
@@ -1740,12 +1740,12 @@ fn assign_points_partitioned(
     point_thin_mul: f64,
     sort_ranks: &[u64],
     mut assigned: Vec<u16>,
-    points_per_partition: usize,
+    target_rows_per_partition: usize,
 ) -> Vec<u16> {
     const UNASSIGNED: u16 = u16::MAX;
     // Limit simultaneous cell maps independently of Rayon thread count.
     const PARTITIONS_IN_FLIGHT: usize = 4;
-    debug_assert!(points_per_partition > 0);
+    debug_assert!(target_rows_per_partition > 0);
     let last_level = (resolutions.len() - 1) as u16;
     let mut remaining_nonempty = 0;
     for (row, kind) in kinds.iter().enumerate() {
@@ -1755,7 +1755,7 @@ fn assign_points_partitioned(
         }
     }
     let partition_count = remaining_nonempty
-        .div_ceil(points_per_partition)
+        .div_ceil(target_rows_per_partition)
         .max(1)
         .next_power_of_two();
     let mask = partition_count - 1;
@@ -1916,9 +1916,13 @@ fn assign_levels(
         return Ok(min_visible);
     }
 
-    // The all-at-once cell maps become larger than the bbox array on very
-    // large point inputs. The partitioned path holds only one cell map at a time.
-    if n > 2_000_000 {
+    // Heuristic crossover for the in-memory and partitioned paths. The
+    // partition target sets the average nonempty point rows per hash bucket;
+    // up to four buckets are processed concurrently, so neither value is a
+    // strict memory limit.
+    const IN_MEMORY_ASSIGNMENT_MAX_ROWS: usize = 2_000_000;
+    const TARGET_POINT_ROWS_PER_PARTITION: usize = 1_000_000;
+    if n > IN_MEMORY_ASSIGNMENT_MAX_ROWS {
         return Ok(assign_points_partitioned(
             bboxes,
             kinds,
@@ -1926,7 +1930,7 @@ fn assign_levels(
             point_thin_mul,
             sort_ranks,
             min_visible,
-            1_000_000,
+            TARGET_POINT_ROWS_PER_PARTITION,
         ));
     }
 
