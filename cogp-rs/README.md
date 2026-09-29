@@ -205,7 +205,7 @@ to convert into GeoJSON / WKT / `geo-types` / FlatGeobuf / etc.
 
 ```toml
 [dependencies]
-cogp = "2.0"
+cogp = "2.1"
 geozero = { version = "0.14", features = ["with-wkb"] }
 arrow-array = "56"
 ```
@@ -259,7 +259,7 @@ actually needs over HTTP range requests:
 
 ```toml
 [dependencies]
-cogp = { version = "2.0", features = ["object_store"] }
+cogp = { version = "2.1", features = ["object_store"] }
 object_store = "0.12"
 geozero = { version = "0.14", features = ["with-wkb"] }
 tokio = { version = "1", features = ["full"] }
