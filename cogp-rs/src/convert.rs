@@ -1508,14 +1508,23 @@ fn remap_levels(assignment: &[u16], selected_candidates: &[usize]) -> Result<Vec
     if selected_candidates.is_empty() {
         bail!("internal: no selected levels");
     }
-    let mut per_level = vec![Vec::new(); selected_candidates.len()];
-    for (row, source_level) in assignment.iter().enumerate() {
-        let source_level = *source_level as usize;
+    // Most point rows can land in one fine level. Count first so that its row
+    // index vector does not temporarily double in capacity while growing.
+    let mut counts = vec![0usize; selected_candidates.len()];
+    for &source_level in assignment {
+        let source_level = source_level as usize;
         let output_level = selected_candidates.partition_point(|level| *level < source_level);
-        let rows = per_level.get_mut(output_level).ok_or_else(|| {
+        let count = counts.get_mut(output_level).ok_or_else(|| {
             anyhow!("internal: feature level {source_level} has no selected successor")
         })?;
-        rows.push(u32::try_from(row).map_err(|_| anyhow!("more than u32::MAX input rows"))?);
+        *count += 1;
+    }
+    let mut per_level: Vec<Vec<u32>> = counts.into_iter().map(Vec::with_capacity).collect();
+    for (row, source_level) in assignment.iter().enumerate() {
+        let output_level =
+            selected_candidates.partition_point(|level| *level < *source_level as usize);
+        per_level[output_level]
+            .push(u32::try_from(row).map_err(|_| anyhow!("more than u32::MAX input rows"))?);
     }
     Ok(per_level)
 }
@@ -1715,28 +1724,128 @@ fn compute_sort_ranks(col: &dyn Array, order: PriorityColumnOrder) -> Result<Vec
     Ok(ranks.into_iter().map(u64::from).collect())
 }
 
+fn point_cell_key(bbox: &Bbox, pitch: f64) -> (i64, i64) {
+    (
+        (bbox.cx() / pitch).floor() as i64,
+        (bbox.cy() / pitch).floor() as i64,
+    )
+}
+
+/// Group point cells into bounded-size partitions before choosing winners.
+/// Previously one map per level could hold almost every input point at once.
+fn assign_points_partitioned(
+    bboxes: &[Bbox],
+    kinds: &[GeomKind],
+    resolutions: &[f64],
+    point_thin_mul: f64,
+    sort_ranks: &[u64],
+    mut assigned: Vec<u16>,
+    points_per_partition: usize,
+) -> Vec<u16> {
+    const UNASSIGNED: u16 = u16::MAX;
+    // Limit simultaneous cell maps independently of Rayon thread count.
+    const PARTITIONS_IN_FLIGHT: usize = 4;
+    debug_assert!(points_per_partition > 0);
+    let last_level = (resolutions.len() - 1) as u16;
+    let mut remaining_nonempty = 0;
+    for (row, kind) in kinds.iter().enumerate() {
+        if *kind == GeomKind::Point {
+            assigned[row] = UNASSIGNED;
+            remaining_nonempty += usize::from(!bboxes[row].is_empty());
+        }
+    }
+    let partition_count = remaining_nonempty
+        .div_ceil(points_per_partition)
+        .max(1)
+        .next_power_of_two();
+    let mask = partition_count - 1;
+    let partition = |(x, y): (i64, i64)| {
+        let mut hash = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (y as u64)
+                .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                .rotate_left(32);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        (hash as usize) & mask
+    };
+    let rank = |row: u32| {
+        priority(
+            &bboxes[row as usize],
+            sort_ranks.get(row as usize).copied().unwrap_or(0),
+            row,
+        )
+    };
+    let mut partitions: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
+
+    for (level_i, prec) in resolutions.iter().enumerate().take(last_level as usize) {
+        if remaining_nonempty == 0 {
+            break;
+        }
+        let pitch = *prec * point_thin_mul;
+        let mut counts = vec![0usize; partition_count];
+        for (row, kind) in kinds.iter().enumerate() {
+            if *kind == GeomKind::Point && !bboxes[row].is_empty() {
+                let key = point_cell_key(&bboxes[row], pitch);
+                counts[partition(key)] += 1;
+            }
+        }
+        for (rows, count) in partitions.iter_mut().zip(counts) {
+            rows.clear();
+            rows.reserve(count);
+        }
+        for (row, kind) in kinds.iter().enumerate() {
+            if *kind == GeomKind::Point && !bboxes[row].is_empty() {
+                let key = point_cell_key(&bboxes[row], pitch);
+                partitions[partition(key)].push(row as u32);
+            }
+        }
+
+        for wave in partitions.chunks(PARTITIONS_IN_FLIGHT) {
+            let winners: Vec<Vec<u32>> = wave
+                .par_iter()
+                .map(|rows| {
+                    // None means a previously assigned coarse point blocks this cell.
+                    let mut cells: HashMap<(i64, i64), Option<u32>> = HashMap::new();
+                    for &row in rows {
+                        let key = point_cell_key(&bboxes[row as usize], pitch);
+                        match cells.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert((assigned[row as usize] == UNASSIGNED).then_some(row));
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if assigned[row as usize] != UNASSIGNED {
+                                    slot.insert(None);
+                                } else if let Some(current) = *slot.get() {
+                                    if rank(row) > rank(current) {
+                                        slot.insert(Some(row));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cells.into_values().flatten().collect()
+                })
+                .collect();
+            for row in winners.into_iter().flatten() {
+                assigned[row as usize] = level_i as u16;
+                remaining_nonempty -= 1;
+            }
+        }
+    }
+    for level in &mut assigned {
+        if *level == UNASSIGNED {
+            *level = last_level;
+        }
+    }
+    assigned
+}
+
 /// Assign features to progressive levels, with grid thinning only for points.
 ///
-/// For each level (coarse → fine), eligible Point/MultiPoint features compete in
-/// grid cells and the highest-priority feature in each cell is assigned. Lines and
-/// polygons are spatially extended: representing either by its bbox center can hide a
-/// feature that contributes visible information across many cells. They therefore do
-/// not compete in cells and are assigned as soon as they pass the visibility gate.
-///
-/// A feature is *eligible* at a level only once its bbox diagonal reaches
-/// `vis_factor · prec` for its kind (see `min_visible`); below that it is excluded and
-/// deferred to a finer level where it becomes independently meaningful. This is a hard
-/// gate, not a tie-break, so the reader does not fetch sub-resolution extended features
-/// at a coarse zoom. It does not impose a density bound on visible lines or polygons.
-/// The trade-off is that a lone sub-threshold feature does not appear at coarser zooms.
-/// Point-kind features have no extent and are eligible from level 0.
-///
-/// Cells already occupied by a feature assigned at a coarser level are blocked: any
-/// remaining candidate whose center re-projects into such a cell at the current
-/// level's grid is skipped (it stays in `remaining` for a finer level). Without
-/// this, a tight cluster would surface one feature per level in the same visual
-/// neighborhood — a coarse winner plus near-identical fine winners around it.
-/// Blocking applies only to points.
+/// At each level, eligible Point/MultiPoint features compete in grid cells;
+/// cells occupied by coarser winners block finer candidates. Lines and polygons
+/// are assigned once their bbox diagonal reaches the visibility threshold and
+/// never compete in cells.
 fn assign_levels(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
@@ -1807,13 +1916,26 @@ fn assign_levels(
         return Ok(min_visible);
     }
 
+    // The all-at-once cell maps become larger than the bbox array on very
+    // large point inputs. The partitioned path holds only one cell map at a time.
+    if n > 2_000_000 {
+        return Ok(assign_points_partitioned(
+            bboxes,
+            kinds,
+            resolutions,
+            point_thin_mul,
+            sort_ranks,
+            min_visible,
+            1_000_000,
+        ));
+    }
+
     let mut assigned: Vec<u16> = vec![u16::MAX; n];
     let mut remaining: Vec<u32> = (0..n as u32).collect();
 
     let cell_key = |row: u32, prec: f64| -> (i64, i64) {
         let b = bboxes[row as usize];
-        let ep = prec * point_thin_mul;
-        ((b.cx() / ep).floor() as i64, (b.cy() / ep).floor() as i64)
+        point_cell_key(&b, prec * point_thin_mul)
     };
 
     let mut assigned_points: Vec<u32> = Vec::new();
@@ -2362,6 +2484,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![1, 0]);
+    }
+
+    #[test]
+    fn partitioned_point_assignment_matches_in_memory_selection() {
+        let mut bboxes: Vec<_> = (0..257)
+            .map(|row| {
+                let x = ((row * 37) % 512) as f64 / 3.0;
+                let y = ((row * 71) % 512) as f64 / 3.0;
+                bb(x, y, x, y)
+            })
+            .collect();
+        bboxes.push(bb(10.0, 10.0, 12.0, 12.0)); // MultiPoint
+        bboxes.push(Bbox::empty());
+        bboxes.push(bb(0.0, 0.0, 40.0, 0.0)); // Line
+        let mut kinds = vec![GeomKind::Point; bboxes.len()];
+        *kinds.last_mut().unwrap() = GeomKind::Line;
+        let ranks: Vec<_> = (0..bboxes.len())
+            .map(|row| ((row * 17) % 23) as u64)
+            .collect();
+        let resolutions = [100.0, 25.0, 5.0, 1.0];
+        let expected = assign_levels(
+            &bboxes,
+            &kinds,
+            &resolutions,
+            1,
+            VisibilityFactors {
+                line: 1,
+                polygon: 1,
+            },
+            &ranks,
+        )
+        .unwrap();
+        let mut initial = vec![0; bboxes.len()];
+        *initial.last_mut().unwrap() = *expected.last().unwrap();
+        let actual =
+            assign_points_partitioned(&bboxes, &kinds, &resolutions, 1.0, &ranks, initial, 8);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn large_point_assignment_handles_many_distinct_cells() {
+        let n = 2_000_001;
+        let bboxes: Vec<_> = (0..n)
+            .map(|row| {
+                let x = row as f64 * 100.0;
+                bb(x, 0.0, x, 0.0)
+            })
+            .collect();
+        let kinds = vec![GeomKind::Point; n];
+        let assigned = assign_levels(
+            &bboxes,
+            &kinds,
+            &[100.0, 10.0],
+            1,
+            VisibilityFactors {
+                line: 1,
+                polygon: 1,
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(assigned.iter().all(|level| *level == 0));
     }
 
     #[test]
