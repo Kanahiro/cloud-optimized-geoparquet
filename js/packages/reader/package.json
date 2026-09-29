@@ -27,7 +27,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "bench": "npm run build && node bench/reader.mjs dist/index.js"
   },
   "dependencies": {
     "hyparquet-compressors": "^1.1.1",

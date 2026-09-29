@@ -1,0 +1,52 @@
+name: Reader benchmark
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/reader-benchmark.yml
+      - js/packages/reader/**
+      - test-data/refinement.parquet
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/reader-benchmark.yml
+      - js/packages/reader/**
+      - test-data/refinement.parquet
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare reader with base
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: candidate
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          path: baseline
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: candidate
+      - run: pnpm install --frozen-lockfile
+        working-directory: baseline
+      - run: pnpm --filter @cogp/reader build
+        working-directory: candidate
+      - run: pnpm --filter @cogp/reader build
+        working-directory: baseline
+      - run: node js/packages/reader/bench/compare.mjs ../baseline/js/packages/reader/dist/index.js js/packages/reader/dist/index.js
+        working-directory: candidate
