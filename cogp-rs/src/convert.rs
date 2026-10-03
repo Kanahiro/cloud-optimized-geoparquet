@@ -126,6 +126,25 @@ pub struct ConvertArgs {
     /// largest value, `asc` keeps the smallest. Ignored when --priority-column is unset.
     #[arg(long, default_value = "desc")]
     pub priority_column_order: PriorityColumnOrder,
+    /// Experimental. How spatial packing chooses each split position within a
+    /// level. `median` splits at the row-count median; `cost` picks the
+    /// row-group- (or page-) aligned position in the middle half that
+    /// minimises the children's expected window hits, so splits tend to fall
+    /// in empty gaps such as open sea.
+    #[arg(long, default_value = "median")]
+    pub spatial_split: SpatialSplit,
+    /// Experimental. Query window side for `--spatial-split cost`, in
+    /// multiples of the level resolution.
+    #[arg(long, default_value_t = 2048.0)]
+    pub spatial_split_window: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SpatialSplit {
+    /// Split at the row-count median.
+    Median,
+    /// Split at the aligned position minimising Σ (w + q)(h + q) of the children.
+    Cost,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -331,6 +350,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.min_root_features == 0 {
         bail!("--min-root-features must be >= 1");
     }
+    anyhow::ensure!(
+        args.spatial_split_window.is_finite() && args.spatial_split_window >= 0.0,
+        "--spatial-split-window must be a finite number >= 0 (got {})",
+        args.spatial_split_window
+    );
     if args.point_thinning_factor == 0 {
         bail!(
             "--point-thinning-factor must be >= 1 (got {})",
@@ -594,13 +618,20 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(rows, &bboxes, write_plan.row_group_rows, level_idx);
+        let split = match args.spatial_split {
+            SpatialSplit::Median => Split::Median,
+            SpatialSplit::Cost => Split::Cost {
+                window: resolutions[level_idx] * args.spatial_split_window,
+            },
+        };
+        str_pack(rows, &bboxes, write_plan.row_group_rows, level_idx, split);
         str_pack_pages(
             rows,
             &bboxes,
             write_plan.row_group_rows,
             args.page_row_count,
             level_idx,
+            split,
         );
     }
 
@@ -2213,8 +2244,24 @@ impl SnakeStart {
     }
 }
 
+/// Split-position rule shared by row-group and page packing.
+#[derive(Clone, Copy)]
+enum Split {
+    Median,
+    /// Expected-hit cost for a square query window of this side length.
+    Cost {
+        window: f64,
+    },
+}
+
 /// STR bulk-loading into spatially compact row-group leaves.
-fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_idx: usize) {
+fn str_pack(
+    rows: &mut Vec<u32>,
+    bboxes: &[Bbox],
+    row_group_size: usize,
+    level_idx: usize,
+    split: Split,
+) {
     let dir = SnakeStart::for_level(level_idx).initial_dir();
     // Cached keys avoid repeated random bbox reads on normal levels. On very
     // large levels their 16-byte-per-row scratch array can exceed available
@@ -2229,6 +2276,7 @@ fn str_pack(rows: &mut Vec<u32>, bboxes: &[Bbox], row_group_size: usize, level_i
         bboxes,
         row_group_size,
         dir,
+        split,
     );
 }
 
@@ -2241,13 +2289,21 @@ fn str_pack_pages(
     row_group_size: usize,
     page_row_count: usize,
     level_idx: usize,
+    split: Split,
 ) {
     rows.chunks_mut(row_group_size)
         .enumerate()
         .for_each(|(row_group_idx, row_group)| {
             let mut scratch = vec![(0.0, 0); row_group.len()];
             let dir = SnakeStart::for_level(level_idx + row_group_idx).initial_dir();
-            str_pack_rec(row_group, Some(&mut scratch), bboxes, page_row_count, dir);
+            str_pack_rec(
+                row_group,
+                Some(&mut scratch),
+                bboxes,
+                page_row_count,
+                dir,
+                split,
+            );
         });
 }
 
@@ -2257,6 +2313,7 @@ fn str_pack_rec(
     bboxes: &[Bbox],
     m: usize,
     dir: SortDir,
+    split: Split,
 ) {
     let n = rows.len();
     if n <= m {
@@ -2275,9 +2332,7 @@ fn str_pack_rec(
     let split_x = extent.width() >= extent.height();
     let reverse = dir.reverse_on(split_x);
 
-    // Split on the physical-unit boundary; only the last leaf may be partial.
-    let split_at = (n.div_ceil(m) / 2).max(1) * m;
-    let (left_scratch, right_scratch) = match scratch {
+    let (mut left_scratch, mut right_scratch) = match scratch {
         Some(scratch) => {
             // Cache keys to avoid random bbox reads inside the comparator.
             debug_assert_eq!(scratch.len(), rows.len());
@@ -2300,8 +2355,7 @@ fn str_pack_rec(
             rows.par_iter_mut()
                 .zip(scratch.par_iter())
                 .for_each(|(r, (_, i))| *r = *i);
-            let (left_scratch, right_scratch) = scratch.split_at_mut(split_at);
-            (Some(left_scratch), Some(right_scratch))
+            (Some(scratch), None)
         }
         None => {
             rows.par_sort_unstable_by(|a, b| {
@@ -2325,12 +2379,82 @@ fn str_pack_rec(
             (None, None)
         }
     };
+    // Split on the physical-unit boundary; only the last leaf may be partial.
+    let split_at = match split {
+        Split::Median => median_split_at(n, m),
+        Split::Cost { window } => cost_split_at(rows, bboxes, m, window),
+    };
+    if let Some(scratch) = left_scratch.take() {
+        let (l, r) = scratch.split_at_mut(split_at);
+        left_scratch = Some(l);
+        right_scratch = Some(r);
+    }
     let (left_rows, right_rows) = rows.split_at_mut(split_at);
     let right_dir = dir.flip_for_right_child(split_x);
     rayon::join(
-        || str_pack_rec(left_rows, left_scratch, bboxes, m, dir),
-        || str_pack_rec(right_rows, right_scratch, bboxes, m, right_dir),
+        || str_pack_rec(left_rows, left_scratch, bboxes, m, dir, split),
+        || str_pack_rec(right_rows, right_scratch, bboxes, m, right_dir, split),
     );
+}
+
+fn median_split_at(n: usize, m: usize) -> usize {
+    (n.div_ceil(m) / 2).max(1) * m
+}
+
+/// Choose the `m`-aligned split of axis-sorted `rows` that minimises the sum
+/// of the children's `(w + q)(h + q)`, i.e. the expected number of children a
+/// random `q`-sided window intersects. Candidates are limited to the middle
+/// half of the leaves to bound recursion depth; ties keep the median.
+fn cost_split_at(rows: &[u32], bboxes: &[Bbox], m: usize, window: f64) -> usize {
+    let n = rows.len();
+    let leaves = n.div_ceil(m);
+    let median = median_split_at(n, m);
+    if leaves <= 2 {
+        return median;
+    }
+    let leaf_boxes: Vec<Bbox> = rows
+        .par_chunks(m)
+        .map(|leaf| {
+            let mut acc = Bbox::empty();
+            for i in leaf {
+                acc.merge(&bboxes[*i as usize]);
+            }
+            acc
+        })
+        .collect();
+    let lo = (leaves / 4).max(1);
+    let hi = (leaves * 3).div_ceil(4).clamp(lo, leaves - 1);
+    let cost = |b: &Bbox| {
+        if b.is_empty() {
+            0.0
+        } else {
+            (b.width() + window) * (b.height() + window)
+        }
+    };
+    // suffix[j] = bbox of leaves j.., only needed for j in lo..=hi.
+    let mut suffix = vec![Bbox::empty(); hi - lo + 1];
+    let mut acc = Bbox::empty();
+    for j in (lo..leaves).rev() {
+        acc.merge(&leaf_boxes[j]);
+        if j <= hi {
+            suffix[j - lo] = acc;
+        }
+    }
+    let mut prefix = Bbox::empty();
+    for b in &leaf_boxes[..lo - 1] {
+        prefix.merge(b);
+    }
+    let median_leaf = median / m;
+    let mut best = (f64::INFINITY, usize::MAX, median_leaf);
+    for j in lo..=hi {
+        prefix.merge(&leaf_boxes[j - 1]);
+        let c = cost(&prefix) + cost(&suffix[j - lo]);
+        let key = (c, j.abs_diff(median_leaf), j);
+        if key.0 < best.0 || (key.0 == best.0 && key.1 < best.1) {
+            best = key;
+        }
+    }
+    best.2 * m
 }
 
 #[cfg(test)]
@@ -2800,7 +2924,7 @@ mod tests {
             bboxes.push(bb(x, y, x + 0.1, y + 0.1));
         }
         let mut rows: Vec<u32> = (0..17u32).collect();
-        str_pack(&mut rows, &bboxes, 10, 0);
+        str_pack(&mut rows, &bboxes, 10, 0, Split::Median);
         let mut sorted = rows.clone();
         sorted.sort();
         let expected: Vec<u32> = (0..17u32).collect();
@@ -2820,9 +2944,35 @@ mod tests {
         let mut in_place = cached.clone();
         let mut scratch = vec![(0.0, 0); cached.len()];
         let dir = SnakeStart::for_level(0).initial_dir();
-        str_pack_rec(&mut cached, Some(&mut scratch), &bboxes, 10, dir);
-        str_pack_rec(&mut in_place, None, &bboxes, 10, dir);
+        str_pack_rec(
+            &mut cached,
+            Some(&mut scratch),
+            &bboxes,
+            10,
+            dir,
+            Split::Median,
+        );
+        str_pack_rec(&mut in_place, None, &bboxes, 10, dir, Split::Median);
         assert_eq!(in_place, cached);
+    }
+
+    #[test]
+    fn cost_split_cuts_at_the_gap_instead_of_the_median() {
+        // Six leaves of 10 rows along x: two dense clusters of 20 and 40 rows
+        // separated by open space. The median (30) falls inside the right
+        // cluster; the cost split should cut at the gap (20).
+        let mut bboxes: Vec<_> = (0..20)
+            .map(|i| bb(i as f64 * 0.01, 0.0, i as f64 * 0.01, 0.0))
+            .collect();
+        bboxes.extend(
+            (0..40).map(|i| bb(100.0 + i as f64 * 0.01, 0.0, 100.0 + i as f64 * 0.01, 0.0)),
+        );
+        let rows: Vec<u32> = (0..60).collect();
+        assert_eq!(median_split_at(rows.len(), 10), 30);
+        assert_eq!(cost_split_at(&rows, &bboxes, 10, 1.0), 20);
+        // Uniform spacing has no gap to prefer, so ties keep the median.
+        let uniform: Vec<_> = (0..60).map(|i| bb(i as f64, 0.0, i as f64, 0.0)).collect();
+        assert_eq!(cost_split_at(&rows, &uniform, 10, 0.0), 30);
     }
 
     #[test]

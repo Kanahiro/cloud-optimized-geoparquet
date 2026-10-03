@@ -13,7 +13,7 @@ use arrow::array::{
     StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use cogp::convert::{ConvertArgs, PriorityColumnOrder};
+use cogp::convert::{ConvertArgs, PriorityColumnOrder, SpatialSplit};
 use cogp::meta::{BboxCovering, Covering, GeoColumn, GeoMeta, GEO_METADATA_KEY};
 use cogp::reader::Reader;
 use parquet::arrow::ArrowWriter;
@@ -150,6 +150,8 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         polygon_visibility_factor: 4,
         priority_column: None,
         priority_column_order: PriorityColumnOrder::Desc,
+        spatial_split: SpatialSplit::Median,
+        spatial_split_window: 2048.0,
     }
 }
 
