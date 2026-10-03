@@ -135,6 +135,7 @@ fn write_input(path: &std::path::Path) {
 fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArgs {
     ConvertArgs {
         simplification_tolerance_factor: 1.0,
+        min_part_size_factor: 1.0,
         min_root_features: 1, // Existing fixtures exercise the complete candidate ladder.
         input: input.to_path_buf(),
         output: output.to_path_buf(),
