@@ -109,6 +109,9 @@ struct RowGroup {
     /// Page Index bytes a pruning reader fetches for this group: bbox
     /// ColumnIndexes plus every column's OffsetIndex.
     index_bytes: u64,
+    /// Compressed bytes of the whole group: what a reader without Page Index
+    /// support fetches when the group's statistics intersect.
+    total_bytes: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -123,6 +126,7 @@ struct Tally {
     index_bytes: f64,
     /// Contiguous data byte ranges (adjacent pages merged, gaps never filled).
     requests: f64,
+    rg_only_bytes: f64,
 }
 
 fn main() -> Result<()> {
@@ -230,6 +234,7 @@ fn main() -> Result<()> {
             pages,
             column_pages,
             index_bytes,
+            total_bytes: rg.compressed_size() as u64,
         });
         start += rows;
     }
@@ -253,8 +258,8 @@ fn main() -> Result<()> {
         v.dedup();
         v
     };
-    println!("| level | window | centers | RG/q | empty RG/q | pages/q | empty pages/q | MB/q | precision | index MB/q | requests/q |");
-    println!("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("| level | window | centers | RG/q | empty RG/q | pages/q | empty pages/q | MB/q | precision | index MB/q | requests/q | RG-only MB/q |");
+    println!("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for &level in &scopes {
         let end = reader.row_groups_up_to_level(level).end;
         let scope = &groups[..end];
@@ -285,7 +290,7 @@ fn main() -> Result<()> {
                 let n = args.queries as f64;
                 let t = sum(&per_group);
                 println!(
-                    "| {level} | {mult} | {centers} | {:.2} | {:.2} | {:.1} | {:.1} | {:.3} | {:.3} | {:.3} | {:.1} |",
+                    "| {level} | {mult} | {centers} | {:.2} | {:.2} | {:.1} | {:.1} | {:.3} | {:.3} | {:.3} | {:.1} | {:.2} |",
                     t.rg / n,
                     t.rg_empty / n,
                     t.pages / n,
@@ -294,6 +299,7 @@ fn main() -> Result<()> {
                     if t.selected_rows > 0.0 { t.useful_rows / t.selected_rows } else { 0.0 },
                     t.index_bytes / n / 1e6,
                     t.requests / n,
+                    t.rg_only_bytes / n / 1e6,
                 );
                 if args.breakdown && level == *scopes.last().unwrap() {
                     // Attribute each row group to the level that owns it.
@@ -330,6 +336,7 @@ fn evaluate(scope: &[RowGroup], bboxes: &[Bbox], q: &Bbox, per_group: &mut [Tall
         }
         t.rg += 1.0;
         t.index_bytes += g.index_bytes as f64;
+        t.rg_only_bytes += g.total_bytes as f64;
         let mut selected: Vec<(usize, usize)> = Vec::new();
         let mut group_useful = 0usize;
         for (first, rows, b) in &g.pages {
@@ -384,6 +391,7 @@ fn sum(tallies: &[Tally]) -> Tally {
         a.selected_rows += t.selected_rows;
         a.index_bytes += t.index_bytes;
         a.requests += t.requests;
+        a.rg_only_bytes += t.rg_only_bytes;
         a
     })
 }

@@ -157,11 +157,18 @@ pub enum PriorityColumnOrder {
 
 /// Write without allowing an input batch to push a row group beyond the
 /// public row-count limit. Levels explicitly flush at their boundaries.
+///
+/// A column writer closes a data page only after a whole write mini-batch, so
+/// a batch that ends mid-page would let the next batch overfill that page and
+/// shift every later page off the `page_rows` intervals `str_pack_pages`
+/// packed. Completing the open page with its own write keeps physical pages
+/// on those intervals regardless of gather and segment boundaries.
 fn write_with_row_group_limit<W: Write + Send>(
     writer: &mut ParallelWriter<W>,
     batch: &RecordBatch,
     max_rows: usize,
     max_bytes: usize,
+    page_rows: usize,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < batch.num_rows() {
@@ -169,6 +176,12 @@ fn write_with_row_group_limit<W: Write + Send>(
             writer.flush()?;
         }
         let capacity = max_rows - writer.in_progress_rows();
+        let open_page = writer.in_progress_rows() % page_rows;
+        let capacity = if open_page == 0 {
+            capacity
+        } else {
+            capacity.min(page_rows - open_page)
+        };
         let rows = (batch.num_rows() - offset).min(capacity);
         writer.write(&batch.slice(offset, rows))?;
         offset += rows;
@@ -869,6 +882,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             &batch,
             write_plan.row_group_rows,
             write_plan.writer_bytes,
+            args.page_row_count,
         )?;
         last_level = Some(level_i);
     }
@@ -2973,6 +2987,44 @@ mod tests {
         // Uniform spacing has no gap to prefer, so ties keep the median.
         let uniform: Vec<_> = (0..60).map(|i| bb(i as f64, 0.0, i as f64, 0.0)).collect();
         assert_eq!(cost_split_at(&rows, &uniform, 10, 0.0), 30);
+    }
+
+    #[test]
+    fn batches_ending_mid_page_keep_pages_on_packed_intervals() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(4)
+            .set_write_batch_size(4)
+            .build();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            ParallelWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        // Batches of 3 rows end mid-page; row groups of 10 end on a partial page.
+        for start in (0..30).step_by(3) {
+            let values = Int64Array::from_iter_values(start..start + 3);
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+            write_with_row_group_limit(&mut writer, &batch, 10, usize::MAX, 4).unwrap();
+        }
+        writer.close().unwrap();
+
+        let meta = ArrowReaderMetadata::load(
+            &file.reopen().unwrap(),
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(true),
+        )
+        .unwrap();
+        let offsets = meta.metadata().offset_index().unwrap();
+        for (rg, columns) in offsets.iter().enumerate() {
+            let starts: Vec<i64> = columns[0]
+                .page_locations()
+                .iter()
+                .map(|p| p.first_row_index)
+                .collect();
+            assert_eq!(starts, vec![0, 4, 8], "row group {rg}");
+        }
     }
 
     #[test]
