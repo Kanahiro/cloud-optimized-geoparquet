@@ -104,8 +104,11 @@ struct RowGroup {
     bbox: Bbox,
     /// Bbox pages: (first row offset in group, row count, bbox).
     pages: Vec<(usize, usize, Bbox)>,
-    /// Per column: (first row offset in group, compressed page bytes).
-    column_pages: Vec<Vec<(usize, u64)>>,
+    /// Per column: (first row offset in group, file offset, compressed page bytes).
+    column_pages: Vec<Vec<(usize, u64, u64)>>,
+    /// Page Index bytes a pruning reader fetches for this group: bbox
+    /// ColumnIndexes plus every column's OffsetIndex.
+    index_bytes: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -117,6 +120,9 @@ struct Tally {
     bytes: f64,
     useful_rows: f64,
     selected_rows: f64,
+    index_bytes: f64,
+    /// Contiguous data byte ranges (adjacent pages merged, gaps never filled).
+    requests: f64,
 }
 
 fn main() -> Result<()> {
@@ -177,18 +183,24 @@ fn main() -> Result<()> {
         for b in &bboxes[start..start + rows] {
             merge(&mut bbox, b);
         }
-        let page_starts = |col: usize| -> Vec<(usize, u64)> {
+        let page_starts = |col: usize| -> Vec<(usize, u64, u64)> {
             offsets[rg_i][col]
                 .page_locations()
                 .iter()
-                .map(|p| (p.first_row_index as usize, p.compressed_page_size as u64))
+                .map(|p| {
+                    (
+                        p.first_row_index as usize,
+                        p.offset as u64,
+                        p.compressed_page_size as u64,
+                    )
+                })
                 .collect()
         };
         let xmin_pages = page_starts(cols[0]);
         let pages = xmin_pages
             .iter()
             .enumerate()
-            .map(|(i, (first, _))| {
+            .map(|(i, (first, _, _))| {
                 let end = xmin_pages.get(i + 1).map_or(rows, |p| p.0);
                 let mut b = empty();
                 for r in &bboxes[start + first..start + end] {
@@ -198,12 +210,26 @@ fn main() -> Result<()> {
             })
             .collect();
         let column_pages = (0..rg.num_columns()).map(page_starts).collect();
+        let index_bytes = rg
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let column_index = if cols.contains(&i) {
+                    c.column_index_length().unwrap_or(0) as u64
+                } else {
+                    0
+                };
+                column_index + c.offset_index_length().unwrap_or(0) as u64
+            })
+            .sum();
         groups.push(RowGroup {
             start,
             rows,
             bbox,
             pages,
             column_pages,
+            index_bytes,
         });
         start += rows;
     }
@@ -227,8 +253,8 @@ fn main() -> Result<()> {
         v.dedup();
         v
     };
-    println!("| level | window | centers | RG/q | empty RG/q | pages/q | empty pages/q | MB/q | precision |");
-    println!("|---:|---:|---|---:|---:|---:|---:|---:|---:|");
+    println!("| level | window | centers | RG/q | empty RG/q | pages/q | empty pages/q | MB/q | precision | index MB/q | requests/q |");
+    println!("|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     for &level in &scopes {
         let end = reader.row_groups_up_to_level(level).end;
         let scope = &groups[..end];
@@ -259,13 +285,15 @@ fn main() -> Result<()> {
                 let n = args.queries as f64;
                 let t = sum(&per_group);
                 println!(
-                    "| {level} | {mult} | {centers} | {:.2} | {:.2} | {:.1} | {:.1} | {:.3} | {:.3} |",
+                    "| {level} | {mult} | {centers} | {:.2} | {:.2} | {:.1} | {:.1} | {:.3} | {:.3} | {:.3} | {:.1} |",
                     t.rg / n,
                     t.rg_empty / n,
                     t.pages / n,
                     t.pages_empty / n,
                     t.bytes / n / 1e6,
                     if t.selected_rows > 0.0 { t.useful_rows / t.selected_rows } else { 0.0 },
+                    t.index_bytes / n / 1e6,
+                    t.requests / n,
                 );
                 if args.breakdown && level == *scopes.last().unwrap() {
                     // Attribute each row group to the level that owns it.
@@ -301,6 +329,7 @@ fn evaluate(scope: &[RowGroup], bboxes: &[Bbox], q: &Bbox, per_group: &mut [Tall
             continue;
         }
         t.rg += 1.0;
+        t.index_bytes += g.index_bytes as f64;
         let mut selected: Vec<(usize, usize)> = Vec::new();
         let mut group_useful = 0usize;
         for (first, rows, b) in &g.pages {
@@ -323,13 +352,23 @@ fn evaluate(scope: &[RowGroup], bboxes: &[Bbox], q: &Bbox, per_group: &mut [Tall
             t.rg_empty += 1.0;
         }
         t.useful_rows += group_useful as f64;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
         for pages in &g.column_pages {
-            for (i, (first, size)) in pages.iter().enumerate() {
+            for (i, (first, offset, size)) in pages.iter().enumerate() {
                 let end = pages.get(i + 1).map_or(g.rows, |p| p.0);
                 if selected.iter().any(|(s, e)| *first < *e && *s < end) {
                     t.bytes += *size as f64;
+                    ranges.push((*offset, offset + size));
                 }
             }
+        }
+        ranges.sort_unstable();
+        let mut last_end = None;
+        for (start, end) in ranges {
+            if last_end != Some(start) {
+                t.requests += 1.0;
+            }
+            last_end = Some(end);
         }
     }
 }
@@ -343,6 +382,8 @@ fn sum(tallies: &[Tally]) -> Tally {
         a.bytes += t.bytes;
         a.useful_rows += t.useful_rows;
         a.selected_rows += t.selected_rows;
+        a.index_bytes += t.index_bytes;
+        a.requests += t.requests;
         a
     })
 }
