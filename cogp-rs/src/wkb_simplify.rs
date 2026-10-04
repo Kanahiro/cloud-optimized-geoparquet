@@ -1344,7 +1344,7 @@ fn regroup_overlay_rings(shapes: Vec<Vec<Vec<Coordinate>>>) -> Option<Vec<Vec<Ve
     let rings: Vec<_> = shapes.into_iter().flatten().collect();
     let outlines: Vec<_> = rings
         .iter()
-        .map(|ring| polygon_xy(&[ring.clone()]))
+        .map(|ring| polygon_xy(std::slice::from_ref(ring)))
         .collect();
     if !outlines.iter().all(polygon_valid) {
         return None;
