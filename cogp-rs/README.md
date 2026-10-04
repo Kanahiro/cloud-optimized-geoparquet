@@ -54,8 +54,9 @@ representation was not validated. The `Reader` opens such files, and
 
 `--simplification-tolerance-factor` defaults to 0.25 and multiplies each CRS-unit
 resolution. Lower values retain more detail and use a finer quantization grid,
-at the cost of larger overviews. A simplified polygon that becomes invalid is
-refined only along its defective edges before the whole geometry is retried.
+at the cost of larger overviews. Polygons are valid by construction: they are
+snapped to the grid and made valid first, then simplified only where removing a
+vertex keeps the geometry valid.
 Line and polygon features are deferred until both their visibility
 threshold and overview viability are met. Later levels can refine geometry
 without adding rows. ZSTD 9, delta encoding of overview integers, and omission
