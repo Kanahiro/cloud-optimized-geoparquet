@@ -15,7 +15,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use geo::line_intersection::{line_intersection, LineIntersection};
 #[cfg(test)]
 use geo::Validation;
-use geo::{Coord, Line, LineString, Polygon};
+use geo::{Coord, Line, LineString, Polygon, Relate};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay::Overlay;
 use i_overlay::core::overlay_rule::OverlayRule;
@@ -290,7 +290,47 @@ fn flatten_quantized(
         }
         _ => bail!("WKB geometry body does not match its type code"),
     }
+    if overview.geometry_type == 6 && !quantized_multipolygon_valid(&overview) {
+        bail!("invalid overview polygon topology after quantization");
+    }
     Ok(overview)
+}
+
+fn quantized_multipolygon_valid(overview: &QuantizedOverview) -> bool {
+    let mut coordinate_start = 0;
+    let mut ring_start = 0;
+    let mut polygons = Vec::with_capacity(overview.polygon_ends.len());
+    for &polygon_end in &overview.polygon_ends {
+        let Ok(polygon_end) = usize::try_from(polygon_end) else {
+            return false;
+        };
+        if polygon_end <= ring_start || polygon_end > overview.part_ends.len() {
+            return false;
+        }
+        let mut rings = Vec::new();
+        for &part_end in &overview.part_ends[ring_start..polygon_end] {
+            let Ok(part_end) = usize::try_from(part_end) else {
+                return false;
+            };
+            if part_end <= coordinate_start || part_end > overview.x.len() {
+                return false;
+            }
+            rings.push(
+                overview.x[coordinate_start..part_end]
+                    .iter()
+                    .zip(&overview.y[coordinate_start..part_end])
+                    .map(|(&x, &y)| Coordinate(vec![x as f64, y as f64]))
+                    .collect::<Vec<_>>(),
+            );
+            coordinate_start = part_end;
+        }
+        polygons.push(polygon_xy(&rings));
+        ring_start = polygon_end;
+    }
+    coordinate_start == overview.x.len()
+        && overview.x.len() == overview.y.len()
+        && ring_start == overview.part_ends.len()
+        && multipolygon_valid(&polygons)
 }
 
 /// Return the first coarse-to-fine tolerance at which the geometry remains
@@ -777,14 +817,21 @@ fn repair_multipolygon(geometry: &mut Geometry, grid: f64) -> bool {
     if shapes.is_empty() {
         return false;
     }
+    let repaired = shapes
+        .iter()
+        .map(|shape| polygon_coordinates(shape, grid, &coords))
+        .collect::<Vec<_>>();
+    let Some(repaired) = regroup_overlay_rings(repaired) else {
+        return false;
+    };
     geometry.body = Body::Collection(
-        shapes
-            .iter()
-            .map(|shape| Geometry {
+        repaired
+            .into_iter()
+            .map(|rings| Geometry {
                 byte_order: geometry.byte_order,
                 raw_type: 3,
                 srid: None,
-                body: Body::Polygon(polygon_coordinates(shape, grid, &coords)),
+                body: Body::Polygon(rings),
             })
             .collect(),
     );
@@ -1209,7 +1256,20 @@ fn rendering_geometry_is_valid(geometry: &Geometry) -> bool {
         }
         Body::Polygon(rings) => polygon_rings_valid(rings),
         Body::Collection(children) => {
-            !children.is_empty() && children.iter().all(rendering_geometry_is_valid)
+            if children.is_empty() || !children.iter().all(rendering_geometry_is_valid) {
+                return false;
+            }
+            if geometry_kind(geometry.raw_type) != 6 {
+                return true;
+            }
+            let polygons: Option<Vec<_>> = children
+                .iter()
+                .map(|child| match &child.body {
+                    Body::Polygon(rings) => Some(polygon_xy(rings)),
+                    _ => None,
+                })
+                .collect();
+            polygons.is_some_and(|polygons| multipolygon_valid(&polygons))
         }
     }
 }
@@ -1249,16 +1309,90 @@ fn clean_polygon(rings: &mut Vec<Vec<Coordinate>>, grid: f64) -> Option<PolygonC
         return None;
     }
     if cleaned.len() == 1 {
-        *rings = polygon_coordinates(&cleaned[0], grid, &grid_polygon);
-        return Some(PolygonCleanResult::Unchanged);
+        let result = polygon_coordinates(&cleaned[0], grid, &grid_polygon);
+        if polygon_rings_valid(&result) {
+            *rings = result;
+            return Some(PolygonCleanResult::Unchanged);
+        }
     }
 
-    Some(PolygonCleanResult::Split(
-        cleaned
+    let split = cleaned
+        .iter()
+        .map(|shape| polygon_coordinates(shape, grid, &grid_polygon))
+        .collect::<Vec<_>>();
+    let regrouped = regroup_overlay_rings(split)?;
+    if regrouped.len() == 1 {
+        *rings = regrouped.into_iter().next().unwrap();
+        Some(PolygonCleanResult::Unchanged)
+    } else {
+        Some(PolygonCleanResult::Split(regrouped))
+    }
+}
+
+/// Some overlay results contain correct contours but attach holes to the wrong
+/// shell. Rebuild ownership from ring containment; alternating nesting depth
+/// preserves islands inside holes. Reject intersections and ambiguous output.
+fn regroup_overlay_rings(shapes: Vec<Vec<Vec<Coordinate>>>) -> Option<Vec<Vec<Vec<Coordinate>>>> {
+    if multipolygon_valid(
+        &shapes
             .iter()
-            .map(|shape| polygon_coordinates(shape, grid, &grid_polygon))
-            .collect(),
-    ))
+            .map(|rings| polygon_xy(rings))
+            .collect::<Vec<_>>(),
+    ) {
+        return Some(shapes);
+    }
+    let rings: Vec<_> = shapes.into_iter().flatten().collect();
+    let outlines: Vec<_> = rings
+        .iter()
+        .map(|ring| polygon_xy(&[ring.clone()]))
+        .collect();
+    if !outlines.iter().all(polygon_valid) {
+        return None;
+    }
+    let mut parent = vec![None; rings.len()];
+    for child in 0..rings.len() {
+        for candidate in 0..rings.len() {
+            if child == candidate || !outlines[candidate].relate(&outlines[child]).is_contains() {
+                continue;
+            }
+            if parent[child].is_none_or(|current: usize| {
+                ring_area(&rings[candidate]) < ring_area(&rings[current])
+            }) {
+                parent[child] = Some(candidate);
+            }
+        }
+    }
+    let mut depth = vec![0; rings.len()];
+    for index in 0..rings.len() {
+        let mut ancestor = parent[index];
+        while let Some(next) = ancestor {
+            depth[index] += 1;
+            if depth[index] >= rings.len() {
+                return None;
+            }
+            ancestor = parent[next];
+        }
+    }
+    let mut polygons = Vec::new();
+    for shell in 0..rings.len() {
+        if depth[shell] % 2 != 0 {
+            continue;
+        }
+        let mut polygon = vec![rings[shell].clone()];
+        for hole in 0..rings.len() {
+            if parent[hole] == Some(shell) && depth[hole] % 2 == 1 {
+                polygon.push(rings[hole].clone());
+            }
+        }
+        polygons.push(polygon);
+    }
+    multipolygon_valid(
+        &polygons
+            .iter()
+            .map(|rings| polygon_xy(rings))
+            .collect::<Vec<_>>(),
+    )
+    .then_some(polygons)
 }
 
 fn polygon_xy(rings: &[Vec<Coordinate>]) -> Polygon<f64> {
@@ -1648,6 +1782,53 @@ fn put_coordinates(output: &mut Vec<u8>, coordinates: &[Coordinate], order: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buildings_l12_regression() {
+        let wkb = include_bytes!("../tests/fixtures/buildings-invalid-l12.wkb");
+        let params = OverviewParams {
+            tolerance: 0.00008583029586459785 * 0.25,
+            min_part_size: 0.00008583029586459785,
+        };
+        let offset = [137.9925994873047, 33.21240234375];
+        let source = parse_complete_geometry(wkb).unwrap();
+        let OverviewOutcome::Built(built) = build_overview(&source, &params) else {
+            panic!("l12 build must return a valid geometry");
+        };
+        assert!(rendering_geometry_is_valid(&built));
+        let overview = quantized_overview_with_fallback(wkb, &params, &params, offset)
+            .unwrap()
+            .unwrap();
+        assert_valid_quantized_multipolygon(&overview);
+    }
+
+    #[test]
+    fn overlay_ring_regrouping_preserves_nested_islands() {
+        let ring = |x, y, side| {
+            square(x, y, side)
+                .into_iter()
+                .map(|(x, y)| Coordinate(vec![x, y]))
+                .collect::<Vec<_>>()
+        };
+        // The second shell is inside the outer hole. The hole assigned to
+        // that shell is actually inside the outer shell, beside the island.
+        let malformed = vec![
+            vec![ring(0., 0., 100.), ring(10., 10., 80.)],
+            vec![ring(20., 20., 10.), ring(92., 20., 5.)],
+        ];
+        let regrouped = regroup_overlay_rings(malformed).unwrap();
+        assert_eq!(regrouped.len(), 2);
+        assert_eq!(
+            regrouped.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(multipolygon_valid(
+            &regrouped
+                .iter()
+                .map(|rings| polygon_xy(rings))
+                .collect::<Vec<_>>()
+        ));
+    }
 
     fn levels(tolerances: &[f64]) -> Vec<OverviewParams> {
         tolerances
@@ -2117,6 +2298,7 @@ mod tests {
 
     fn assert_valid_quantized_multipolygon(overview: &QuantizedOverview) {
         assert_eq!(overview.geometry_type, 6);
+        assert!(quantized_multipolygon_valid(overview));
         assert_eq!(overview.x.len(), overview.y.len());
         assert!(!overview.polygon_ends.is_empty());
 
