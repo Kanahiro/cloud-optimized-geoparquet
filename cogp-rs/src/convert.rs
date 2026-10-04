@@ -36,7 +36,8 @@ use crate::parallel_writer::ParallelWriter;
 use crate::wkb_bbox::{bbox_from_wkb, kind_from_wkb, Bbox, GeomKind};
 
 use crate::wkb_simplify::{
-    first_viable_level, overview_scale, quantized_overview_with_fallback, QuantizedOverview,
+    first_viable_level, overview_scale, quantized_overview_with_fallback, OverviewParams,
+    QuantizedOverview,
 };
 
 #[derive(Args)]
@@ -78,6 +79,12 @@ pub struct ConvertArgs {
     /// Simplification tolerance in multiples of the CRS-unit resolution.
     #[arg(long, default_value_t = 0.25)]
     pub simplification_tolerance_factor: f64,
+    /// Minimum overview part size in multiples of the CRS-unit resolution.
+    /// Polygon parts and holes with a smaller area than this length squared,
+    /// and line parts shorter than it, are omitted from an LoD while a larger
+    /// part of the same feature remains. Set to 0 to keep every part.
+    #[arg(long, default_value_t = 1.0)]
+    pub min_part_size_factor: f64,
     /// Maximum top-level rows per data page. Page indexes and spatial page
     /// packing are always enabled; smaller pages permit finer spatial pruning.
     #[arg(long, default_value_t = 1024)]
@@ -370,6 +377,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             && args.simplification_tolerance_factor > 0.0,
         "simplification tolerance factor must be positive and finite"
     );
+    anyhow::ensure!(
+        args.min_part_size_factor.is_finite() && args.min_part_size_factor >= 0.0,
+        "--min-part-size-factor must be non-negative and finite"
+    );
     if args.page_row_count == 0 {
         bail!("--page-row-count must be >= 1");
     }
@@ -534,9 +545,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if with_overviews {
         // A feature enters only once its derived representation survives. This
         // changes ordering only: the primary geometry and every attribute stay intact.
-        let tolerances: Vec<_> = resolutions
+        let level_params: Vec<_> = resolutions
             .iter()
-            .map(|r| r * args.simplification_tolerance_factor)
+            .map(|resolution| overview_params(&args, *resolution))
             .collect();
         let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
             File::open(&args.input)?,
@@ -566,7 +577,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                             .unwrap()
                             .value(i)
                     };
-                    first_viable_level(bytes, &tolerances).with_context(|| {
+                    first_viable_level(bytes, &level_params).with_context(|| {
                         format!("checking overview viability for input row {}", row + i)
                     })
                 })
@@ -635,8 +646,8 @@ pub fn run(args: ConvertArgs) -> Result<()> {
             .iter()
             .enumerate()
             .map(|(level, resolution)| {
-                let tolerance = *resolution * args.simplification_tolerance_factor;
-                let scale = overview_scale(tolerance)?;
+                let params = overview_params(&args, *resolution);
+                let scale = overview_scale(params.tolerance)?;
                 let center = [
                     (dataset_bbox.xmin + dataset_bbox.xmax) * 0.5,
                     (dataset_bbox.ymin + dataset_bbox.ymax) * 0.5,
@@ -645,7 +656,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                     id: format!("l{level}"),
                     polygon: matches!(family, Some(GeometryFamily::Polygon)),
                     level,
-                    tolerance,
+                    params,
                     scale: [scale, scale],
                     offset: [
                         (center[0] / scale).round() * scale,
@@ -996,9 +1007,16 @@ struct OverviewPlan {
     id: String,
     polygon: bool,
     level: usize,
-    tolerance: f64,
+    params: OverviewParams,
     scale: [f64; 2],
     offset: [f64; 2],
+}
+
+fn overview_params(args: &ConvertArgs, resolution: f64) -> OverviewParams {
+    OverviewParams {
+        tolerance: resolution * args.simplification_tolerance_factor,
+        min_part_size: resolution * args.min_part_size_factor,
+    }
 }
 
 fn coordinate_fields() -> Fields {
@@ -1667,14 +1685,14 @@ fn build_overviews_array(
                 let Some(bytes) = bytes_at(index) else {
                     return Ok(Some(QuantizedOverview::empty(overview.polygon)));
                 };
-                let fallback_tolerance = plan
+                let fallback = &plan
                     .get(entry_level)
                     .ok_or_else(|| anyhow!("internal: overview entry level out of range"))?
-                    .tolerance;
+                    .params;
                 let value = quantized_overview_with_fallback(
                     bytes,
-                    overview.tolerance,
-                    fallback_tolerance,
+                    &overview.params,
+                    fallback,
                     overview.offset,
                 )
                 .with_context(|| {
@@ -2432,6 +2450,7 @@ mod tests {
         assert_eq!(cli.args.zstd_level, 9);
         assert_eq!(cli.args.page_row_count, 1024);
         assert_eq!(cli.args.simplification_tolerance_factor, 0.25);
+        assert_eq!(cli.args.min_part_size_factor, 1.0);
         assert_eq!(cli.args.priority_column.as_deref(), Some("population"));
         assert!(matches!(
             cli.args.priority_column_order,

@@ -54,7 +54,9 @@ representation was not validated. The `Reader` opens such files, and
 
 `--simplification-tolerance-factor` defaults to 0.25 and multiplies each CRS-unit
 resolution. Lower values retain more detail and use a finer quantization grid,
-at the cost of larger overviews. Line and polygon features are deferred until both their visibility
+at the cost of larger overviews. A simplified polygon that becomes invalid is
+refined only along its defective edges before the whole geometry is retried.
+Line and polygon features are deferred until both their visibility
 threshold and overview viability are met. Later levels can refine geometry
 without adding rows. ZSTD 9, delta encoding of overview integers, and omission
 of primary WKB statistics are internal writer choices.
@@ -126,6 +128,12 @@ Other options:
   default when transfer size and selective reads matter more than write time.
 - `--simplification-tolerance-factor` (default `0.25`) — overview simplification
   tolerance and quantization grid, in multiples of each level's resolution.
+- `--min-part-size-factor` (default `1`) — minimum overview part size, in
+  multiples of each level's resolution. Polygon parts and holes whose area is
+  below this length squared, and line parts shorter than it, are omitted from
+  that LoD while a larger part of the same feature remains; finer LoDs bring
+  them back. It never changes the level at which a feature first appears.
+  Set to `0` to keep every part.
 - `--page-row-count` (default `1024`) — maximum top-level rows per data page.
   Page Indexes and spatial page packing are always enabled. Row Groups never
   mix levels; the bbox leaves get ColumnIndexes and every leaf gets an OffsetIndex.
