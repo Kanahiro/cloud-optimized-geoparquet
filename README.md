@@ -85,7 +85,8 @@ cogp convert my-data.parquet my-data.cogp.parquet
 cogp validate my-data.cogp.parquet
 ```
 
-The defaults target a Web Mercator z0–z16 pyramid. See the
+The defaults target a Web Mercator z0–z17 pyramid of 512-pixel tiles, as in
+MapLibre GL JS and deck.gl. See the
 [CLI reference](./cogp-rs/README.md#convert) for tuning levels, point
 thinning, and row group size.
 

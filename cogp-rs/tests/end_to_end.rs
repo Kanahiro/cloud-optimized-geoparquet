@@ -140,15 +140,14 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         input: input.to_path_buf(),
         output: output.to_path_buf(),
         resolution: vec![],
-        webmerc_minzoom: 0,
-        webmerc_maxzoom: 4,
+        webmerc_minzoom: 1,
+        webmerc_maxzoom: 5,
         row_group_size: 8,
         zstd_level: 9,
         page_row_count: 2,
-        webmerc_resolution: 1024,
-        point_thinning_factor: 4,
-        line_visibility_factor: 2,
-        polygon_visibility_factor: 4,
+        point_thinning_factor: 4.0,
+        line_visibility_factor: 2.0,
+        polygon_visibility_factor: 4.0,
         priority_column: None,
         priority_column_order: PriorityColumnOrder::Desc,
     }
@@ -502,7 +501,7 @@ fn convert_rejects_zero_thinning_factor() {
     let output = tmp.path().join("out.parquet");
     write_input(&input);
     let mut args = convert_args(&input, &output);
-    args.point_thinning_factor = 0;
+    args.point_thinning_factor = 0.0;
     let err = cogp::convert::run(args).unwrap_err();
     assert!(format!("{err}").contains("point-thinning-factor"));
 }
@@ -892,12 +891,13 @@ fn cli_defaults_write_page_indexes() {
     );
     let reader = Reader::open(&output).unwrap();
     assert_eq!(reader.parquet_metadata().file_metadata().num_rows(), 40);
-    assert_eq!(reader.levels().len(), 17);
-    assert_eq!(reader.lod_meta().overviews.as_ref().unwrap().lods.len(), 17);
+    assert_eq!(reader.levels().len(), 18);
+    assert_eq!(reader.lod_meta().overviews.as_ref().unwrap().lods.len(), 18);
     assert_eq!(reader.num_row_groups(), 1);
     assert!(reader.levels().iter().all(|level| level.row_group_end == 0));
+    // z17 is one pixel of a 512-pixel tile, converted to CRS84 degrees.
     assert!(
-        (reader.levels()[16].resolution - 40_075_016.685_578_49 / (1024.0 * 65536.0 * 111_320.0))
+        (reader.levels()[17].resolution - 40_075_016.685_578_49 / (512.0 * 131_072.0 * 111_320.0))
             .abs()
             < 1e-12
     );
@@ -995,7 +995,7 @@ fn root_minimum_is_applied_after_overview_viability() {
     );
     let mut args = convert_args(&input, &output);
     args.resolution = vec![16.0, 4.0, 1.0, 0.25];
-    args.line_visibility_factor = 1;
+    args.line_visibility_factor = 1.0;
     args.simplification_tolerance_factor = 8.0;
     args.min_root_features = 2;
     cogp::convert::run(args).unwrap();
@@ -1048,7 +1048,7 @@ fn convert_preserves_refinement_without_new_features() {
     let output = tmp.path().join("output.parquet");
     write_line_input(&input, &[vec![(0.4, 0.4), (50.4, 3.4), (100.4, 0.4)]]);
     let mut args = convert_args(&input, &output);
-    args.line_visibility_factor = 1;
+    args.line_visibility_factor = 1.0;
     args.resolution = vec![256.0, 8.0, 4.0, 1.0, 0.5];
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
@@ -1194,7 +1194,7 @@ fn shared_lod_contract_fixtures() {
         ],
     );
     let mut args = convert_args(&input, &output);
-    args.line_visibility_factor = 1;
+    args.line_visibility_factor = 1.0;
     args.resolution = vec![8.0, 1.0, 0.5];
     cogp::convert::run(args).unwrap();
     cogp::validate::run(&output).unwrap();
@@ -1255,7 +1255,7 @@ fn shared_lod_contract_fixtures() {
     // Distinct boundaries also use the same optional rendering contract.
     let distinct_output = tmp.path().join("distinct-source.parquet");
     let mut args = convert_args(&input, &distinct_output);
-    args.line_visibility_factor = 1;
+    args.line_visibility_factor = 1.0;
     args.resolution = vec![8.0, 1.0];
     cogp::convert::run(args).unwrap();
     let distinct = Reader::open(&distinct_output).unwrap().lod_meta().clone();
