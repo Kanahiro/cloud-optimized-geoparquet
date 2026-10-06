@@ -30,8 +30,8 @@ cogp validate output.cogp.parquet
 
 The output COGP file itself is projection-agnostic — it can be consumed by
 any renderer regardless of projection. The defaults simply pick Resolutions tuned
-for a Web Mercator z0..=z16 tile pyramid (17 levels), since that's the most
-common viewer target. Pass `--resolution` to optimize for a different renderer.
+for a Web Mercator z0..=z17 pyramid of 512-pixel tiles (18 levels), as in
+MapLibre GL JS and deck.gl, since that's the most common viewer target. Pass `--resolution` to optimize for a different renderer.
 Supports GeoParquet 1.x with WKB point, line, or polygon geometries, including Multi variants.
 
 ## Rendering overviews
@@ -54,8 +54,9 @@ representation was not validated. The `Reader` opens such files, and
 
 `--simplification-tolerance-factor` defaults to 0.25 and multiplies each CRS-unit
 resolution. Lower values retain more detail and use a finer quantization grid,
-at the cost of larger overviews. A simplified polygon that becomes invalid is
-refined only along its defective edges before the whole geometry is retried.
+at the cost of larger overviews. Polygons are valid by construction: they are
+snapped to the grid and made valid first, then simplified only where removing a
+vertex keeps the geometry valid.
 Line and polygon features are deferred until both their visibility
 threshold and overview viability are met. Later levels can refine geometry
 without adding rows. ZSTD 9, delta encoding of overview integers, and omission
@@ -93,18 +94,16 @@ readable by any renderer regardless of which path you pick.
 - `--resolution 1000,500,100,50` — explicit rendering resolutions in **primary geometry CRS units**,
   strictly decreasing. Use this to tune levels for a specific renderer (any
   projection — not just non-Web-Mercator).
-- `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `16`) — derive
-  Resolutions from a Web Mercator tile pyramid:
-  `resolution(z) = 40_075_016.68557849 / (webmerc_resolution · 2^z)` equatorial meters,
-  converted to the primary CRS units (degrees use 111,320 m/degree). This is the default
+- `--webmerc-minzoom` / `--webmerc-maxzoom` (default `0` / `17`) — derive
+  Resolutions from a Web Mercator pyramid of 512-pixel tiles, one pixel per level:
+  `resolution(z) = 40_075_016.68557849 / (512 · 2^z)` equatorial meters,
+  converted to the primary CRS units (degrees use 111,320 m/degree). Zoom `z`
+  matches MapLibre GL JS and deck.gl zoom; a 256-pixel tile pyramid at zoom `z`
+  uses the level for `z - 1`. This is the default
   because Web Mercator is the most common viewer target, not because the
   output is restricted to it. Levels that add no features are dropped, except
   when overviews are written: those levels are kept because they refine the
   geometry of existing features.
-- `--webmerc-resolution` (default `1024`) — units per tile side used in the
-  Web Mercator Resolution formula above. `1024` is ~4× the typical 256-pixel tile
-  resolution, so features collapsing within a few subpixels are deferred to
-  finer levels. Controls level granularity; ignored when `--resolution` is given.
 
 Other options:
 
@@ -155,11 +154,14 @@ No coordinate reprojection is performed.
 All visibility factors default to **4**, a common four-resolution-unit scale.
 This is a rendering heuristic: a point grid width and a geometry bbox diagonal
 are different measures, so the same factor does not guarantee equal visual density.
+Factors accept any positive number. Halving every resolution-relative factor
+(including `--simplification-tolerance-factor` and `--min-part-size-factor`)
+gives each level roughly the detail of the next finer one.
 
 - `--point-thinning-factor` (default `4`) — point-like features (WKB
   `Point` / `MultiPoint`) thin on a grid this many times coarser per axis
   than the level Resolution, yielding approximately `factor²` fewer points than a
-  factor of `1`. Set to `1` for one winner per Resolution-sized cell. Grid thinning
+  factor of `1`, which keeps one winner per Resolution-sized cell. Grid thinning
   applies only to points: lines and
   polygons are assigned as soon as they meet their visibility threshold,
   because a bbox center cannot represent an extended geometry's footprint.
@@ -168,15 +170,13 @@ are different measures, so the same factor does not guarantee equal visual densi
   reach `factor · Resolution` of that level. Lines are 1D so a diagonal equal to
   one Resolution is only a hairline. This is a hard cutoff: a line shorter than the
   threshold is excluded from that level and deferred to a finer one, so a
-  coarse-zoom read never fetches sub-resolution lines. Set to `1` for the least
-  restrictive supported threshold.
+  coarse-zoom read never fetches sub-resolution lines.
 - `--polygon-visibility-factor` (default `4`) — coarsest level at which a
   Polygon is considered independently meaningful: its bbox diagonal must
   reach `factor · Resolution` of that level. A hard cutoff, like
   `--line-visibility-factor`: a polygon below the threshold is excluded from
   that level and deferred to a finer one. The default keeps coarse levels from
-  being crowded by tiny polygons. Set to `1` for the least restrictive supported
-  threshold.
+  being crowded by tiny polygons.
 - `--priority-column` — attribute column that decides which feature wins when several
   points contend for the same thinning cell. When set it is the primary criterion: the
   higher-ranked feature survives to coarser levels, so the more important one is

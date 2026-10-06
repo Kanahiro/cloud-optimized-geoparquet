@@ -1,6 +1,6 @@
 [package]
 name = "cogp"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2021"
 description = "Reference CLI and reader library for the Cloud Optimized GeoParquet Profile (COGP)"
 license = "MIT"
@@ -27,7 +27,7 @@ parquet = { version = "56", default-features = false, features = ["arrow", "snap
 byteorder = "1"
 geo = "0.33"
 rstar = "0.12"
-i_overlay = "4.5.2"
+i_overlay = "9.0.0"
 rayon = "1"
 thrift = { version = "0.17", default-features = false }
 tempfile = "3"

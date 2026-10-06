@@ -50,18 +50,20 @@ pub struct ConvertArgs {
     /// For geographic coordinates use degrees; for projected coordinates use their horizontal units.
     /// If omitted, resolutions are auto-derived
     /// from --webmerc-minzoom..=--webmerc-maxzoom assuming a Web Mercator tile
-    /// pyramid (see --webmerc-minzoom/--webmerc-maxzoom/--webmerc-resolution).
+    /// pyramid (see --webmerc-minzoom/--webmerc-maxzoom).
     /// Pass --resolution directly if you target a non-Web-Mercator renderer.
     #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["webmerc_minzoom", "webmerc_maxzoom"])]
     pub resolution: Vec<f64>,
     /// Coarsest Web Mercator zoom level for Resolution auto-derivation. Used only
-    /// when --resolution is omitted. Assumes the consumer renders on a Web Mercator
-    /// (EPSG:3857) tile pyramid; for other projections, supply --resolution.
+    /// when --resolution is omitted. Zoom `z` uses 512-pixel tiles, as in
+    /// MapLibre GL JS and deck.gl, and its Resolution is one pixel:
+    /// `40_075_016.68557849 / (512 · 2^z)` meters at the equator. For other
+    /// projections, supply --resolution.
     #[arg(long, default_value_t = 0)]
     pub webmerc_minzoom: u32,
     /// Finest Web Mercator zoom level for Resolution auto-derivation. Used only
-    /// when --resolution is omitted. Same Web Mercator assumption as --webmerc-minzoom.
-    #[arg(long, default_value_t = 16)]
+    /// when --resolution is omitted. Same 512-pixel tile zoom as --webmerc-minzoom.
+    #[arg(long, default_value_t = 17)]
     pub webmerc_maxzoom: u32,
     /// Minimum cumulative feature count for the coarsest output level.
     /// Sparse coarse levels are folded into the first level reaching this count.
@@ -89,35 +91,20 @@ pub struct ConvertArgs {
     /// packing are always enabled; smaller pages permit finer spatial pruning.
     #[arg(long, default_value_t = 1024)]
     pub page_row_count: usize,
-    /// **Web Mercator only.** Base resolution per tile side (units) used to
-    /// derive level visibility thresholds and the point-thinning grid when
-    /// auto-deriving resolutions from
-    /// --webmerc-minzoom/--webmerc-maxzoom. The level-i Resolution is the ground
-    /// distance covered by one base unit at zoom i, computed as
-    /// `40_075_016.68557849 / (base · 2^i)` meters at the equator — i.e. it bakes in
-    /// the Web Mercator equatorial circumference and the standard `2^z` tile
-    /// pyramid. This controls level granularity, not output coordinate
-    /// precision. The default of 1024 is ~4× the typical 256-pixel tile
-    /// resolution, so features collapsing within a few subpixels are deferred
-    /// to finer levels. Ignored when --resolution is given (in that case the resolutions are
-    /// taken verbatim and no projection is assumed).
-    #[arg(long, default_value_t = 1024)]
-    pub webmerc_resolution: u32,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
-    /// many times coarser than the level resolution per axis, yielding ~factor² fewer points
-    /// per level than a factor of 1. Set to `1` for the finest supported
-    /// thinning grid (one winner per resolution-sized cell).
-    #[arg(long, default_value_t = 4)]
-    pub point_thinning_factor: u32,
+    /// many times the level resolution per axis, yielding ~factor² fewer points
+    /// per level than a factor of 1 (one winner per resolution-sized cell).
+    #[arg(long, default_value_t = 4.0)]
+    pub point_thinning_factor: f64,
     /// Minimum line bbox diagonal in resolution units. The default uses the
     /// same four-unit visibility scale as points and polygons; this is a
     /// rendering heuristic, not a guarantee of equal perceived size.
-    #[arg(long, default_value_t = 4)]
-    pub line_visibility_factor: u32,
+    #[arg(long, default_value_t = 4.0)]
+    pub line_visibility_factor: f64,
     /// Minimum polygon bbox diagonal in resolution units. Larger factors defer
     /// smaller polygons to finer levels without changing their geometries.
-    #[arg(long, default_value_t = 4)]
-    pub polygon_visibility_factor: u32,
+    #[arg(long, default_value_t = 4.0)]
+    pub polygon_visibility_factor: f64,
     /// Attribute column deciding which feature wins when several contend for the
     /// same point-thinning cell. When set it is the primary criterion: the
     /// higher-ranked feature survives to coarser levels, so the more important
@@ -274,19 +261,12 @@ fn auto_resolution_scale(geo: Option<&serde_json::Value>, column: &str) -> Resul
 /// Web Mercator equatorial circumference, used as `2π · 6_378_137 m`.
 const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
 
-/// Ground distance per base unit at the equator at zoom 0, for a tile sliced
-/// into `webmerc_resolution` units per side. The default of 1024 yields
-/// ~39136 m per unit at zoom 0 — the coarsest level's base visibility unit.
-fn base_unit_resolution_z0(webmerc_resolution: u32) -> f64 {
-    WEB_MERCATOR_CIRCUMFERENCE_M / (webmerc_resolution as f64)
-}
+/// Pixels per side of a Web Mercator tile at zoom `z`, as in MapLibre GL JS
+/// and deck.gl. Each auto-derived level resolution is one pixel at its zoom.
+const WEB_MERCATOR_TILE_PIXELS: f64 = 512.0;
 
-fn web_mercator_resolutions(
-    webmerc_minzoom: u32,
-    webmerc_maxzoom: u32,
-    webmerc_resolution: u32,
-) -> Vec<f64> {
-    let z0 = base_unit_resolution_z0(webmerc_resolution);
+fn web_mercator_resolutions(webmerc_minzoom: u32, webmerc_maxzoom: u32) -> Vec<f64> {
+    let z0 = WEB_MERCATOR_CIRCUMFERENCE_M / WEB_MERCATOR_TILE_PIXELS;
     (webmerc_minzoom..=webmerc_maxzoom)
         .map(|z| z0 / (1u64 << z) as f64)
         .collect()
@@ -309,23 +289,12 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                 args.webmerc_maxzoom
             );
         }
-        if args.webmerc_resolution == 0 {
-            bail!(
-                "--webmerc-resolution must be > 0 (got {})",
-                args.webmerc_resolution
-            );
-        }
-        let derived = web_mercator_resolutions(
-            args.webmerc_minzoom,
-            args.webmerc_maxzoom,
-            args.webmerc_resolution,
-        );
+        let derived = web_mercator_resolutions(args.webmerc_minzoom, args.webmerc_maxzoom);
         eprintln!(
-            "      auto-derived {} level(s) from Web Mercator z{}..=z{} (resolution {})",
+            "      auto-derived {} level(s) from Web Mercator z{}..=z{}",
             derived.len(),
             args.webmerc_minzoom,
             args.webmerc_maxzoom,
-            args.webmerc_resolution,
         );
         derived
     };
@@ -351,23 +320,17 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     if args.min_root_features == 0 {
         bail!("--min-root-features must be >= 1");
     }
-    if args.point_thinning_factor == 0 {
-        bail!(
-            "--point-thinning-factor must be >= 1 (got {})",
-            args.point_thinning_factor
-        );
-    }
-    if args.line_visibility_factor == 0 {
-        bail!(
-            "--line-visibility-factor must be >= 1 (got {})",
-            args.line_visibility_factor
-        );
-    }
-    if args.polygon_visibility_factor == 0 {
-        bail!(
-            "--polygon-visibility-factor must be >= 1 (got {})",
-            args.polygon_visibility_factor
-        );
+    for (name, value) in [
+        ("--point-thinning-factor", args.point_thinning_factor),
+        ("--line-visibility-factor", args.line_visibility_factor),
+        (
+            "--polygon-visibility-factor",
+            args.polygon_visibility_factor,
+        ),
+    ] {
+        if !(value.is_finite() && value > 0.0) {
+            bail!("{name} must be positive and finite (got {value})");
+        }
     }
     if args.row_group_size == 0 {
         bail!("--row-group-size must be >= 1");
@@ -562,11 +525,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         for batch in reader {
             let batch = batch?;
             let geometry = batch.column(0);
+            let visible = &assignment[row..row + batch.num_rows()];
             let minimum: Vec<usize> = (0..batch.num_rows())
                 .into_par_iter()
                 .map(|i| {
+                    // Levels coarser than the visibility threshold cannot
+                    // admit the feature, so their overviews are not built.
+                    let start = visible[i] as usize;
                     if geometry.is_null(i) {
-                        return Ok(0);
+                        return Ok(start);
                     }
                     let bytes = if let Some(a) = geometry.as_any().downcast_ref::<BinaryArray>() {
                         a.value(i)
@@ -577,13 +544,15 @@ pub fn run(args: ConvertArgs) -> Result<()> {
                             .unwrap()
                             .value(i)
                     };
-                    first_viable_level(bytes, &level_params).with_context(|| {
-                        format!("checking overview viability for input row {}", row + i)
-                    })
+                    first_viable_level(bytes, &level_params[start..])
+                        .map(|level| start + level)
+                        .with_context(|| {
+                            format!("checking overview viability for input row {}", row + i)
+                        })
                 })
                 .collect::<Result<_>>()?;
             for viable in minimum {
-                assignment[row] = assignment[row].max(viable.min(resolutions.len() - 1) as u16);
+                assignment[row] = viable as u16;
                 row += 1;
             }
         }
@@ -1821,8 +1790,8 @@ fn consolidate_sparse_root(assignment: &mut [u16], level_count: usize, minimum: 
 /// from level 0 regardless of any factor.
 #[derive(Clone, Copy)]
 struct VisibilityFactors {
-    line: u32,
-    polygon: u32,
+    line: f64,
+    polygon: f64,
 }
 
 /// Per-row tie-break ranks derived from the `--priority-column` attribute column: a
@@ -1847,9 +1816,12 @@ fn point_cell_key(bbox: &Bbox, pitch: f64) -> (i64, i64) {
     )
 }
 
-/// Hash-partition point cells before choosing winners. The partition target
+/// Assign points by grid thinning. At each level, eligible points compete in
+/// grid cells; cells occupied by coarser winners block finer candidates.
+///
+/// Cells are hash-partitioned before choosing winners. The partition target
 /// controls average row count, not a hard per-partition memory limit.
-fn assign_points_partitioned(
+fn assign_points(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
     resolutions: &[f64],
@@ -1859,8 +1831,8 @@ fn assign_points_partitioned(
     target_rows_per_partition: usize,
 ) -> Vec<u16> {
     const UNASSIGNED: u16 = u16::MAX;
-    // Limit simultaneous cell maps independently of Rayon thread count.
-    const PARTITIONS_IN_FLIGHT: usize = 4;
+    // Bound the rows held in simultaneous cell maps, in units of the target.
+    const TARGET_PARTITIONS_IN_FLIGHT: usize = 4;
     debug_assert!(target_rows_per_partition > 0);
     let last_level = (resolutions.len() - 1) as u16;
     let mut remaining_nonempty = 0;
@@ -1870,10 +1842,17 @@ fn assign_points_partitioned(
             remaining_nonempty += usize::from(!bboxes[row].is_empty());
         }
     }
+    // Small inputs still get one partition per thread. Waves then hold about
+    // `TARGET_PARTITIONS_IN_FLIGHT` partitions' worth of target rows at once.
     let partition_count = remaining_nonempty
         .div_ceil(target_rows_per_partition)
+        .max(rayon::current_num_threads())
         .max(1)
         .next_power_of_two();
+    let partitions_in_flight = (TARGET_PARTITIONS_IN_FLIGHT * target_rows_per_partition)
+        .saturating_mul(partition_count)
+        .div_ceil(remaining_nonempty.max(1))
+        .clamp(1, partition_count);
     let mask = partition_count - 1;
     let partition = |(x, y): (i64, i64)| {
         let mut hash = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -1916,7 +1895,7 @@ fn assign_points_partitioned(
             }
         }
 
-        for wave in partitions.chunks(PARTITIONS_IN_FLIGHT) {
+        for wave in partitions.chunks(partitions_in_flight) {
             let winners: Vec<Vec<u32>> = wave
                 .par_iter()
                 .map(|rows| {
@@ -1966,7 +1945,7 @@ fn assign_levels(
     bboxes: &[Bbox],
     kinds: &[GeomKind],
     resolutions: &[f64],
-    point_thinning_factor: u32,
+    point_thinning_factor: f64,
     visibility: VisibilityFactors,
     sort_ranks: &[u64],
 ) -> Result<Vec<u16>> {
@@ -1978,25 +1957,18 @@ fn assign_levels(
     anyhow::ensure!(n <= u32::MAX as usize, "more than u32::MAX input rows");
     let last_level = (resolutions.len() - 1) as u16;
 
-    let precs = resolutions.to_vec();
-
-    let point_thin_mul = point_thinning_factor as f64;
-    let line_vis_mul = visibility.line as f64;
-    let polygon_vis_mul = visibility.polygon as f64;
-
     // Coarsest level at which each feature is independently meaningful: its bbox
     // diagonal ≥ `vis_factor · prec` for the feature's kind. Diagonal — rather
     // than max(w, h) — so a 45° line is rated by its actual length, not its
     // axis-aligned shadow. Compared in squared form to avoid a per-row sqrt.
-    // Points have no extent so are eligible from level 0. Used as a hard
-    // eligibility gate in the per-cell selection below.
-    let sq_line_vis: Vec<f64> = precs
+    // Points have no extent so are eligible from level 0.
+    let sq_line_vis: Vec<f64> = resolutions
         .iter()
-        .map(|p| (p * line_vis_mul) * (p * line_vis_mul))
+        .map(|p| (p * visibility.line).powi(2))
         .collect();
-    let sq_polygon_vis: Vec<f64> = precs
+    let sq_polygon_vis: Vec<f64> = resolutions
         .iter()
-        .map(|p| (p * polygon_vis_mul) * (p * polygon_vis_mul))
+        .map(|p| (p * visibility.polygon).powi(2))
         .collect();
     let min_visible: Vec<u16> = bboxes
         .par_iter()
@@ -2032,132 +2004,18 @@ fn assign_levels(
         return Ok(min_visible);
     }
 
-    // Heuristic crossover for the in-memory and partitioned paths. The
-    // partition target sets the average nonempty point rows per hash bucket;
-    // up to four buckets are processed concurrently, so neither value is a
-    // strict memory limit.
-    const IN_MEMORY_ASSIGNMENT_MAX_ROWS: usize = 2_000_000;
+    // The partition target sets the average nonempty point rows per hash
+    // bucket, bounding the cell maps built at once on large inputs.
     const TARGET_POINT_ROWS_PER_PARTITION: usize = 1_000_000;
-    if n > IN_MEMORY_ASSIGNMENT_MAX_ROWS {
-        return Ok(assign_points_partitioned(
-            bboxes,
-            kinds,
-            resolutions,
-            point_thin_mul,
-            sort_ranks,
-            min_visible,
-            TARGET_POINT_ROWS_PER_PARTITION,
-        ));
-    }
-
-    let mut assigned: Vec<u16> = vec![u16::MAX; n];
-    let mut remaining: Vec<u32> = (0..n as u32).collect();
-
-    let cell_key = |row: u32, prec: f64| -> (i64, i64) {
-        let b = bboxes[row as usize];
-        point_cell_key(&b, prec * point_thin_mul)
-    };
-
-    let mut assigned_points: Vec<u32> = Vec::new();
-    for (level_i, prec) in precs.iter().enumerate() {
-        // Nothing competes after the finest level: all remaining rows must be
-        // retained there, even if they share a point cell.
-        if level_i == last_level as usize {
-            for row in remaining.drain(..) {
-                assigned[row as usize] = last_level;
-            }
-            break;
-        }
-        // Re-project every coarser-level point onto this level's grid and mark
-        // those cells as blocked, so a candidate point falling into the same
-        // cell as an already-placed coarse winner is skipped.
-        // Rebuilt per level because each level's grid pitch differs.
-        let blocked: std::collections::HashSet<(i64, i64)> = assigned_points
-            .par_iter()
-            .map(|&row| cell_key(row, *prec))
-            .collect();
-
-        let prio = |row: u32| {
-            priority(
-                &bboxes[row as usize],
-                sort_ranks.get(row as usize).copied().unwrap_or(0),
-                row,
-            )
-        };
-
-        // Per-cell point winner map built in parallel: each thread folds into a
-        // local HashMap, then reduce merges them keeping the higher-score row
-        // on collision.
-        let best: HashMap<(i64, i64), u32> = remaining
-            .par_iter()
-            .fold(HashMap::new, |mut local, &row| {
-                // Points are meaningful from level 0. The visibility gate for
-                // extended geometries is applied below when they are collected.
-                if min_visible[row as usize] as usize > level_i {
-                    return local;
-                }
-                if kinds[row as usize] != GeomKind::Point {
-                    return local;
-                }
-                let key = cell_key(row, *prec);
-                if blocked.contains(&key) {
-                    return local;
-                }
-                match local.get(&key) {
-                    None => {
-                        local.insert(key, row);
-                    }
-                    Some(&cur) => {
-                        if prio(row) > prio(cur) {
-                            local.insert(key, row);
-                        }
-                    }
-                }
-                local
-            })
-            .reduce(HashMap::new, |mut a, mut b| {
-                if a.len() < b.len() {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                for (k, row) in b {
-                    match a.get(&k) {
-                        None => {
-                            a.insert(k, row);
-                        }
-                        Some(&cur) => {
-                            if prio(row) > prio(cur) {
-                                a.insert(k, row);
-                            }
-                        }
-                    }
-                }
-                a
-            });
-        for &row in best.values() {
-            assigned[row as usize] = level_i as u16;
-        }
-        assigned_points.extend(best.values().copied());
-        remaining.retain(|&row| {
-            if kinds[row as usize] != GeomKind::Point
-                && min_visible[row as usize] as usize <= level_i
-            {
-                assigned[row as usize] = level_i as u16;
-            }
-            assigned[row as usize] == u16::MAX
-        });
-        if remaining.is_empty() {
-            break;
-        }
-    }
-    for r in remaining {
-        assigned[r as usize] = last_level;
-    }
-    for (i, a) in assigned.iter().enumerate() {
-        if *a == u16::MAX {
-            bail!("internal: row {i} was never assigned");
-        }
-    }
-    Ok(assigned)
+    Ok(assign_points(
+        bboxes,
+        kinds,
+        resolutions,
+        point_thinning_factor,
+        sort_ranks,
+        min_visible,
+        TARGET_POINT_ROWS_PER_PARTITION,
+    ))
 }
 
 /// Point-cell winner priority. The optional `--priority-column` rank leads, bbox
@@ -2443,9 +2301,9 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.args.min_root_features, 2048);
-        assert_eq!(cli.args.point_thinning_factor, 4);
-        assert_eq!(cli.args.line_visibility_factor, 4);
-        assert_eq!(cli.args.polygon_visibility_factor, 4);
+        assert_eq!(cli.args.point_thinning_factor, 4.0);
+        assert_eq!(cli.args.line_visibility_factor, 4.0);
+        assert_eq!(cli.args.polygon_visibility_factor, 4.0);
         assert_eq!(cli.args.row_group_size, 262_144);
         assert_eq!(cli.args.zstd_level, 9);
         assert_eq!(cli.args.page_row_count, 1024);
@@ -2539,7 +2397,7 @@ mod tests {
 
     #[test]
     fn web_mercator_resolutions_monotonic_and_halving() {
-        let g = web_mercator_resolutions(0, 4, 1024);
+        let g = web_mercator_resolutions(0, 4);
         assert_eq!(g.len(), 5);
         for w in g.windows(2) {
             assert!(
@@ -2547,8 +2405,8 @@ mod tests {
                 "expected halving, got {w:?}"
             );
         }
-        // Web Mercator equatorial circumference / 1024 at z0.
-        assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 1024.0).abs() < 1e-6);
+        // One pixel of a 512-pixel tile at z0.
+        assert!((g[0] - WEB_MERCATOR_CIRCUMFERENCE_M / 512.0).abs() < 1e-6);
     }
 
     #[test]
@@ -2603,10 +2461,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 1,
-                polygon: 1,
+                line: 1.0,
+                polygon: 1.0,
             },
             &[0, 0],
         )
@@ -2626,10 +2484,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 1,
-                polygon: 1,
+                line: 1.0,
+                polygon: 1.0,
             },
             &[0, 0],
         )
@@ -2651,10 +2509,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 1,
-                polygon: 1,
+                line: 1.0,
+                polygon: 1.0,
             },
             &[1, 5],
         )
@@ -2663,7 +2521,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_point_assignment_matches_in_memory_selection() {
+    fn point_assignment_is_independent_of_partition_count() {
         let mut bboxes: Vec<_> = (0..257)
             .map(|row| {
                 let x = ((row * 37) % 512) as f64 / 3.0;
@@ -2684,18 +2542,17 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 1,
-                polygon: 1,
+                line: 1.0,
+                polygon: 1.0,
             },
             &ranks,
         )
         .unwrap();
         let mut initial = vec![0; bboxes.len()];
         *initial.last_mut().unwrap() = *expected.last().unwrap();
-        let actual =
-            assign_points_partitioned(&bboxes, &kinds, &resolutions, 1.0, &ranks, initial, 8);
+        let actual = assign_points(&bboxes, &kinds, &resolutions, 1.0, &ranks, initial, 8);
         assert_eq!(actual, expected);
     }
 
@@ -2713,10 +2570,10 @@ mod tests {
             &bboxes,
             &kinds,
             &[100.0, 10.0],
-            1,
+            1.0,
             VisibilityFactors {
-                line: 1,
-                polygon: 1,
+                line: 1.0,
+                polygon: 1.0,
             },
             &[],
         )
@@ -2752,10 +2609,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 2,
-                polygon: 4,
+                line: 2.0,
+                polygon: 4.0,
             },
             &[0],
         )
@@ -2778,10 +2635,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 2,
-                polygon: 4,
+                line: 2.0,
+                polygon: 4.0,
             },
             &[0, 0],
         )
@@ -2812,10 +2669,10 @@ mod tests {
             &bboxes,
             &kinds,
             &resolutions,
-            1,
+            1.0,
             VisibilityFactors {
-                line: 2,
-                polygon: 4,
+                line: 2.0,
+                polygon: 4.0,
             },
             &[0, 0, 0, 0],
         )

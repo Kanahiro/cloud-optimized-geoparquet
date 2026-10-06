@@ -6,6 +6,7 @@ use parquet::arrow::parquet_to_arrow_schema;
 use parquet::arrow::ProjectionMask;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
+use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
 
@@ -266,56 +267,97 @@ fn validate_lod_coverage(path: &Path, lod_meta: &LodMeta, family: GeometryFamily
             })
             .map(|(index, _)| index),
     );
-    for group in 0..metadata.metadata().num_row_groups() {
-        let batches =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file.try_clone()?, metadata.clone())
-                .with_projection(projection.clone())
-                .with_row_groups(vec![group])
-                .build()?;
-        for batch in batches {
-            let batch = batch?;
-            let root = batch
-                .column_by_name(overviews.column.as_str())
-                .and_then(|array| array.as_any().downcast_ref::<StructArray>())
-                .context("missing overviews while checking LoD coverage")?;
-            for (lod, lod_metadata) in &overviews.lods {
-                let boundary = lod_meta
-                    .lod_row_group_end(lod)
-                    .context("validated overview LoD is not referenced by a level")?;
-                let values = root
-                    .column_by_name(lod)
-                    .context("missing LoD in coverage projection")?;
-                let expected_nulls = if group as i64 <= boundary {
-                    0
-                } else {
-                    batch.num_rows()
-                };
-                if values.null_count() != expected_nulls {
-                    bail!("row group {group} overview `{lod}` must be {} (effective boundary {boundary})",
-                        if expected_nulls == 0 { "non-null" } else { "null" });
-                }
-                let quantization = lod_metadata.quantization()?;
-                let kind = match quantization.geometry_type.as_str() {
-                    "LineString" => 2,
-                    "Polygon" => 3,
-                    "MultiLineString" => 5,
-                    "MultiPolygon" => 6,
-                    other => bail!("overview `{lod}` has invalid geometry_type `{other}`"),
-                };
-                for row in 0..batch.num_rows() {
-                    anyhow::ensure!(!root.is_null(row), "null overview root");
-                    if values.is_null(row) {
-                        continue;
+    // Each row group has independent pages. Bound concurrency to keep decoded
+    // Arrow batches and random reads from overwhelming memory or storage.
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get().min(8))
+        .unwrap_or(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()?;
+    let count = metadata.metadata().num_row_groups();
+    for first in (0..count).step_by(workers) {
+        let last = (first + workers).min(count);
+        let results = pool.install(|| {
+            (first..last)
+                .into_par_iter()
+                .map(|group| {
+                    validate_row_group(path, &metadata, &projection, lod_meta, family, group)
+                })
+                .collect::<Vec<_>>()
+        });
+        // Rayon preserves indexed order, so the earliest invalid group is
+        // reported even if a later group finishes first.
+        for result in results {
+            result?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_row_group(
+    path: &Path,
+    metadata: &ArrowReaderMetadata,
+    projection: &ProjectionMask,
+    lod_meta: &LodMeta,
+    family: GeometryFamily,
+    group: usize,
+) -> Result<()> {
+    let overviews = lod_meta.overviews.as_ref().unwrap();
+    let batches =
+        ParquetRecordBatchReaderBuilder::new_with_metadata(File::open(path)?, metadata.clone())
+            .with_projection(projection.clone())
+            .with_row_groups(vec![group])
+            .build()?;
+    for batch in batches {
+        let batch = batch?;
+        let root = batch
+            .column_by_name(overviews.column.as_str())
+            .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+            .context("missing overviews while checking LoD coverage")?;
+        anyhow::ensure!(root.null_count() == 0, "null overview root");
+        for (lod, lod_metadata) in &overviews.lods {
+            let boundary = lod_meta
+                .lod_row_group_end(lod)
+                .context("validated overview LoD is not referenced by a level")?;
+            let values = root
+                .column_by_name(lod)
+                .context("missing LoD in coverage projection")?;
+            let expected_nulls = if group as i64 <= boundary {
+                0
+            } else {
+                batch.num_rows()
+            };
+            if values.null_count() != expected_nulls {
+                bail!(
+                    "row group {group} overview `{lod}` must be {} (effective boundary {boundary})",
+                    if expected_nulls == 0 {
+                        "non-null"
+                    } else {
+                        "null"
                     }
-                    crate::overview_validation::validate_value(
-                        values.as_ref(),
-                        row,
-                        kind,
-                        &quantization,
-                        family,
-                    )
-                    .with_context(|| format!("row group {group}, row {row}, LoD {lod}"))?;
-                }
+                );
+            }
+            if expected_nulls != 0 {
+                continue;
+            }
+            let quantization = lod_metadata.quantization()?;
+            let kind = match quantization.geometry_type.as_str() {
+                "LineString" => 2,
+                "Polygon" => 3,
+                "MultiLineString" => 5,
+                "MultiPolygon" => 6,
+                other => bail!("overview `{lod}` has invalid geometry_type `{other}`"),
+            };
+            for row in 0..batch.num_rows() {
+                crate::overview_validation::validate_value(
+                    values.as_ref(),
+                    row,
+                    kind,
+                    &quantization,
+                    family,
+                )
+                .with_context(|| format!("row group {group}, row {row}, LoD {lod}"))?;
             }
         }
     }
