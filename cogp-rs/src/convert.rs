@@ -142,12 +142,11 @@ fn write_with_row_group_limit<W: Write + Send>(
     writer: &mut ParallelWriter<W>,
     batch: &RecordBatch,
     max_rows: usize,
-    max_bytes: usize,
     page_rows: usize,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < batch.num_rows() {
-        if writer.in_progress_rows() >= max_rows || writer.memory_size() >= max_bytes {
+        if writer.in_progress_rows() >= max_rows {
             writer.flush()?;
         }
         let capacity = max_rows - writer.in_progress_rows();
@@ -160,9 +159,6 @@ fn write_with_row_group_limit<W: Write + Send>(
         let rows = (batch.num_rows() - offset).min(capacity);
         writer.write(&batch.slice(offset, rows))?;
         offset += rows;
-        if writer.memory_size() >= max_bytes {
-            writer.flush()?;
-        }
     }
     Ok(())
 }
@@ -176,10 +172,8 @@ fn flushed_row_group_end<W: Write + Send>(writer: &ParallelWriter<W>) -> Result<
 }
 
 struct WritePlan {
-    row_group_rows: usize,
     gather_rows: usize,
     workers: usize,
-    writer_bytes: usize,
 }
 
 /// Drain only the oldest gather result, preserving sorted output while other
@@ -201,8 +195,8 @@ fn forward_gathered_chunk(
 }
 
 /// Parquet's uncompressed row-group sizes give a cheap payload estimate before
-/// gathering. Cap both task size and task count: a gathered chunk temporarily
-/// exists as decoded input, reordered output, and encoded writer buffers.
+/// gathering. Keep gather tasks small without changing the requested row-group
+/// boundary; encoded columns are written from a temporary row-group spool.
 fn write_plan(meta: &ArrowReaderMetadata, requested_rows: usize) -> WritePlan {
     // This is a pipeline-sizing heuristic, not a total process memory limit.
     let budget = 512usize << 20;
@@ -215,19 +209,14 @@ fn write_plan(meta: &ArrowReaderMetadata, requested_rows: usize) -> WritePlan {
         .max()
         .unwrap_or(1)
         .max(1);
-    let writer_bytes = budget / 4;
-    // Allow headroom for Arrow arrays and intermediate overview geometry.
-    let row_group_rows = requested_rows.min(writer_bytes / bytes_per_row / 2).max(1);
     let gather_bytes = (budget / 16).min(32 << 20);
-    let gather_rows = row_group_rows.min(gather_bytes / bytes_per_row).max(1);
+    let gather_rows = requested_rows.min(gather_bytes / bytes_per_row).max(1);
     let workers = rayon::current_num_threads()
         .min(budget / gather_bytes.saturating_mul(4))
         .max(1);
     WritePlan {
-        row_group_rows,
         gather_rows,
         workers,
-        writer_bytes,
     }
 }
 
@@ -425,7 +414,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let write_plan = write_plan(&arrow_meta, args.row_group_size);
     eprintln!(
         "      write plan: {} rows/row group, {} rows/gather, {} workers",
-        write_plan.row_group_rows, write_plan.gather_rows, write_plan.workers
+        args.row_group_size, write_plan.gather_rows, write_plan.workers
     );
 
     let priority_column_idx = match &args.priority_column {
@@ -587,11 +576,11 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     }
 
     for (level_idx, rows) in per_level.iter_mut().enumerate() {
-        str_pack(rows, &bboxes, write_plan.row_group_rows, level_idx);
+        str_pack(rows, &bboxes, args.row_group_size, level_idx);
         str_pack_pages(
             rows,
             &bboxes,
-            write_plan.row_group_rows,
+            args.row_group_size,
             args.page_row_count,
             level_idx,
         );
@@ -676,7 +665,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_dictionary_enabled(false)
         .set_encoding(Encoding::PLAIN)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(args.zstd_level)?))
-        .set_max_row_group_size(write_plan.row_group_rows)
+        .set_max_row_group_size(args.row_group_size)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_statistics_enabled(
             ColumnPath::from(geom_col_name.as_str()),
@@ -711,9 +700,16 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_data_page_row_count_limit(args.page_row_count)
         .set_write_batch_size(args.page_row_count);
     let props = props_builder.build();
+    let output_dir = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let out_file = File::create(&args.output)
         .with_context(|| format!("creating {}", args.output.display()))?;
-    let mut writer = ParallelWriter::try_new(out_file, output_schema.clone(), Some(props))?;
+    let mut writer =
+        ParallelWriter::try_new(out_file, output_schema.clone(), Some(props), &output_dir)?;
 
     // Gather tasks run ahead of the writer in a bounded window. Each has its
     // own result slot, so completion order does not affect physical row order;
@@ -723,12 +719,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     let producer_bboxes = Arc::new(bboxes);
     let producer_meta = arrow_meta.clone();
     let producer_input = args.input.clone();
-    let producer_output_dir = args
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let producer_output_dir = output_dir;
     let producer_keep = keep_col_indices;
     let producer_append_bbox = append_bbox;
     let producer_geom_col = geom_col_idx;
@@ -829,8 +820,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         write_with_row_group_limit(
             &mut writer,
             &batch,
-            write_plan.row_group_rows,
-            write_plan.writer_bytes,
+            args.row_group_size,
             args.page_row_count,
         )?;
         last_level = Some(level_i);
@@ -2727,13 +2717,18 @@ mod tests {
             .set_write_batch_size(4)
             .build();
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut writer =
-            ParallelWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        let mut writer = ParallelWriter::try_new(
+            file.reopen().unwrap(),
+            schema.clone(),
+            Some(props),
+            std::env::temp_dir().as_path(),
+        )
+        .unwrap();
         // Batches of 3 rows end mid-page; row groups of 10 end on a partial page.
         for start in (0..30).step_by(3) {
             let values = Int64Array::from_iter_values(start..start + 3);
             let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
-            write_with_row_group_limit(&mut writer, &batch, 10, usize::MAX, 4).unwrap();
+            write_with_row_group_limit(&mut writer, &batch, 10, 4).unwrap();
         }
         writer.close().unwrap();
 
@@ -2759,7 +2754,8 @@ mod tests {
         // ≥1 row group), but the helper must refuse to lie.
         let buf = Vec::new();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let writer = ParallelWriter::try_new(buf, schema, None).unwrap();
+        let writer =
+            ParallelWriter::try_new(buf, schema, None, std::env::temp_dir().as_path()).unwrap();
         assert!(flushed_row_group_end(&writer).is_err());
     }
 

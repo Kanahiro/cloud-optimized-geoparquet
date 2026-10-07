@@ -154,7 +154,7 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
 }
 
 #[test]
-fn wide_rows_use_smaller_gathers_and_row_groups() {
+fn wide_rows_use_smaller_gathers_without_shrinking_row_groups() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let tmp = TempDir::new("wide-rows");
@@ -208,7 +208,8 @@ fn wide_rows_use_smaller_gathers_and_row_groups() {
     cogp::validate::run(&output).unwrap();
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&output).unwrap()).unwrap();
-    assert!(builder.metadata().num_row_groups() > 1);
+    assert_eq!(builder.metadata().num_row_groups(), 1);
+    assert_eq!(builder.metadata().row_group(0).num_rows(), 17);
     let mut seen = vec![false; 17];
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
@@ -388,6 +389,20 @@ fn root_minimum_preserves_rows_and_all_overviews() {
             lod.overviews.as_ref().unwrap().lods.len(),
             resolutions.len()
         );
+        if minimum <= 26 {
+            assert_eq!(reader.num_row_groups(), 2);
+            assert_eq!(
+                reader
+                    .parquet_metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|group| group.num_rows())
+                    .collect::<Vec<_>>(),
+                vec![26, 14]
+            );
+            assert_eq!(reader.levels()[0].row_group_end, 0);
+            assert_eq!(reader.levels()[1].row_group_end, 1);
+        }
         if minimum == 2048 {
             assert_eq!(reader.num_row_groups(), 1);
             assert!(reader.levels().iter().all(|level| level.row_group_end == 0));
