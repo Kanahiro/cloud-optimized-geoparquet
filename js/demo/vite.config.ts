@@ -14,6 +14,15 @@ export default defineConfig({
   base: './',
   server: {
     port: 5173,
+    proxy: {
+      // The public samples accept byte ranges but do not expose browser CORS
+      // headers to localhost. Keep their canonical URLs in shareable links.
+      '/cogp-sample': {
+        target: 'https://cogp-demo.spatialty.io',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/cogp-sample/, ''),
+      },
+    },
   },
   build: {
     rollupOptions: {
