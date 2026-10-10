@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Layout inspector · COGP Demo</title>
+    <link rel="stylesheet" href="../../src/shared/base.css" />
+    <link rel="stylesheet" href="../../src/pages/layout-inspector/style.css" />
+  </head>
+  <body>
+    <div class="dashboard">
+      <header class="topbar">
+        <div class="brand">
+          <div class="eyebrow">COGP / FILE ANALYSIS</div>
+          <h1>Layout inspector</h1>
+          <p>Inspect physical placement and measure spatial reads.</p>
+        </div>
+        <div class="dataset-controls">
+          <label for="preset">Dataset</label>
+          <select id="preset">
+            <option value="">Choose a sample…</option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet" selected>Buildings</option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet">Road segments</option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet">POIs</option>
+            <option value="https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet">Administrative boundaries</option>
+          </select>
+          <label for="url">COGP URL</label>
+          <input id="url" type="url" placeholder="https://example.com/file.parquet" />
+          <button id="load">Load</button>
+        </div>
+        <a class="demos-link" href="../../">Demos ↗</a>
+      </header>
+      <p id="status" class="status" role="status">Opening dataset…</p>
+      <main class="workspace">
+        <section class="map-panel" aria-label="Spatial query map">
+          <div class="panel-heading">
+            <div><span class="eyebrow">01 / QUERY AREA</span><h2>Spatial query</h2></div>
+            <button id="draw" disabled>Draw rectangle</button>
+          </div>
+          <div class="map-stage">
+            <div id="map"></div>
+            <div class="map-legend"><span class="swatch group"></span> Row group <span class="swatch page"></span> Page BBOX <span class="swatch read"></span> Read</div>
+          </div>
+          <div class="map-options">
+            <div class="level-control">
+              <label for="max-level">Read through level</label>
+              <select id="max-level" disabled></select>
+            </div>
+            <label class="check"><input id="use-overview" type="checkbox" disabled /> Use overview</label>
+            <div class="overlay-options">
+              <label class="check"><input id="show-groups" type="checkbox" checked /> Row groups</label>
+              <label class="check"><input id="show-pages" type="checkbox" checked /> Primary pages</label>
+            </div>
+            <details id="attribute-picker" class="attribute-picker">
+              <summary id="attribute-summary">Attributes · None</summary>
+              <div class="attribute-menu">
+                <div id="attribute-list" class="attribute-list"></div>
+                <div class="attribute-actions">
+                  <button id="attribute-all" type="button" class="quiet" aria-label="Select all attributes">All</button>
+                  <button id="attribute-none" type="button" class="quiet" aria-label="Clear attributes">None</button>
+                  <button id="attribute-apply" type="button" aria-label="Apply attribute selection">Apply selection</button>
+                </div>
+              </div>
+            </details>
+            <p>Draw a rectangle to measure a read. Level and overview changes repeat it; apply attribute changes when ready.</p>
+          </div>
+        </section>
+        <div class="analysis">
+          <section class="panel physical-panel">
+            <div class="panel-heading">
+              <div><span class="eyebrow">02 / PHYSICAL BYTES</span><h2>Physical file layout</h2></div>
+              <strong id="file-size"></strong>
+            </div>
+            <p class="note">The file strip is proportional to byte offset. Click a row group to inspect its columns. Orange shows row groups touched by the query.</p>
+            <div class="chart-title"><h3>Entire file</h3><span>Row groups · Page indexes · Footer</span></div>
+            <canvas id="overview" height="112" aria-label="Entire file byte layout"></canvas>
+            <div class="axis"><span>0</span><span id="file-end">end</span></div>
+            <div id="level-summary" class="level-summary" aria-label="Level sizes"></div>
+            <div class="group-heading">
+              <div><h3>Selected row group</h3><div id="group-details" class="details">Choose a row group above.</div></div>
+              <div class="group-row"><label for="group-id">RG</label><input id="group-id" type="number" min="0" value="0" disabled /><span id="group-total">/ –</span></div>
+            </div>
+            <div class="column-head"><span>Column chunk</span><span>Position in row group</span><span>Size</span></div>
+            <div id="column-layout" class="column-layout" aria-label="Selected row group column chunks"></div>
+            <div id="layout-hover" class="details layout-hover">Hover over the file strip or a column for byte offsets.</div>
+          </section>
+          <section class="panel read-panel">
+            <div class="panel-heading"><div><span class="eyebrow">03 / READ COST</span><h2>BBOX query cost</h2></div></div>
+            <p class="note">Fetched bytes and requests are measured from the real read. Page sizes describe physical pages touched; Full RG data is the size of all columns in those row groups.</p>
+            <div id="query-stats" class="metrics" hidden></div>
+            <div id="read-breakdown" class="breakdown" hidden>
+              <div class="chart-title"><h3>Data pages touched</h3><span>Compressed page bytes</span></div>
+              <div class="breakdown-bar"><span class="bbox"></span><span class="geometry"></span><span class="attributes"></span><span class="other"></span></div>
+              <div class="breakdown-legend"><span><i class="bbox"></i>BBOX</span><span><i class="geometry"></i>Geometry</span><span><i class="attributes"></i>Attributes</span><span><i class="other"></i>Other</span></div>
+            </div>
+            <div id="read-list" class="read-list" hidden></div>
+            <p id="read-empty" class="empty-state">Draw a rectangle on the map to inspect transfer, geometry, and BBOX page costs.</p>
+          </section>
+          <section class="panel pages-panel">
+            <div class="panel-heading"><div><span class="eyebrow">04 / SPATIAL INDEX</span><h2>Primary geometry pages</h2></div><span id="page-count"></span></div>
+            <p class="note">Page BBOXs combine overlapping xmin/ymin/xmax/ymax Column Index row ranges. They are conservative envelopes, including when the query reads an overview.</p>
+            <div id="page-list" class="page-list"></div>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="../../src/pages/layout-inspector/main.ts"></script>
+  </body>
+</html>
