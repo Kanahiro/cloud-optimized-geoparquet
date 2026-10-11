@@ -263,8 +263,9 @@ async function load(url: string): Promise<void> {
   if (!url) return;
   const revision = ++loadRevision;
   ++queryRevision;
+  ++selectionRevision;
   resetWorker();
-  layout = null; pages = []; query = null; drawn = null;
+  layout = null; pages = []; selectedGroup = 0; selectedPage = -1; query = null; drawn = null;
   attributePicker.open = false;
   renderAttributes([]);
   groupInput.disabled = true; drawButton.disabled = true; maxLevelSelect.disabled = true; useOverviewInput.disabled = true;
@@ -305,13 +306,13 @@ async function load(url: string): Promise<void> {
       map.fitBounds([[b.minX, b.minY], [b.maxX, b.maxY]], { padding: 65, maxZoom: 13 });
     }
     renderMap(); renderPhysicalLayout();
-    void selectGroup(0);
+    void selectGroup(0, false);
   } catch (error) {
     if (revision === loadRevision) setStatus(`Could not open dataset: ${(error as Error).message}. The URL must permit browser CORS and byte Range requests.`, true);
   }
 }
 
-async function selectGroup(id: number): Promise<void> {
+async function selectGroup(id: number, focusMap = true): Promise<void> {
   if (!layout || !Number.isSafeInteger(id) || id < 0 || id >= layout.groups.length) return;
   selectedGroup = id; selectedPage = -1; pages = [];
   groupInput.value = String(id);
@@ -321,12 +322,25 @@ async function selectGroup(id: number): Promise<void> {
     + (column.offsetIndex ? column.offsetIndex.end - column.offsetIndex.start : 0), 0);
   $('group-details').textContent = `Level ${group.level + 1} · ${group.rows.toLocaleString()} rows · ${formatBytes(group.end - group.start)} data span · ${formatBytes(indexBytes)} indexes`;
   renderMap(); renderPhysicalLayout(); renderPages();
+  if (focusMap && group.bbox) {
+    map.fitBounds([[group.bbox.minX, group.bbox.minY], [group.bbox.maxX, group.bbox.maxY]],
+      { padding: 65, maxZoom: 13 });
+  }
   const revision = ++selectionRevision;
   try {
     const result = await call<PageLayout[]>({ type: 'pages', groupId: id });
     if (revision !== selectionRevision) return;
     pages = result;
     renderMap(); renderPhysicalLayout(); renderPages();
+    if (focusMap && !group.bbox) {
+      const bbox = pages.reduce<Bbox | null>((combined, page) => {
+        if (!page.bbox) return combined;
+        if (!combined) return page.bbox;
+        return { minX: Math.min(combined.minX, page.bbox.minX), minY: Math.min(combined.minY, page.bbox.minY),
+          maxX: Math.max(combined.maxX, page.bbox.maxX), maxY: Math.max(combined.maxY, page.bbox.maxY) };
+      }, null);
+      if (bbox) map.fitBounds([[bbox.minX, bbox.minY], [bbox.maxX, bbox.maxY]], { padding: 65, maxZoom: 13 });
+    }
   } catch (error) {
     if (revision === selectionRevision) $('page-list').textContent = `Page indexes unavailable: ${(error as Error).message}`;
   }
