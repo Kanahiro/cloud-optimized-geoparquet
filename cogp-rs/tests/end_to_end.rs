@@ -287,7 +287,7 @@ fn convert_reader_validate_pipeline() {
             assert!(column.dictionary_page_offset().is_none());
             assert!(!column
                 .encodings()
-                .contains(&parquet::basic::Encoding::RLE_DICTIONARY));
+                .any(|encoding| encoding == parquet::basic::Encoding::RLE_DICTIONARY));
         }
         assert!(row_group
             .columns()
@@ -1026,9 +1026,12 @@ fn page_size_limit_splits_pages_before_row_count_limit() {
         cogp::convert::run(args).unwrap();
 
         let file = File::open(output).unwrap();
-        let metadata =
-            ArrowReaderMetadata::load(&file, ArrowReaderOptions::new().with_page_index(true))
-                .unwrap();
+        let metadata = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required),
+        )
+        .unwrap();
         assert_eq!(metadata.metadata().row_group(0).num_rows(), 256);
         let geometry = metadata
             .metadata()
@@ -1037,7 +1040,12 @@ fn page_size_limit_splits_pages_before_row_count_limit() {
             .iter()
             .position(|col| col.column_path().string() == "geometry")
             .unwrap();
-        metadata.metadata().offset_index().unwrap()[0][geometry]
+        metadata
+            .metadata()
+            .page_index()
+            .unwrap()
+            .offset_index(0, geometry)
+            .unwrap()
             .page_locations()
             .iter()
             .map(|page| page.first_row_index)
@@ -1619,11 +1627,12 @@ fn attribute_encodings_preserve_values_and_nested_paths() {
             } else {
                 Encoding::PLAIN
             };
+            let encodings = column.encodings().collect::<Vec<_>>();
             assert!(
-                column.encodings().contains(&expected),
+                encodings.contains(&expected),
                 "{}: {:?}",
                 column.column_path(),
-                column.encodings()
+                encodings
             );
         }
     }

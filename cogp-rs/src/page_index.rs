@@ -9,13 +9,13 @@ use anyhow::{bail, Context, Result};
 use parquet::arrow::arrow_reader::RowSelection;
 #[cfg(feature = "async")]
 use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::basic::Type;
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::index_reader::{decode_column_index, decode_offset_index};
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::file::reader::ChunkReader;
-use parquet::format::{ColumnIndex, OffsetIndex};
-use parquet::thrift::TSerializable;
-use std::io::Cursor;
 use std::ops::Range;
-use thrift::protocol::TCompactInputProtocol;
 
 #[derive(Clone, Copy)]
 enum BboxLeaf {
@@ -41,6 +41,7 @@ struct Request {
     output_row_start: usize,
     row_group_rows: usize,
     leaf: BboxLeaf,
+    column_type: Type,
     column_index: Range<u64>,
     offset_index: Range<u64>,
 }
@@ -81,6 +82,7 @@ impl Plan {
                     output_row_start,
                     row_group_rows,
                     leaf,
+                    column_type: column.column_type(),
                     column_index,
                     offset_index,
                 });
@@ -113,10 +115,10 @@ impl Plan {
         for request in self.requests {
             let column_bytes = buffers.next().context("missing ColumnIndex response")?;
             let offset_bytes = buffers.next().context("missing OffsetIndex response")?;
-            let column: ColumnIndex =
-                decode_thrift(column_bytes.as_ref()).context("decoding bbox ColumnIndex")?;
-            let offset: OffsetIndex =
-                decode_thrift(offset_bytes.as_ref()).context("decoding bbox OffsetIndex")?;
+            let column = decode_column_index(column_bytes.as_ref(), request.column_type)
+                .context("decoding bbox ColumnIndex")?;
+            let offset =
+                decode_offset_index(offset_bytes.as_ref()).context("decoding bbox OffsetIndex")?;
             prune_pages(&mut keep, &request, &column, &offset, query);
         }
         if buffers.next().is_some() {
@@ -168,42 +170,35 @@ fn index_range(offset: Option<i64>, length: Option<i32>) -> Option<Range<u64>> {
     start.checked_add(length).map(|end| start..end)
 }
 
-fn decode_thrift<T: TSerializable>(bytes: &[u8]) -> Result<T> {
-    let mut protocol = TCompactInputProtocol::new(Cursor::new(bytes));
-    Ok(T::read_from_in_protocol(&mut protocol)?)
-}
-
 fn prune_pages(
     keep: &mut [bool],
     request: &Request,
-    column: &ColumnIndex,
-    offset: &OffsetIndex,
+    column: &ColumnIndexMetaData,
+    offset: &OffsetIndexMetaData,
     query: [f64; 4],
 ) {
+    let ColumnIndexMetaData::DOUBLE(column) = column else {
+        return;
+    };
+    let locations = offset.page_locations();
     let page_count = column
-        .min_values
+        .min_values()
         .len()
-        .min(column.max_values.len())
-        .min(column.null_pages.len())
-        .min(offset.page_locations.len());
+        .min(column.max_values().len())
+        .min(locations.len());
     for page_index in 0..page_count {
-        if column.null_pages[page_index] {
+        if column.is_null_page(page_index) {
             continue;
         }
-        let (Some(min), Some(max)) = (
-            parquet_f64(&column.min_values[page_index]),
-            parquet_f64(&column.max_values[page_index]),
-        ) else {
-            continue;
-        };
+        let min = column.min_values()[page_index];
+        let max = column.max_values()[page_index];
         if !request.leaf.misses(min, max, query) {
             continue;
         }
-        let Ok(start) = usize::try_from(offset.page_locations[page_index].first_row_index) else {
+        let Ok(start) = usize::try_from(locations[page_index].first_row_index) else {
             continue;
         };
-        let end = offset
-            .page_locations
+        let end = locations
             .get(page_index + 1)
             .and_then(|page| usize::try_from(page.first_row_index).ok())
             .unwrap_or(request.row_group_rows)
@@ -215,10 +210,6 @@ fn prune_pages(
         let end = request.output_row_start + end;
         keep[start..end].fill(false);
     }
-}
-
-fn parquet_f64(bytes: &[u8]) -> Option<f64> {
-    Some(f64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn selection_from_bitmap(keep: &[bool]) -> RowSelection {

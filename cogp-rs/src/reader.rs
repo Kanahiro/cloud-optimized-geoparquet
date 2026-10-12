@@ -38,6 +38,8 @@ use parquet::arrow::async_reader::{
 };
 
 #[cfg(feature = "object_store")]
+// Keep the existing public adapter while callers migrate to their own AsyncFileReader.
+#[allow(deprecated)]
 pub use parquet::arrow::async_reader::ParquetObjectReader;
 
 #[cfg(feature = "async")]
@@ -702,7 +704,7 @@ mod tests {
         let reader = Reader::try_new(bytes.clone()).unwrap();
         // Construction remains footer-only; indexes are fetched by the bbox
         // read below rather than retained for unrelated future queries.
-        assert!(reader.parquet_metadata().column_index().is_none());
+        assert!(reader.parquet_metadata().page_index().is_none());
         let rows = reader
             .sync_batch_reader_with_bbox(bytes, &[0], [9.0, 9.0, 12.0, 12.0])
             .unwrap()

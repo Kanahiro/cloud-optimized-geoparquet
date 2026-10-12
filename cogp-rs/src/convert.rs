@@ -673,7 +673,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         .set_dictionary_enabled(false)
         .set_encoding(Encoding::PLAIN)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(args.zstd_level)?))
-        .set_max_row_group_size(args.row_group_size)
+        .set_max_row_group_row_count(Some(args.row_group_size))
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_column_statistics_enabled(
             ColumnPath::from(geom_col_name.as_str()),
@@ -2750,12 +2750,15 @@ mod tests {
 
         let meta = ArrowReaderMetadata::load(
             &file.reopen().unwrap(),
-            parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(true),
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required),
         )
         .unwrap();
-        let offsets = meta.metadata().offset_index().unwrap();
-        for (rg, columns) in offsets.iter().enumerate() {
-            let starts: Vec<i64> = columns[0]
+        let index = meta.metadata().page_index().unwrap();
+        for rg in 0..meta.metadata().num_row_groups() {
+            let starts: Vec<i64> = index
+                .offset_index(rg, 0)
+                .unwrap()
                 .page_locations()
                 .iter()
                 .map(|p| p.first_row_index)
