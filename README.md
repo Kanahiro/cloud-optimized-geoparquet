@@ -57,10 +57,10 @@ https://github.com/user-attachments/assets/0b3e666a-5663-4f10-97f6-887442242d14
 
 ## Sample data
 
-- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet) (OpenStreetMap)
-- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet) (OvertureMaps)
-- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet) (OvertureMaps)
-- [admin.cogp.parquet](https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet) (administrative boundaries, https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N03-2025.html)
+- [pois.cogp.parquet](https://cogp-demo.spatialty.io/v2.2.2/pois.cogp.parquet) (OpenStreetMap)
+- [segments.cogp.parquet](https://cogp-demo.spatialty.io/v2.2.2/segments.cogp.parquet) (OvertureMaps)
+- [buildings.cogp.parquet](https://cogp-demo.spatialty.io/v2.2.2/buildings.cogp.parquet) (OvertureMaps)
+- [admin.cogp.parquet](https://cogp-demo.spatialty.io/v2.2.2/admin.cogp.parquet) (administrative boundaries, https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N03-2025.html)
 
 ## Getting started
 
