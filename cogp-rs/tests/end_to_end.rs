@@ -145,6 +145,7 @@ fn convert_args(input: &std::path::Path, output: &std::path::Path) -> ConvertArg
         row_group_size: 8,
         zstd_level: 9,
         page_row_count: 2,
+        page_size_limit: 256 * 1024,
         point_thinning_factor: 4.0,
         line_visibility_factor: 2.0,
         polygon_visibility_factor: 4.0,
@@ -286,7 +287,7 @@ fn convert_reader_validate_pipeline() {
             assert!(column.dictionary_page_offset().is_none());
             assert!(!column
                 .encodings()
-                .contains(&parquet::basic::Encoding::RLE_DICTIONARY));
+                .any(|encoding| encoding == parquet::basic::Encoding::RLE_DICTIONARY));
         }
         assert!(row_group
             .columns()
@@ -490,6 +491,18 @@ fn root_minimum_rejects_zero() {
     args.min_root_features = 0;
     let error = cogp::convert::run(args).unwrap_err();
     assert!(error.to_string().contains("--min-root-features"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn page_size_limit_rejects_zero() {
+    let tmp = TempDir::new("invalid-page-size-limit");
+    let input = tmp.path().join("input.parquet");
+    let output = tmp.path().join("output.parquet");
+    let mut args = convert_args(&input, &output);
+    args.page_size_limit = 0;
+    let error = cogp::convert::run(args).unwrap_err();
+    assert!(error.to_string().contains("--page-size-limit"));
     assert!(!output.exists());
 }
 
@@ -994,6 +1007,63 @@ fn write_line_input(path: &std::path::Path, lines: &[Vec<(f64, f64)>]) {
         ),
     });
     writer.close().unwrap();
+}
+
+#[test]
+fn page_size_limit_splits_pages_before_row_count_limit() {
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+
+    let tmp = TempDir::new("page-size-limit");
+    let input = tmp.path().join("input.parquet");
+    write_line_input(&input, &vec![vec![(0.0, 0.0), (1.0, 1.0)]; 256]);
+
+    let page_starts = |output: &std::path::Path, size_limit| {
+        let mut args = convert_args(&input, output);
+        args.resolution = vec![0.01];
+        args.row_group_size = 256;
+        args.page_row_count = 256;
+        args.page_size_limit = size_limit;
+        cogp::convert::run(args).unwrap();
+
+        let file = File::open(output).unwrap();
+        let metadata = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required),
+        )
+        .unwrap();
+        assert_eq!(metadata.metadata().row_group(0).num_rows(), 256);
+        let geometry = metadata
+            .metadata()
+            .row_group(0)
+            .columns()
+            .iter()
+            .position(|col| col.column_path().string() == "geometry")
+            .unwrap();
+        metadata
+            .metadata()
+            .page_index()
+            .unwrap()
+            .offset_index(0, geometry)
+            .unwrap()
+            .page_locations()
+            .iter()
+            .map(|page| page.first_row_index)
+            .collect::<Vec<_>>()
+    };
+
+    let large = page_starts(&tmp.path().join("large.parquet"), 1024 * 1024);
+    let small = page_starts(&tmp.path().join("small.parquet"), 1024);
+    assert_eq!(large, vec![0]);
+    assert!(
+        small.len() > 1,
+        "size limit did not split geometry pages: {small:?}"
+    );
+    assert_eq!(small[0], 0);
+    assert!(
+        small[1] < 128,
+        "size check waited for a large row batch: {small:?}"
+    );
 }
 
 #[test]
@@ -1557,11 +1627,12 @@ fn attribute_encodings_preserve_values_and_nested_paths() {
             } else {
                 Encoding::PLAIN
             };
+            let encodings = column.encodings().collect::<Vec<_>>();
             assert!(
-                column.encodings().contains(&expected),
+                encodings.contains(&expected),
                 "{}: {:?}",
                 column.column_path(),
-                column.encodings()
+                encodings
             );
         }
     }

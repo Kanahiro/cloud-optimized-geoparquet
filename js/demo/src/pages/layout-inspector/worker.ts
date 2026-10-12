@@ -12,7 +12,7 @@ let sourceUrl = '';
 let trace: ByteSpan[] | undefined;
 let queryController: AbortController | undefined;
 let runningQuery: Promise<QueryResult> | undefined;
-const pageCache = new Map<number, Promise<PageLayout[]>>();
+const pageCache = new Map<string, Promise<PageLayout[]>>();
 
 // Capture the actual HTTP ranges used by the reader. Index inspection is kept
 // outside this trace so the query figure does not include UI bookkeeping.
@@ -129,25 +129,27 @@ async function coveringPages(chunk: ColumnChunk, rows: number): Promise<IndexedC
   }));
 }
 
-async function loadPages(groupId: number): Promise<PageLayout[]> {
+async function loadPages(groupId: number, column: string): Promise<PageLayout[]> {
   if (!reader || !layout) throw new Error('Open a dataset first');
   const group = layout.groups[groupId];
   if (!group) throw new Error(`Unknown row group ${groupId}`);
   const rg = (reader.metadata as unknown as FileMetaData).row_groups[groupId]!;
-  const geometry = rg.columns.find(c => c.meta_data?.path_in_schema[0] === reader!.primaryGeometryColumn);
-  if (!geometry) return [];
-  const covering = reader.geo.columns[reader.primaryGeometryColumn]?.covering?.bbox;
+  const chunk = rg.columns.find(c => c.meta_data?.path_in_schema.join('.') === column);
+  if (!chunk) throw new Error(`Unknown physical column ${column}`);
+  const locations = await offsetLocations(chunk);
+  // Without an Offset Index, a column chunk cannot be split into physical
+  // pages from metadata. Treating the entire chunk as one page is misleading.
+  if (!locations) return [];
+  const covering = column === reader.primaryGeometryColumn
+    ? reader.geo.columns[reader.primaryGeometryColumn]?.covering?.bbox : undefined;
   const names = covering ? [covering.xmin, covering.ymin, covering.xmax, covering.ymax] : [];
   const chunks = names.map(path => rg.columns.find(c => c.meta_data?.path_in_schema.join('.') === path.join('.')));
-  const [locations, ...stats] = await Promise.all([
-    offsetLocations(geometry),
-    ...chunks.map(chunk => chunk ? coveringPages(chunk, group.rows) : Promise.resolve(null)),
-  ]);
-  const physical = locations?.length ? locations.map((loc, id) => ({
+  const stats = await Promise.all(chunks.map(chunk => chunk ? coveringPages(chunk, group.rows) : Promise.resolve(null)));
+  const physical = locations.map((loc, id) => ({
     id, rowStart: Number(loc.first_row_index),
     rowEnd: id + 1 < locations.length ? Number(locations[id + 1]!.first_row_index) : group.rows,
     start: Number(loc.offset), end: Number(loc.offset) + loc.compressed_page_size,
-  })) : [{ id: 0, rowStart: 0, rowEnd: group.rows, ...span(geometry)! }];
+  }));
   return physical.map(page => {
     const extrema = stats.map((column, i) => {
       if (!column) return NaN;
@@ -161,11 +163,12 @@ async function loadPages(groupId: number): Promise<PageLayout[]> {
   });
 }
 
-function pagesFor(groupId: number): Promise<PageLayout[]> {
-  let promise = pageCache.get(groupId);
+function pagesFor(groupId: number, column: string): Promise<PageLayout[]> {
+  const key = `${groupId}\0${column}`;
+  let promise = pageCache.get(key);
   if (!promise) {
-    promise = loadPages(groupId).catch(error => { pageCache.delete(groupId); throw error; });
-    pageCache.set(groupId, promise);
+    promise = loadPages(groupId, column).catch(error => { pageCache.delete(key); throw error; });
+    pageCache.set(key, promise);
   }
   return promise;
 }
@@ -213,7 +216,6 @@ async function query(bbox: Bbox, maxLevel: number, useOverview: boolean, attribu
   // Index and footer ranges do not count as data pages. Inspect only column
   // chunks that the real read touched, keeping small queries cheap.
   const candidates = current.groups.filter(g => g.columns.some(c => requests.some(r => intersects(c, r))));
-  const pagesByGroup: Record<number, number[]> = {};
   const columnPagesByGroup: QueryResult['columnPagesByGroup'] = {};
   let geometryPageCount = 0;
   let geometryPageBytes = 0;
@@ -251,13 +253,6 @@ async function query(bbox: Bbox, maxLevel: number, useOverview: boolean, attribu
       return { column: column.name, pageIds: hit.map(page => page.id), bytes: hitBytes };
     }));
     columnPagesByGroup[group.id] = columnReads.filter(read => read.pageIds.length);
-    if (!readsOverview && touched.some(column => column.name === file.primaryGeometryColumn)) {
-      const pages = await pagesFor(group.id);
-      const hit = pages.filter(page => requests.some(request => intersects(page, request)));
-      if (hit.length) {
-        pagesByGroup[group.id] = hit.map(page => page.id);
-      }
-    }
   }
   if (controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
   const rowGroupBytes = candidates.reduce((sum, group) => sum
@@ -267,7 +262,7 @@ async function query(bbox: Bbox, maxLevel: number, useOverview: boolean, attribu
     fetchedBytes: requests.reduce((sum, request) => sum + request.end - request.start, 0),
     groupIds: candidates.map(group => group.id), rowGroupBytes, dataPageBytes, dataPageCount,
     bboxPageBytes, bboxPageCount, attributePageBytes, attributePageCount,
-    columnPagesByGroup, pagesByGroup, geometryPageCount, geometryPageBytes };
+    columnPagesByGroup, geometryPageCount, geometryPageBytes };
 }
 
 context.onmessage = async (event: MessageEvent<Request>) => {
@@ -275,7 +270,7 @@ context.onmessage = async (event: MessageEvent<Request>) => {
   if (request.type === 'cancel') { queryController?.abort(); return; }
   try {
     const result = request.type === 'open' ? await open(request.url)
-      : request.type === 'pages' ? await pagesFor(request.groupId)
+      : request.type === 'pages' ? await pagesFor(request.groupId, request.column)
         : await (async () => {
           queryController?.abort();
           const previous = runningQuery;

@@ -290,7 +290,7 @@ mod tests {
         let props = WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(9).unwrap()))
-            .set_max_row_group_size(4)
+            .set_max_row_group_row_count(Some(4))
             .build();
 
         let mut expected = Vec::new();

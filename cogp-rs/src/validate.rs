@@ -442,7 +442,7 @@ pub(crate) fn validate_standard_lists(
         };
         let info = node.get_basic_info();
         let list = info.converted_type() == ConvertedType::LIST
-            || matches!(info.logical_type(), Some(LogicalType::List));
+            || matches!(info.logical_type_ref(), Some(LogicalType::List));
         for child in fields {
             let child_path = format!("{path}.{}", child.name());
             let repeated = child.get_basic_info().has_repetition()

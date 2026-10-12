@@ -88,7 +88,7 @@ fn write_file(path: &std::path::Path, row_groups: usize, kv: Vec<KeyValue>) {
         false,
     )]));
     let props = WriterProperties::builder()
-        .set_max_row_group_size(1) // one row per row group
+        .set_max_row_group_row_count(Some(1)) // one row per row group
         .build();
     let file = File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();

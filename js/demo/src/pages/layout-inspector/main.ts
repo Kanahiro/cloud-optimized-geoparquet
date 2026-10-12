@@ -39,6 +39,8 @@ const readBreakdown = $<HTMLDivElement>('read-breakdown');
 const readList = $<HTMLDivElement>('read-list');
 const readEmpty = $<HTMLParagraphElement>('read-empty');
 const pageList = $<HTMLDivElement>('page-list');
+const pageColumnSelect = $<HTMLSelectElement>('page-column');
+const pageNote = $<HTMLParagraphElement>('page-note');
 
 const map = new maplibregl.Map({
   container: 'map', hash: true,
@@ -56,7 +58,10 @@ const pending = new Map<number, { resolve: (value: never) => void; reject: (erro
 let layout: Layout | null = null;
 let pages: PageLayout[] = [];
 let selectedGroup = 0;
+let selectedColumn = '';
 let selectedPage = -1;
+let pagesLoading = false;
+let pageError = '';
 let query: QueryResult | null = null;
 let drawn: Bbox | null = null;
 let drawing = false;
@@ -159,11 +164,16 @@ function renderMap(): void {
   if (!map.isStyleLoaded()) return;
   setFeatures('groups', showGroups.checked && layout
     ? layout.groups.flatMap(g => g.bbox ? [rectangle(g.bbox, { id: g.id })] : []) : []);
-  setFeatures('pages', showPages.checked ? pages.flatMap(p => p.bbox
-    ? [rectangle(p.bbox, { id: p.id, read: query?.pagesByGroup[selectedGroup]?.includes(p.id) ? 1 : 0 })] : []) : []);
+  const readPages = new Set(readPagesForSelection());
+  setFeatures('pages', showPages.checked && selectedColumn === layout?.geometryColumn ? pages.flatMap(p => p.bbox
+    ? [rectangle(p.bbox, { id: p.id, read: readPages.has(p.id) ? 1 : 0 })] : []) : []);
   const group = layout?.groups[selectedGroup];
   setFeatures('selection', group?.bbox ? [rectangle(group.bbox)] : []);
   setFeatures('query', drawn ? [rectangle(drawn)] : []);
+}
+
+function readPagesForSelection(): number[] {
+  return query?.columnPagesByGroup[selectedGroup]?.find(read => read.column === selectedColumn)?.pageIds ?? [];
 }
 
 function bboxFromPoints(a: [number, number], b: [number, number]): Bbox {
@@ -262,10 +272,13 @@ async function readRectangle(bbox: Bbox): Promise<void> {
 async function load(url: string): Promise<void> {
   if (!url) return;
   const revision = ++loadRevision;
-  ++queryRevision;
   ++selectionRevision;
+  ++queryRevision;
   resetWorker();
-  layout = null; pages = []; selectedGroup = 0; selectedPage = -1; query = null; drawn = null;
+  layout = null; pages = []; selectedGroup = 0; query = null; drawn = null;
+  selectedColumn = ''; selectedPage = -1; pagesLoading = false; pageError = '';
+  pageColumnSelect.replaceChildren(); pageColumnSelect.disabled = true;
+  showPages.disabled = true;
   attributePicker.open = false;
   renderAttributes([]);
   groupInput.disabled = true; drawButton.disabled = true; maxLevelSelect.disabled = true; useOverviewInput.disabled = true;
@@ -312,48 +325,106 @@ async function load(url: string): Promise<void> {
   }
 }
 
-async function selectGroup(id: number, focusMap = true): Promise<void> {
+function selectGroup(id: number, focusMap = true): void {
   if (!layout || !Number.isSafeInteger(id) || id < 0 || id >= layout.groups.length) return;
-  selectedGroup = id; selectedPage = -1; pages = [];
+  const currentLayout = layout;
+  selectedGroup = id;
   groupInput.value = String(id);
-  const group = layout.groups[id]!;
+  const group = currentLayout.groups[id]!;
+  if (!group.columns.some(column => column.name === selectedColumn)) {
+    selectedColumn = group.columns.find(column => column.name === currentLayout.geometryColumn)?.name
+      ?? group.columns[0]?.name ?? '';
+  }
+  pageColumnSelect.replaceChildren(...group.columns.map(column => {
+    const option = document.createElement('option');
+    option.value = column.name;
+    option.textContent = column.name
+      + (column.name === currentLayout.geometryColumn ? ' · primary geometry'
+        : currentLayout.overviewColumn && column.name.startsWith(`${currentLayout.overviewColumn}.`) ? ' · overview' : '')
+      + (column.offsetIndex ? '' : ' · no Offset Index');
+    return option;
+  }));
+  pageColumnSelect.value = selectedColumn;
+  pageColumnSelect.title = selectedColumn;
+  pageColumnSelect.disabled = group.columns.length === 0;
   const indexBytes = group.columns.reduce((sum, column) => sum
     + (column.columnIndex ? column.columnIndex.end - column.columnIndex.start : 0)
     + (column.offsetIndex ? column.offsetIndex.end - column.offsetIndex.start : 0), 0);
   $('group-details').textContent = `Level ${group.level + 1} · ${group.rows.toLocaleString()} rows · ${formatBytes(group.end - group.start)} data span · ${formatBytes(indexBytes)} indexes`;
-  renderMap(); renderPhysicalLayout(); renderPages();
   if (focusMap && group.bbox) {
     map.fitBounds([[group.bbox.minX, group.bbox.minY], [group.bbox.maxX, group.bbox.maxY]],
       { padding: 65, maxZoom: 13 });
   }
+  void loadSelectedPages(focusMap && !group.bbox);
+}
+
+async function loadSelectedPages(focusMap = false): Promise<void> {
+  const id = selectedGroup;
+  const column = selectedColumn;
   const revision = ++selectionRevision;
+  pages = []; selectedPage = -1; pageError = '';
+  pagesLoading = Boolean(layout?.groups[id]?.columns.find(c => c.name === column)?.offsetIndex);
+  showPages.disabled = column !== layout?.geometryColumn;
+  renderMap(); renderPhysicalLayout(); renderPages();
+  if (focusMap && column !== layout?.geometryColumn && layout?.geometryColumn) {
+    void call<PageLayout[]>({ type: 'pages', groupId: id, column: layout.geometryColumn })
+      .then(geometryPages => { if (revision === selectionRevision) focusPageBounds(geometryPages); })
+      .catch(() => {});
+  }
+  if (!pagesLoading) return;
   try {
-    const result = await call<PageLayout[]>({ type: 'pages', groupId: id });
+    const result = await call<PageLayout[]>({ type: 'pages', groupId: id, column });
     if (revision !== selectionRevision) return;
-    pages = result;
+    pages = result; pagesLoading = false;
     renderMap(); renderPhysicalLayout(); renderPages();
-    if (focusMap && !group.bbox) {
-      const bbox = pages.reduce<Bbox | null>((combined, page) => {
-        if (!page.bbox) return combined;
-        if (!combined) return page.bbox;
-        return { minX: Math.min(combined.minX, page.bbox.minX), minY: Math.min(combined.minY, page.bbox.minY),
-          maxX: Math.max(combined.maxX, page.bbox.maxX), maxY: Math.max(combined.maxY, page.bbox.maxY) };
-      }, null);
-      if (bbox) map.fitBounds([[bbox.minX, bbox.minY], [bbox.maxX, bbox.maxY]], { padding: 65, maxZoom: 13 });
-    }
+    if (focusMap && column === layout?.geometryColumn) focusPageBounds(pages);
   } catch (error) {
-    if (revision === selectionRevision) $('page-list').textContent = `Page indexes unavailable: ${(error as Error).message}`;
+    if (revision !== selectionRevision) return;
+    pagesLoading = false;
+    pageError = `Page indexes unavailable: ${(error as Error).message}`;
+    renderPages();
   }
 }
 
+function focusPageBounds(groupPages: PageLayout[]): void {
+  const bbox = groupPages.reduce<Bbox | null>((combined, page) => {
+    if (!page.bbox) return combined;
+    if (!combined) return page.bbox;
+    return { minX: Math.min(combined.minX, page.bbox.minX), minY: Math.min(combined.minY, page.bbox.minY),
+      maxX: Math.max(combined.maxX, page.bbox.maxX), maxY: Math.max(combined.maxY, page.bbox.maxY) };
+  }, null);
+  if (bbox) map.fitBounds([[bbox.minX, bbox.minY], [bbox.maxX, bbox.maxY]], { padding: 65, maxZoom: 13 });
+}
+
 function renderPages(): void {
-  if (!layout) { pageList.textContent = 'Open a dataset.'; $('page-count').textContent = ''; return; }
-  $('page-count').textContent = `${pages.length.toLocaleString()} pages`;
+  if (!layout) {
+    pageNote.textContent = 'Select a row group to inspect its column pages.';
+    pageList.textContent = 'Open a dataset.'; $('page-count').textContent = '';
+    return;
+  }
+  const column = layout.groups[selectedGroup]?.columns.find(c => c.name === selectedColumn);
+  pageNote.textContent = selectedColumn === layout.geometryColumn
+    ? 'Page BBOXs combine overlapping xmin/ymin/xmax/ymax Column Index row ranges into conservative envelopes.'
+    : 'Offset Indexes give each page’s first row; nested pages may share a row. Map Page BBOXs are available only for primary geometry.';
+  if (pagesLoading) { $('page-count').textContent = 'Loading…'; pageList.textContent = 'Loading Offset Index…'; return; }
+  if (pageError) { $('page-count').textContent = ''; pageList.textContent = pageError; return; }
+  if (!column?.offsetIndex) {
+    $('page-count').textContent = 'No Offset Index';
+    pageList.textContent = 'This column has no Offset Index, so its physical pages cannot be listed.';
+    return;
+  }
+  $('page-count').textContent = `${pages.length.toLocaleString()} ${pages.length === 1 ? 'page' : 'pages'}`;
+  if (!pages.length) { pageList.textContent = 'No data pages in this column chunk.'; return; }
+  const readPages = new Set(readPagesForSelection());
+  const primaryGeometry = layout.geometryColumn;
   pageList.replaceChildren(...pages.map(page => {
     const button = document.createElement('button');
     button.className = 'page-item' + (page.id === selectedPage ? ' selected' : '')
-      + (query?.pagesByGroup[selectedGroup]?.includes(page.id) ? ' read' : '');
-    button.innerHTML = `<span>Page ${page.id} <small>rows ${page.rowStart.toLocaleString()}–${page.rowEnd.toLocaleString()}</small></span><small>${formatBytes(page.end - page.start)}</small>`;
+      + (readPages.has(page.id) ? ' read' : '');
+    const rowLabel = selectedColumn === primaryGeometry
+      ? `rows ${page.rowStart.toLocaleString()}–${page.rowEnd.toLocaleString()}`
+      : `first row ${page.rowStart.toLocaleString()}`;
+    button.innerHTML = `<span>Page ${page.id} <small>${rowLabel}</small></span><small>${formatBytes(page.end - page.start)}</small>`;
     button.addEventListener('click', () => {
       selectedPage = page.id;
       renderPages(); renderPhysicalLayout();
@@ -421,7 +492,7 @@ function renderPhysicalLayout(): void {
     const geometry = column.name === layout!.geometryColumn || column.name.startsWith(`${layout!.geometryColumn}.`)
       || !!layout!.overviewColumn && (column.name === layout!.overviewColumn || column.name.startsWith(`${layout!.overviewColumn}.`));
     const bbox = layout!.bboxColumns.includes(column.name);
-    row.className = `column-row${geometry ? ' geometry' : ''}${bbox ? ' bbox' : ''}${readColumns.has(column.name) ? ' read' : ''}`;
+    row.className = `column-row${geometry ? ' geometry' : ''}${bbox ? ' bbox' : ''}${readColumns.has(column.name) ? ' read' : ''}${column.name === selectedColumn ? ' selected' : ''}`;
     const name = document.createElement('span');
     name.className = 'column-name'; name.textContent = column.name;
     const track = document.createElement('span');
@@ -431,7 +502,7 @@ function renderPhysicalLayout(): void {
     bar.style.left = `${(column.start - selected.start) / span * 100}%`;
     bar.style.width = `${(column.end - column.start) / span * 100}%`;
     track.append(bar);
-    if (column.name === layout!.geometryColumn) for (const page of pages) {
+    if (column.name === selectedColumn) for (const page of pages) {
       const tick = document.createElement('span');
       tick.className = `column-tick${page.id === selectedPage ? ' selected' : ''}`;
       tick.style.left = `${(page.start - selected.start) / span * 100}%`;
@@ -465,6 +536,11 @@ overview.addEventListener('mousemove', event => {
     : `File offset ${offset.toLocaleString()}`;
 });
 groupInput.addEventListener('change', () => void selectGroup(Number(groupInput.value)));
+pageColumnSelect.addEventListener('change', () => {
+  selectedColumn = pageColumnSelect.value;
+  pageColumnSelect.title = selectedColumn;
+  void loadSelectedPages();
+});
 showGroups.addEventListener('change', renderMap);
 showPages.addEventListener('change', renderMap);
 maxLevelSelect.addEventListener('change', () => { if (drawn) void readRectangle(drawn); });
