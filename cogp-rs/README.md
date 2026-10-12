@@ -138,6 +138,10 @@ Other options:
 - `--page-row-count` (default `1024`) — maximum top-level rows per data page.
   Page Indexes and spatial page packing are always enabled. Row Groups never
   mix levels; the bbox leaves get ColumnIndexes and every leaf gets an OffsetIndex.
+- `--page-size-limit` (default `262144`, 256 KiB) — best-effort maximum encoded data-page
+  size in bytes before compression. The writer checks this after each write
+  batch, so a page can exceed the limit, especially for a large single value.
+  This limit applies per column; a page is not a whole-row byte budget.
 
 The writer always disables dictionary encoding for all columns, including nested
 attributes, so selective reads do not need column-chunk-wide dictionaries. ZSTD

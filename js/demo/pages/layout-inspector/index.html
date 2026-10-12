@@ -49,7 +49,7 @@
             <label class="check"><input id="use-overview" type="checkbox" disabled /> Use overview</label>
             <div class="overlay-options">
               <label class="check"><input id="show-groups" type="checkbox" checked /> Row groups</label>
-              <label class="check"><input id="show-pages" type="checkbox" checked /> Primary pages</label>
+              <label class="check"><input id="show-pages" type="checkbox" checked /> Page BBOXs</label>
             </div>
             <details id="attribute-picker" class="attribute-picker">
               <summary id="attribute-summary">Attributes · None</summary>
@@ -97,8 +97,9 @@
             <p id="read-empty" class="empty-state">Draw a rectangle on the map to inspect transfer, geometry, and BBOX page costs.</p>
           </section>
           <section class="panel pages-panel">
-            <div class="panel-heading"><div><span class="eyebrow">04 / SPATIAL INDEX</span><h2>Primary geometry pages</h2></div><span id="page-count"></span></div>
-            <p class="note">Page BBOXs combine overlapping xmin/ymin/xmax/ymax Column Index row ranges. They are conservative envelopes, including when the query reads an overview.</p>
+            <div class="panel-heading"><div><span class="eyebrow">04 / PAGE INDEX</span><h2>Column pages</h2></div><span id="page-count"></span></div>
+            <div class="page-column-row"><label for="page-column">Physical column</label><select id="page-column" disabled></select></div>
+            <p id="page-note" class="note">Select a row group to inspect its column pages.</p>
             <div id="page-list" class="page-list"></div>
           </section>
         </div>

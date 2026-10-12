@@ -49,13 +49,12 @@ export interface QueryResult {
   attributePageBytes: number;
   attributePageCount: number;
   columnPagesByGroup: Record<number, { column: string; pageIds: number[]; bytes: number }[]>;
-  pagesByGroup: Record<number, number[]>;
   geometryPageCount: number;
   geometryPageBytes: number;
 }
 export type Request =
   | { id: number; type: 'open'; url: string }
-  | { id: number; type: 'pages'; groupId: number }
+  | { id: number; type: 'pages'; groupId: number; column: string }
   | { id: number; type: 'query'; bbox: Bbox; maxLevel: number; useOverview: boolean; attributes: string[] }
   | { id: number; type: 'cancel' };
 export type Response =

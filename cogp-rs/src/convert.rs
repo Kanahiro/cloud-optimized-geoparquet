@@ -91,6 +91,10 @@ pub struct ConvertArgs {
     /// packing are always enabled; smaller pages permit finer spatial pruning.
     #[arg(long, default_value_t = 1024)]
     pub page_row_count: usize,
+    /// Best-effort maximum encoded data-page size in bytes, before compression.
+    /// Pages can exceed this when a single value or write batch is larger.
+    #[arg(long, default_value_t = 256 * 1024)]
+    pub page_size_limit: usize,
     /// Point-like features (WKB Point / MultiPoint) use a thinning grid this
     /// many times the level resolution per axis, yielding ~factor² fewer points
     /// per level than a factor of 1 (one winner per resolution-sized cell).
@@ -137,7 +141,8 @@ pub enum PriorityColumnOrder {
 /// a batch that ends mid-page would let the next batch overfill that page and
 /// shift every later page off the `page_rows` intervals `str_pack_pages`
 /// packed. Completing the open page with its own write keeps physical pages
-/// on those intervals regardless of gather and segment boundaries.
+/// on those intervals regardless of gather and segment boundaries when the
+/// byte-size limit has not already closed a page.
 fn write_with_row_group_limit<W: Write + Send>(
     writer: &mut ParallelWriter<W>,
     batch: &RecordBatch,
@@ -335,6 +340,9 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     );
     if args.page_row_count == 0 {
         bail!("--page-row-count must be >= 1");
+    }
+    if args.page_size_limit == 0 {
+        bail!("--page-size-limit must be >= 1");
     }
     eprintln!("[1/4] Reading input metadata: {}", args.input.display());
     let file =
@@ -698,7 +706,10 @@ pub fn run(args: ConvertArgs) -> Result<()> {
     // Keep bbox page statistics and offsets for all projected columns.
     props_builder = props_builder
         .set_data_page_row_count_limit(args.page_row_count)
-        .set_write_batch_size(args.page_row_count);
+        .set_data_page_size_limit(args.page_size_limit)
+        // Parquet checks both page limits after each mini-batch. A single-row
+        // batch prevents many wide values from overshooting the byte limit.
+        .set_write_batch_size(1);
     let props = props_builder.build();
     let output_dir = args
         .output
@@ -2297,6 +2308,7 @@ mod tests {
         assert_eq!(cli.args.row_group_size, 262_144);
         assert_eq!(cli.args.zstd_level, 9);
         assert_eq!(cli.args.page_row_count, 1024);
+        assert_eq!(cli.args.page_size_limit, 256 * 1024);
         assert_eq!(cli.args.simplification_tolerance_factor, 0.25);
         assert_eq!(cli.args.min_part_size_factor, 1.0);
         assert_eq!(cli.args.priority_column.as_deref(), Some("population"));
@@ -2304,6 +2316,10 @@ mod tests {
             cli.args.priority_column_order,
             PriorityColumnOrder::Asc
         ));
+
+        let custom =
+            Cli::try_parse_from(["cogp", "input", "output", "--page-size-limit", "4096"]).unwrap();
+        assert_eq!(custom.args.page_size_limit, 4096);
     }
 
     #[test]
